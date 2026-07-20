@@ -1,0 +1,17 @@
+# Core Network Parameters
+stratum_port: ":5555"
+kaspad_address: "192.168.0.12:16110"
+
+# Central Pool Wallet
+mining_address: "kaspa:qz2sehqzx8xetzkhz2ycqflwf8dhusyxhj0myv4ez72k0n6vdaj827jexnyzz"
+
+# Public Pool Mechanics
+starting_diff: 64       # ⚡ Allows KS0 Ultras to survive
+min_share_diff: 2.0      
+var_diff: true           
+shares_per_min: 20
+extranonce_size: 2
+
+# Telemetry System
+prom_port: ":8081"
+print_stats: true

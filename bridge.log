@@ -1,0 +1,6 @@
+   Compiling malachite-nz v0.9.2
+   Compiling axum v0.6.20
+   Compiling protobuf v2.28.0
+   Compiling redis v0.25.5
+   Compiling prometheus v0.13.4
+   Compiling tonic v0.11.0
