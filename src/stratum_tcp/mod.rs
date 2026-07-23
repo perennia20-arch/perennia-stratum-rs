@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use crate::config::StratumConfig;
 use crate::job_manager::JobManager;
+use redis::AsyncCommands; // ⚡ INQUIRY 3 IMPORT: Required for Block Discovery Oracle Injection
 
 static WORKER_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -231,8 +232,33 @@ async fn handle_worker_connection(
 
                                             if is_network_block {
                                                 tracing::info!("💎💎💎 [{}] NETWORK BLOCK ACQUIRED! Nonce: {:016x}", peer_addr, nonce);
+                                                
+                                                let mut final_header = consensus_header.clone();
+                                                final_header.nonce = nonce;
+                                                let block_hash = kaspa_consensus_core::hashing::header::hash(&final_header).to_string();
+
                                                 if let Some(ref mut rpc_header) = rpc_block.header { rpc_header.nonce = nonce; }
+                                                
+                                                // ⚡ INQUIRY 3 INJECTION: Pipe discovery directly to the Oracle
+                                                let worker_clone = req_worker.clone();
+                                                let diff_clone = current_diff as f64;
+                                                
+                                                tokio::spawn(async move {
+                                                    if let Ok(client) = redis::Client::open("redis://127.0.0.1/") {
+                                                        if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
+                                                            let block_event = serde_json::json!({
+                                                                "worker": worker_clone,
+                                                                "block_hash": block_hash,
+                                                                "nonce": nonce,
+                                                                "network_diff": diff_clone
+                                                            });
+                                                            let _: () = redis::cmd("RPUSH").arg("perennia:oracle:block_buffer").arg(block_event.to_string()).query_async(&mut conn).await.unwrap_or(());
+                                                        }
+                                                    }
+                                                });
+
                                                 let _ = job_manager.block_submit_tx.try_send(rpc_block);
+                                                
                                             } else if is_valid_share {
                                                 tracing::info!("✅ [{}] TIER SHARE ACCEPTED | Job: {}", peer_addr, job_id);
                                                 crate::telemetry::WORKER_SHARES.with_label_values(&[&req_worker, "valid"]).inc();

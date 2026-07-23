@@ -4,6 +4,7 @@ mod telemetry;
 mod kaspad_client;
 mod job_manager; 
 mod diff_engine; 
+mod oracle;
 
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -32,9 +33,14 @@ async fn main() -> anyhow::Result<()> {
     // ⚡ Build the shared Accounting Channel
     let (valid_share_tx, valid_share_rx) = mpsc::channel(10000);
 
-    // ⚡ Spawn the background Redis Ledger Thread
+    // ⚡ Spawn the background Redis Ledger Thread (Phase 1 Ingestion)
     tokio::spawn(async move {
         telemetry::start_accounting_engine(valid_share_rx).await;
+    });
+
+    // ⚡ Spawn the Persistent Yield Streaming Oracle (PostgreSQL WAL)
+    tokio::spawn(async move {
+        oracle::start_oracle_daemon().await;
     });
 
     let (job_manager_arc, _job_rx, block_submit_rx) = JobManager::new();
