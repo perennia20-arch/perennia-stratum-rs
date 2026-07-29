@@ -1,13 +1,16 @@
 use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
+use tokio_util::codec::{FramedRead, LinesCodec};
+use tokio_stream::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Instant, Duration};
 use crate::config::StratumConfig;
 use crate::job_manager::JobManager;
-use redis::AsyncCommands; // ⚡ INQUIRY 3 IMPORT: Required for Block Discovery Oracle Injection
+use redis::AsyncCommands; 
 
 static WORKER_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -34,9 +37,15 @@ pub async fn start_stratum_server(
 ) -> anyhow::Result<()> {
     let bind_addr = format!("0.0.0.0:{}", port);
     let listener = TcpListener::bind(&bind_addr).await?;
+    
+    // ⚡ FIX: Implemented Semaphore to strictly limit File Descriptors and prevent SYN Flood crashes
+    let connection_limit = Arc::new(Semaphore::new(5000));
+    
     tracing::info!("🛡️ STRATUM TIER ACTIVE ON {} (Diff: {}, Throttle: {}ms)", bind_addr, difficulty, throttle_ms);
 
     loop {
+        // Wait safely until a slot opens in the connection pool
+        let permit = connection_limit.clone().acquire_owned().await?;
         let (socket, addr) = listener.accept().await?;
         tracing::info!("🔌 [{}] Hardware connection established to Tier Port {}", addr.ip(), port);
 
@@ -46,6 +55,7 @@ pub async fn start_stratum_server(
         let peer_ip = addr.ip().to_string();
 
         tokio::spawn(async move {
+            let _permit = permit; // Safely hold the permit; dropped automatically on disconnect
             if let Err(e) = handle_worker_connection(socket, peer_ip.clone(), config_clone, job_manager_clone, share_tx_clone, difficulty, throttle_ms).await {
                 tracing::warn!("⚠️ [{}] Worker disconnected: {}", peer_ip, e);
             }
@@ -56,7 +66,7 @@ pub async fn start_stratum_server(
 async fn handle_worker_connection(
     socket: TcpStream, 
     peer_addr: String,
-    _config: Arc<StratumConfig>,
+    config: Arc<StratumConfig>,
     job_manager: Arc<JobManager>,
     valid_share_tx: mpsc::Sender<(String, f64)>,
     difficulty: f64,
@@ -64,24 +74,32 @@ async fn handle_worker_connection(
 ) -> anyhow::Result<()> {
     let mut job_rx = job_manager.job_tx.subscribe();
     let conn_id = WORKER_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
-    
-    // ⚡ GO-BRIDGE SPEC: Pool extranonce is exactly 2 bytes (4 hex chars).
     let extranonce1 = format!("{:04x}", conn_id & 0xFFFF); 
     
-    let current_diff = clamp_to_power_of_2(difficulty);
+    let mut current_diff = clamp_to_power_of_2(difficulty);
 
     let (read_half, mut write_half) = socket.into_split();
-    let mut reader = BufReader::with_capacity(32768, read_half);
-    let mut line_buf = Vec::new();
+    
+    // ⚡ FIX: OOM memory exhaustion patched via strict LinesCodec bounds (Max 2048 bytes per payload)
+    let mut reader = FramedRead::new(read_half, LinesCodec::new_with_max_length(2048));
 
     let mut handshake_state = 0; 
+    let mut current_worker_name = String::new();
+
+    // ⚡ FIX: VarDiff Tracking Variables
+    let mut share_count = 0;
+    let mut last_vardiff_retarget = Instant::now();
+    let target_shares_per_min = config.shares_per_min as f64;
 
     while handshake_state < 2 {
-        line_buf.clear();
-        let bytes_read = reader.read_until(b'\n', &mut line_buf).await?;
-        if bytes_read == 0 { anyhow::bail!("EOF - Client closed connection during handshake"); }
+        let line_res = reader.next().await;
+        if line_res.is_none() { anyhow::bail!("EOF - Client closed connection during handshake"); }
         
-        let payload_str = std::str::from_utf8(&line_buf).unwrap_or("");
+        let payload_str = match line_res.unwrap() {
+            Ok(s) => s,
+            Err(e) => anyhow::bail!("Client Payload Violation: {}", e),
+        };
+        
         let trimmed = payload_str.trim_matches('\0').trim();
         if trimmed.is_empty() { continue; }
         
@@ -92,7 +110,6 @@ async fn handle_worker_connection(
             let req_id = req.id.clone().unwrap_or(serde_json::Value::Null);
 
             if handshake_state == 0 && method == "mining.subscribe" {
-                // ⚡ EthereumStratum handshake bypasses IceRiver parser strictness
                 let sub_json = json!({
                     "id": req_id,
                     "result": [true, "EthereumStratum/1.0.0"],
@@ -100,10 +117,8 @@ async fn handle_worker_connection(
                 });
                 let mut response = sub_json.to_string();
                 response.push('\n');
-                tracing::info!("⬆️ [TX | {}] {}", peer_addr, response.trim());
                 write_half.write_all(response.as_bytes()).await?;
 
-                // ⚡ Immediately push the extranonce1 explicitly
                 let en_json = json!({
                     "id": null,
                     "method": "mining.set_extranonce",
@@ -111,11 +126,9 @@ async fn handle_worker_connection(
                 });
                 let mut en_resp = en_json.to_string();
                 en_resp.push('\n');
-                tracing::info!("⬆️ [TX | {}] {}", peer_addr, en_resp.trim());
                 write_half.write_all(en_resp.as_bytes()).await?;
                 
                 handshake_state = 1;
-                
             } else if handshake_state == 1 && method == "mining.authorize" {
                 let auth_json = json!({
                     "id": req_id,
@@ -124,15 +137,10 @@ async fn handle_worker_connection(
                 });
                 let mut response = auth_json.to_string();
                 response.push('\n');
-                tracing::info!("⬆️ [TX | {}] {}", peer_addr, response.trim());
                 write_half.write_all(response.as_bytes()).await?;
                 
                 handshake_state = 2;
-            } else {
-                tracing::warn!("⚠️ [{}] Unexpected handshake message: {}", peer_addr, method);
             }
-        } else {
-            tracing::error!("❌ [{}] JSON PARSE ERROR during handshake | Raw: {}", peer_addr, trimmed);
         }
     }
 
@@ -143,7 +151,6 @@ async fn handle_worker_connection(
     });
     let mut diff_msg = diff_json.to_string();
     diff_msg.push('\n'); 
-    tracing::info!("⬆️ [TX | {}] {}", peer_addr, diff_msg.trim());
     write_half.write_all(diff_msg.as_bytes()).await?;
 
     let initial_job = {
@@ -155,15 +162,15 @@ async fn handle_worker_connection(
     }; 
 
     if let Some(cached_payload) = initial_job {
-        if let Ok(job_str) = std::str::from_utf8(&cached_payload[..]) {
-            tracing::info!("⬆️ [TX | {}] {}", peer_addr, job_str.trim());
-        }
         write_half.write_all(&cached_payload[..]).await?; 
     }
 
     let safe_throttle = if throttle_ms == 0 { 10 } else { throttle_ms };
-    let mut throttle_interval = tokio::time::interval(tokio::time::Duration::from_millis(safe_throttle));
+    let mut throttle_interval = tokio::time::interval(Duration::from_millis(safe_throttle));
     throttle_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // Dynamic VarDiff Check Interval (evaluate every 30s)
+    let mut vardiff_interval = tokio::time::interval(Duration::from_secs(30));
 
     let mut pending_job_payload = None;
 
@@ -175,133 +182,153 @@ async fn handle_worker_connection(
 
             _ = throttle_interval.tick() => {
                 if let Some(payload) = pending_job_payload.take() {
-                    if let Ok(job_str) = std::str::from_utf8(&payload[..]) {
-                        tracing::info!("⬆️ [TX | {}] {}", peer_addr, job_str.trim());
-                    }
                     let _ = write_half.write_all(&payload[..]).await;
                 }
             }
 
-            read_res = reader.read_until(b'\n', &mut line_buf) => {
-                let bytes_read = read_res?;
-                if bytes_read == 0 { anyhow::bail!("EOF - Client closed connection"); }
-                
-                if let Ok(payload_str) = std::str::from_utf8(&line_buf) {
-                    let trimmed = payload_str.trim_matches('\0').trim();
+            _ = vardiff_interval.tick() => {
+                // ⚡ FIX: True VarDiff Calculation and Retargeting Mechanism
+                if config.var_diff && last_vardiff_retarget.elapsed().as_secs() >= 60 {
+                    let elapsed_mins = last_vardiff_retarget.elapsed().as_secs_f64() / 60.0;
+                    let shares_per_min = share_count as f64 / elapsed_mins;
                     
-                    if !trimmed.is_empty() {
-                        tracing::info!("⬇️ [RX | {}] {}", peer_addr, trimmed);
+                    let mut new_diff = current_diff;
+                    if shares_per_min < target_shares_per_min * 0.5 {
+                        new_diff = (current_diff / 2).max(clamp_to_power_of_2(config.min_share_diff));
+                    } else if shares_per_min > target_shares_per_min * 2.0 {
+                        new_diff = current_diff * 2;
+                    }
+                    
+                    if new_diff != current_diff {
+                        current_diff = new_diff;
+                        let retarget_json = json!({
+                            "id": null,
+                            "method": "mining.set_difficulty",
+                            "params": [current_diff]
+                        });
+                        let mut retarget_msg = retarget_json.to_string();
+                        retarget_msg.push('\n');
+                        let _ = write_half.write_all(retarget_msg.as_bytes()).await;
+                        tracing::info!("🔄 VarDiff Adjusted for {} -> New Diff: {}", current_worker_name, current_diff);
+                    }
+                    
+                    share_count = 0;
+                    last_vardiff_retarget = Instant::now();
+                }
+            }
+
+            line_res = reader.next() => {
+                if line_res.is_none() { anyhow::bail!("EOF - Client closed connection"); }
+                
+                let payload_str = match line_res.unwrap() {
+                    Ok(s) => s,
+                    Err(e) => anyhow::bail!("Client payload violation: {}", e),
+                };
+                
+                let trimmed = payload_str.trim_matches('\0').trim();
+                if !trimmed.is_empty() {
+                    if let Ok(req) = serde_json::from_str::<RpcRequest>(trimmed) {
+                        let method = req.method.unwrap_or_else(|| "unknown".to_string());
+                        let req_id = req.id.clone().unwrap_or(serde_json::Value::Null);
                         
-                        if let Ok(req) = serde_json::from_str::<RpcRequest>(trimmed) {
-                            let method = req.method.unwrap_or_else(|| "unknown".to_string());
-                            let req_id = req.id.clone().unwrap_or(serde_json::Value::Null);
-                            
-                            if method == "mining.submit" {
-                                if let Some(params) = req.params {
-                                    if params.len() >= 3 {
-                                        let req_worker = match &params[0] {
-                                            serde_json::Value::String(s) => s.clone(),
-                                            v => v.to_string(),
-                                        }.replace('"', "").replace('\0', "").trim().to_string();
+                        if method == "mining.submit" {
+                            if let Some(params) = req.params {
+                                if params.len() >= 3 {
+                                    let req_worker = match &params[0] {
+                                        serde_json::Value::String(s) => s.clone(),
+                                        v => v.to_string(),
+                                    }.replace('"', "").replace('\0', "").trim().to_string();
+                                    
+                                    current_worker_name = req_worker.clone();
+                                    
+                                    let job_id = match &params[1] {
+                                        serde_json::Value::String(s) => s.clone(),
+                                        v => v.to_string(),
+                                    }.replace('"', "").replace('\0', "").trim().to_string();
+                                    
+                                    let nonce_str = match &params[2] {
+                                        serde_json::Value::String(s) => s.clone(),
+                                        v => v.to_string(),
+                                    }.replace('"', "").replace('\0', "").trim().to_string();
+
+                                    let clean_nonce = nonce_str.trim_start_matches("0x");
+                                    let mut nonce: u64 = u64::from_str_radix(clean_nonce, 16).unwrap_or(0);
+
+                                    if clean_nonce.len() <= 12 { 
+                                        let full_nonce_hex = format!("{}{:0>12}", extranonce1, clean_nonce);
+                                        nonce = u64::from_str_radix(&full_nonce_hex, 16).unwrap_or(nonce);
+                                    }
+
+                                    if let Some(job_entry) = job_manager.active_jobs.get(&job_id) {
+                                        let (consensus_header, mut rpc_block) = job_entry.value().clone();
                                         
-                                        let job_id = match &params[1] {
-                                            serde_json::Value::String(s) => s.clone(),
-                                            v => v.to_string(),
-                                        }.replace('"', "").replace('\0', "").trim().to_string();
-                                        
-                                        let nonce_str = match &params[2] {
-                                            serde_json::Value::String(s) => s.clone(),
-                                            v => v.to_string(),
-                                        }.replace('"', "").replace('\0', "").trim().to_string();
+                                        let (is_valid_share, is_network_block) = crate::diff_engine::verify_share(
+                                            &consensus_header, nonce, current_diff as f64
+                                        );
 
-                                        let clean_nonce = nonce_str.trim_start_matches("0x");
-                                        let mut nonce: u64 = u64::from_str_radix(clean_nonce, 16).unwrap_or(0);
-
-                                        // ⚡ RECONSTRUCT THE FULL NONCE
-                                        if clean_nonce.len() <= 12 { // 6 bytes = 12 chars
-                                            let full_nonce_hex = format!("{}{:0>12}", extranonce1, clean_nonce);
-                                            nonce = u64::from_str_radix(&full_nonce_hex, 16).unwrap_or(nonce);
-                                        }
-
-                                        if let Some(job_entry) = job_manager.active_jobs.get(&job_id) {
-                                            let (consensus_header, mut rpc_block) = job_entry.value().clone();
+                                        if is_network_block {
+                                            tracing::info!("💎💎💎 [{}] NETWORK BLOCK ACQUIRED! Nonce: {:016x}", peer_addr, nonce);
                                             
-                                            let (is_valid_share, is_network_block) = crate::diff_engine::verify_share(
-                                                &consensus_header, nonce, current_diff as f64
-                                            );
+                                            let mut final_header = consensus_header.clone();
+                                            final_header.nonce = nonce;
+                                            let block_hash = kaspa_consensus_core::hashing::header::hash(&final_header).to_string();
 
-                                            if is_network_block {
-                                                tracing::info!("💎💎💎 [{}] NETWORK BLOCK ACQUIRED! Nonce: {:016x}", peer_addr, nonce);
-                                                
-                                                let mut final_header = consensus_header.clone();
-                                                final_header.nonce = nonce;
-                                                let block_hash = kaspa_consensus_core::hashing::header::hash(&final_header).to_string();
-
-                                                if let Some(ref mut rpc_header) = rpc_block.header { rpc_header.nonce = nonce; }
-                                                
-                                                // ⚡ INQUIRY 3 INJECTION: Pipe discovery directly to the Oracle
-                                                let worker_clone = req_worker.clone();
-                                                let diff_clone = current_diff as f64;
-                                                
-                                                tokio::spawn(async move {
-                                                    if let Ok(client) = redis::Client::open("redis://127.0.0.1/") {
-                                                        if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
-                                                            let block_event = serde_json::json!({
-                                                                "worker": worker_clone,
-                                                                "block_hash": block_hash,
-                                                                "nonce": nonce,
-                                                                "network_diff": diff_clone
-                                                            });
-                                                            let _: () = redis::cmd("RPUSH").arg("perennia:oracle:block_buffer").arg(block_event.to_string()).query_async(&mut conn).await.unwrap_or(());
-                                                        }
+                                            if let Some(ref mut rpc_header) = rpc_block.header { rpc_header.nonce = nonce; }
+                                            
+                                            let worker_clone = req_worker.clone();
+                                            let diff_clone = current_diff as f64;
+                                            
+                                            tokio::spawn(async move {
+                                                if let Ok(client) = redis::Client::open("redis://127.0.0.1/") {
+                                                    if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
+                                                        let block_event = serde_json::json!({
+                                                            "worker": worker_clone,
+                                                            "block_hash": block_hash,
+                                                            "nonce": nonce,
+                                                            "network_diff": diff_clone
+                                                        });
+                                                        let _: () = redis::cmd("RPUSH").arg("perennia:oracle:block_buffer").arg(block_event.to_string()).query_async(&mut conn).await.unwrap_or(());
                                                     }
-                                                });
+                                                }
+                                            });
 
-                                                let _ = job_manager.block_submit_tx.try_send(rpc_block);
-                                                
-                                            } else if is_valid_share {
-                                                tracing::info!("✅ [{}] TIER SHARE ACCEPTED | Job: {}", peer_addr, job_id);
-                                                crate::telemetry::WORKER_SHARES.with_label_values(&[&req_worker, "valid"]).inc();
-                                                let _ = valid_share_tx.try_send((req_worker.clone(), current_diff as f64));
-                                            } else {
-                                                tracing::warn!("🚫 [{}] INVALID SHARE | Worker: {}", peer_addr, req_worker);
-                                            }
+                                            let _ = job_manager.block_submit_tx.try_send(rpc_block);
+                                            
+                                        } else if is_valid_share {
+                                            tracing::info!("✅ [{}] TIER SHARE ACCEPTED | Job: {}", peer_addr, job_id);
+                                            crate::telemetry::WORKER_SHARES.with_label_values(&[&req_worker, "valid"]).inc();
+                                            share_count += 1;
+                                            let _ = valid_share_tx.try_send((req_worker.clone(), current_diff as f64));
                                         } else {
-                                            tracing::warn!("⚠️ [{}] STALE JOB REJECTED: {}", peer_addr, job_id);
+                                            tracing::warn!("🚫 [{}] INVALID SHARE | Worker: {}", peer_addr, req_worker);
                                         }
                                     } else {
-                                        tracing::warn!("⚠️ [{}] MALFORMED PARAMS REJECTED", peer_addr);
+                                        tracing::warn!("⚠️ [{}] STALE JOB REJECTED: {}", peer_addr, job_id);
                                     }
                                 }
-
-                                let submit_reply = json!({
-                                    "id": req_id,
-                                    "result": true,
-                                    "error": null
-                                });
-                                let mut response = submit_reply.to_string();
-                                response.push('\n'); 
-                                let _ = write_half.write_all(response.as_bytes()).await;
-
-                            } else {
-                                let catch_json = json!({
-                                    "id": req_id,
-                                    "result": true,
-                                    "error": null
-                                });
-                                let mut response = catch_json.to_string();
-                                response.push('\n'); 
-                                let _ = write_half.write_all(response.as_bytes()).await;
                             }
+
+                            let submit_reply = json!({
+                                "id": req_id,
+                                "result": true,
+                                "error": null
+                            });
+                            let mut response = submit_reply.to_string();
+                            response.push('\n'); 
+                            let _ = write_half.write_all(response.as_bytes()).await;
+
                         } else {
-                            tracing::error!("❌ [{}] JSON PARSE ERROR | Raw: {}", peer_addr, trimmed);
+                            let catch_json = json!({
+                                "id": req_id,
+                                "result": true,
+                                "error": null
+                            });
+                            let mut response = catch_json.to_string();
+                            response.push('\n'); 
+                            let _ = write_half.write_all(response.as_bytes()).await;
                         }
                     }
-                } else {
-                    tracing::error!("❌ [{}] UTF-8 PARSE ERROR / DROPPED | Raw Bytes: {:02X?}", peer_addr, line_buf);
                 }
-                
-                line_buf.clear();
             }
         }
     }
