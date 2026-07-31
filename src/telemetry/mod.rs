@@ -8,11 +8,7 @@ use serde_json::json;
 use std::time::{SystemTime, UNIX_EPOCH};
 use redis::AsyncCommands;
 
-/// ⚡ 7-Tier Harmonic Cascade Time Constants (in Seconds)
-/// Tier 0 (1s) -> Tier 6 (377s Fibonacci Anchor)
 const EMA_WINDOWS: [f64; 7] = [1.0, 3.0, 8.0, 21.0, 55.0, 144.0, 377.0];
-
-/// Kaspa Fixed Difficulty Multiplier Constant (2^32 hashes per unit difficulty)
 const KASPA_DIFF_CONSTANT: f64 = 4_294_967_296.0;
 
 lazy_static! {
@@ -63,13 +59,12 @@ pub async fn start_prometheus_exporter(_bind_addr: String) {
     }
 }
 
-/// Internal struct tracking 64-byte harmonic state per worker
 struct WorkerState {
     last_share_ts: u64,
     emas: [f64; 7],
     shares_contributed: f64,
     unflushed_difficulty: f64,
-    unflushed_oracle_shares: Vec<(f64, u64)>, // (difficulty, timestamp)
+    unflushed_oracle_shares: Vec<(f64, u64)>,
 }
 
 pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String, f64)>) {
@@ -84,13 +79,11 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
         }
     };
 
-    // ⚡ 1000ms METRONOME TICK: High-frequency telemetry broadcast
     let mut flush_interval = tokio::time::interval(tokio::time::Duration::from_millis(1000));
     let mut worker_states: HashMap<String, WorkerState> = HashMap::new();
 
     loop {
         tokio::select! {
-            // ⚡ REAL-TIME SHARE INGESTION: Microsecond Continuous-Time EMA Cascade
             Some((full_worker_name, difficulty)) = valid_share_rx.recv() => {
                 let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
                 let work = difficulty * KASPA_DIFF_CONSTANT;
@@ -105,11 +98,8 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
 
                 let dt_sec = (now.saturating_sub(state.last_share_ts)) as f64 / 1000.0;
 
-                // Execute Continuous-Time EMA Decay Across 7 Harmonic Tiers
                 for (i, &tau) in EMA_WINDOWS.iter().enumerate() {
                     let alpha = 1.0 - f64::exp(-dt_sec / tau);
-                    
-                    // L'Hôpital Limit Guard against instant burst shares
                     let contribution = if dt_sec > 0.001 {
                         (work / dt_sec) * alpha
                     } else {
@@ -124,11 +114,9 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                 state.unflushed_difficulty += difficulty;
                 state.unflushed_oracle_shares.push((difficulty, now));
 
-                // Prometheus Counter Update
                 WORKER_SHARES.with_label_values(&[&full_worker_name, "valid"]).inc_by(difficulty as u64);
             }
 
-            // ⚡ 1000ms BROADCAST METRONOME: Read-Time Decay Projection & Stream Pipeline
             _ = flush_interval.tick() => {
                 if worker_states.is_empty() {
                     continue;
@@ -144,16 +132,15 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                     let dt_idle = (now.saturating_sub(state.last_share_ts)) as f64 / 1000.0;
                     let mut projected_emas = [0.0; 7];
 
-                    // Read-Time Projection Decay (projects drain without touching base state)
                     for (i, &tau) in EMA_WINDOWS.iter().enumerate() {
                         let alpha = 1.0 - f64::exp(-dt_idle / tau);
-                        projected_emas[i] = state.emas[i] * (1.0 - alpha);
+                        let projected = state.emas[i] * (1.0 - alpha);
+                        
+                        // Treat extremely small or negative values as zero to prevent UI errors
+                        projected_emas[i] = if projected > 0.000001 { projected } else { 0.0 };
                     }
 
-                    // Tier 2 (8-second window) serves as the primary UI Hashes/sec rate
                     let current_hashrate = projected_emas[2];
-
-                    // Drop offline if tracking rate falls below 5 GH/s and idle > 30s
                     let is_online = current_hashrate > 5_000_000_000.0 || dt_idle < 30.0;
 
                     if !is_online {
@@ -162,13 +149,10 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                         pipeline.cmd("SREM").arg("pool:workers").arg(full_worker.clone()).ignore();
                     } else {
                         total_hashrate += current_hashrate;
-
-                        // Update Prometheus Gauge (in TH/s)
                         WORKER_HASHRATE.with_label_values(&[full_worker]).set(current_hashrate / 1e12);
 
                         pipeline.cmd("SET").arg(format!("worker:{}:hashrate", full_worker)).arg(current_hashrate).ignore();
 
-                        // Execute Ledger & Oracle Buffer Flushes if new shares were ingested
                         if state.unflushed_difficulty > 0.0 {
                             let parts: Vec<&str> = full_worker.split('.').collect();
                             let wallet = parts[0];
@@ -186,7 +170,6 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                                 });
                                 pipeline.cmd("RPUSH").arg("perennia:oracle:share_buffer").arg(oracle_event.to_string()).ignore();
                             }
-
                             state.unflushed_difficulty = 0.0;
                         }
 
@@ -207,7 +190,6 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                     }
                 }
 
-                // Evict completely drained offline workers
                 for key in keys_to_remove {
                     worker_states.remove(&key);
                 }
@@ -221,21 +203,20 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
 
                 let payload_str = telemetry_payload.to_string();
 
-                // 1. Snapshot Cache for HTTP Polling endpoints
+                // ⚡ RESTORED: The wide JSON console log to visually confirm multiplexer broadcast
+                tracing::info!("📡 [MULTIPLEXER OUT] {}", payload_str);
+
                 pipeline.cmd("SET")
                     .arg("perennia:telemetry")
                     .arg(&payload_str)
                     .ignore();
 
-                // 2. ⚡ REAL-TIME REDIS STREAM: XADD for WebSocket Event Pipelines
-                pipeline.cmd("XADD")
-                    .arg("telemetry:stream")
-                    .arg("MAXLEN").arg("~").arg(100)
-                    .arg("*")
-                    .arg("payload").arg(&payload_str)
+                // ⚡ FIX: Adjusted channel name to "pool_telemetry" to perfectly match your SvelteKit +server.ts
+                pipeline.cmd("PUBLISH")
+                    .arg("pool_telemetry")
+                    .arg(&payload_str)
                     .ignore();
 
-                // Execute Atomic Pipeline
                 if let Err(e) = pipeline.query_async::<_, ()>(&mut redis_conn).await {
                     tracing::error!("🚨 CRITICAL LEDGER FAILURE: {}", e);
                     tracing::warn!("🔄 Attempting to re-establish broken Redis multiplexer pipeline...");

@@ -1,8 +1,10 @@
+# Cargo.toml
+
 [package]
 name = "perennia-stratum-rs"
-version = "0.2.0"
+version = "0.3.0" # Phase 1 Covenant Upgrade
 edition = "2021"
-description = "High-Performance Zero-Allocation Stratum Server for Kaspa Toccata (Streaming Oracle Edition)"
+description = "High-Performance Zero-Allocation Stratum Server for Kaspa Toccata (Silverscript Edition)"
 
 [dependencies]
 tokio = { version = "1.36", features = ["full"] }
@@ -22,17 +24,28 @@ anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dashmap = "6.0"
+axum = "0.7"
+reqwest = { version = "0.11", features = ["json"] }
 
 # 🛡️ SOVEREIGN INFRASTRUCTURE: PostgreSQL Yield Streaming WAL
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.8", features = ["v4", "serde"] }
 
-# 🛡️ Enterprise Path A: Official Kaspa Consensus Core Cryptography
+# ⚡ OMNI-CHAIN ROUTING & MOCK FAUCET
+async-trait = "0.1"
+thiserror = "1.0"
+deadpool-redis = "0.15"
+rand = "0.8"
+
+# 🛡️ Enterprise Path A: Official Kaspa Consensus Core Cryptography (TN12 / Toccata)
 kaspa-consensus-core = { git = "https://github.com/kaspanet/rusty-kaspa", branch = "master" }
 kaspa-hashes = { git = "https://github.com/kaspanet/rusty-kaspa", branch = "master" }
 kaspa-math = { git = "https://github.com/kaspanet/rusty-kaspa", branch = "master" }
 kaspa-pow = { git = "https://github.com/kaspanet/rusty-kaspa", branch = "master" } 
+kaspa-txscript = { git = "https://github.com/kaspanet/rusty-kaspa", branch = "master" }
+kaspa-addresses = { git = "https://github.com/kaspanet/rusty-kaspa", branch = "master" }
+dotenvy = "0.15.7"
 
 [build-dependencies]
 tonic-build = "0.11" 

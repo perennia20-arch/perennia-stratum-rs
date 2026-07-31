@@ -1,3 +1,5 @@
+// src/kaspad_client/mod.rs
+
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -57,15 +59,23 @@ pub async fn start_kaspad_client(
         payload: Some(RequestPayload::NotifyBlockAddedRequest(NotifyBlockAddedRequestMessage { command: 0 })),
     }).await?;
 
+    // ⚡ Dynamically poll Redis for the mining address before the first request
+    let mut initial_pay_address = config.mining_address.clone();
+    if let Ok(Some(addr)) = redis_conn.get::<_, Option<String>>("perennia:stratum:mining_address").await {
+        if !addr.is_empty() {
+            initial_pay_address = addr;
+        }
+    }
+
     tx.send(KaspadRequest {
         id: 2,
         payload: Some(RequestPayload::GetBlockTemplateRequest(GetBlockTemplateRequestMessage {
-            pay_address: config.mining_address.clone(),
+            pay_address: initial_pay_address,
             extra_data: "Perennia-Zero-Allocation".to_string(),
         })),
     }).await?;
 
-    let mining_address = config.mining_address.clone();
+    let fallback_address = config.mining_address.clone();
     let tx_clone = tx.clone();
     
     tokio::spawn(async move {
@@ -89,10 +99,19 @@ pub async fn start_kaspad_client(
                 }
                 Some(ResponsePayload::BlockAddedNotification(_)) => {
                     req_id += 1;
+                    
+                    // ⚡ Dynamically poll Redis to hot-swap the address on the fly
+                    let mut current_pay_address = fallback_address.clone();
+                    if let Ok(Some(addr)) = redis_conn.get::<_, Option<String>>("perennia:stratum:mining_address").await {
+                        if !addr.is_empty() {
+                            current_pay_address = addr;
+                        }
+                    }
+
                     let _ = tx_clone.send(KaspadRequest {
                         id: req_id,
                         payload: Some(RequestPayload::GetBlockTemplateRequest(GetBlockTemplateRequestMessage {
-                            pay_address: mining_address.clone(),
+                            pay_address: current_pay_address,
                             extra_data: "Perennia-Zero-Allocation".to_string(),
                         })),
                     }).await;

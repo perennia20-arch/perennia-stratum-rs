@@ -1,23 +1,41 @@
-mod config;
-mod stratum_tcp;
-mod telemetry;
-mod kaspad_client;
-mod job_manager; 
-mod diff_engine; 
-mod oracle;
+// src/main.rs
+
+use perennia_stratum_rs::{
+    api, config, diff_engine, job_manager, kaspad_client, 
+    omnichain, oracle, stratum_tcp, telemetry
+};
 
 use std::sync::Arc;
+use std::env;
 use tokio::sync::mpsc;
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 use job_manager::JobManager;
+use deadpool_redis::{Config, Runtime};
+use axum::{routing::post, Router};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // ⚡ Load environment variables
+    dotenvy::dotenv().ok();
+
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
         .finish();
     tracing::subscriber::set_global_default(subscriber).expect("Failed to init tracing");
+
+    // ==============================================================================
+    // 🧪 PHASE 1.5 TEST HARNESS: PRINT P2SH COVENANT TO CONSOLE
+    // ==============================================================================
+    let (test_script, test_addr) = omnichain::scripts::SilverscriptCompiler::compile_test_lock();
+    let redeem_hex = test_script.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+    
+    tracing::info!("==================================================");
+    tracing::info!("🧪 TN12 BURN TEST COVENANT COMPILED SUCCESSFULLY");
+    tracing::info!("   -> Redeem Script Hex: {}", redeem_hex); // Expected: 014287
+    tracing::info!("   -> Target P2SH Address: {}", test_addr);
+    tracing::info!("==================================================");
+    // ==============================================================================
 
     tracing::info!("Booting Perennia Multi-Tier Stratum Engine...");
 
@@ -53,6 +71,33 @@ async fn main() -> anyhow::Result<()> {
             tracing::error!("Kaspa gRPC Connection Failed: {}", e);
         }
     });
+
+    // ==============================================================================
+    // ⚡ AXUM SOR HTTP SERVER WIRING (Port 8082)
+    // ==============================================================================
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let redis_cfg = Config::from_url(redis_url);
+    let redis_pool = redis_cfg.create_pool(Some(Runtime::Tokio1)).expect("Failed to create Redis pool");
+    
+    // ⚡ Spawn the External Liquidity Poller (Tier 2/3 Aggregation)
+    let poller_pool = redis_pool.clone();
+    tokio::spawn(async move {
+        omnichain::liquidity_poller::start_liquidity_poller(poller_pool).await;
+    });
+
+    let provider = omnichain::initialize_provider().await;
+    let sor = Arc::new(omnichain::router::SmartOrderRouter::new(Arc::new(provider), redis_pool));
+
+    let app = Router::new()
+        .route("/v1/sor/lock", post(api::sor_lock_handler))
+        .with_state(sor);
+
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:8082").await.unwrap();
+        tracing::info!("🚀 Axum SOR HTTP Server listening on 0.0.0.0:8082");
+        axum::serve(listener, app).await.unwrap();
+    });
+    // ==============================================================================
 
     // ⚡ STRICT REQUIREMENT 1: 3-Tier Tokio Listeners
     

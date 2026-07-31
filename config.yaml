@@ -1,9 +1,9 @@
-# Core Network Parameters
+# Core Network Parameters (Kaspa TN12 - Toccata)
 stratum_port: ":5555"
-kaspad_address: "192.168.0.12:16110"
+kaspad_address: "192.168.0.12:16210" # Shifted from 16110 to TN12
 
-# Central Pool Wallet
-mining_address: "kaspa:qz2sehqzx8xetzkhz2ycqflwf8dhusyxhj0myv4ez72k0n6vdaj827jexnyzz"
+# Central Pool Wallet (Testnet-12 P2SH Covenant Boundary)
+mining_address: "kaspatest:qqktt4fyd3t8hg0d2mxzcle69cx33wnzd59v4zguc5ywc2lfvtq6cvcwlwzus"
 
 # Public Pool Mechanics
 starting_diff: 64       # ⚡ Allows KS0 Ultras to survive
