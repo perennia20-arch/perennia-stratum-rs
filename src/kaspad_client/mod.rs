@@ -10,7 +10,7 @@ pub mod protowire {
 }
 
 use protowire::rpc_client::RpcClient;
-use protowire::{KaspadRequest, GetBlockTemplateRequestMessage, NotifyBlockAddedRequestMessage, SubmitBlockRequestMessage};
+use protowire::{KaspadRequest, GetBlockTemplateRequestMessage, NotifyBlockAddedRequestMessage, SubmitBlockRequestMessage, NotifyNewBlockTemplateRequestMessage};
 use protowire::kaspad_request::Payload as RequestPayload;
 use protowire::kaspad_response::Payload as ResponsePayload;
 use protowire::RpcBlock;
@@ -59,11 +59,37 @@ pub async fn start_kaspad_client(
 
     tx.send(KaspadRequest {
         id: 2,
+        payload: Some(RequestPayload::NotifyNewBlockTemplateRequest(NotifyNewBlockTemplateRequestMessage { command: 0 })),
+    }).await?;
+
+    tx.send(KaspadRequest {
+        id: 3,
         payload: Some(RequestPayload::GetBlockTemplateRequest(GetBlockTemplateRequestMessage {
             pay_address: config.mining_address.clone(),
             extra_data: "Perennia-Zero-Allocation".to_string(),
         })),
     }).await?;
+
+    let tx_poll = tx.clone();
+    let mining_address_poll = config.mining_address.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(1000));
+        let mut req_id = 50000;
+        loop {
+            interval.tick().await;
+            req_id += 1;
+            let req = KaspadRequest {
+                id: req_id,
+                payload: Some(RequestPayload::GetBlockTemplateRequest(GetBlockTemplateRequestMessage {
+                    pay_address: mining_address_poll.clone(),
+                    extra_data: "Perennia-Zero-Allocation".to_string(),
+                })),
+            };
+            if tx_poll.send(req).await.is_err() {
+                break;
+            }
+        }
+    });
 
     let mining_address = config.mining_address.clone();
     let tx_clone = tx.clone();
@@ -73,10 +99,11 @@ pub async fn start_kaspad_client(
         while let Ok(Some(response)) = response_stream.message().await {
             match response.payload {
                 Some(ResponsePayload::GetBlockTemplateResponse(res)) => {
-                    if let Some(block) = res.block {
+                    if let Some(err) = res.error {
+                        tracing::error!("❌ GET_BLOCK_TEMPLATE REJECTED BY NODE: {}", err.message);
+                    } else if let Some(block) = res.block {
                         if let Some(header) = &block.header {
                             tracing::debug!("🧊 Toccata Block Template Acquired! Blue Score: {}", header.blue_score);
-                            // ⚡ FIX: Re-establish dropped node ping dynamically
                             let set_res: redis::RedisResult<()> = redis_conn.set("perennia:node:sync_status", "Online (Toccata Core)").await;
                             if set_res.is_err() {
                                 if let Ok(new_conn) = redis_client.get_multiplexed_async_connection().await {
@@ -87,7 +114,8 @@ pub async fn start_kaspad_client(
                         }
                     }
                 }
-                Some(ResponsePayload::BlockAddedNotification(_)) => {
+                Some(ResponsePayload::BlockAddedNotification(_)) |
+                Some(ResponsePayload::NewBlockTemplateNotification(_)) => {
                     req_id += 1;
                     let _ = tx_clone.send(KaspadRequest {
                         id: req_id,
@@ -107,6 +135,9 @@ pub async fn start_kaspad_client(
                 _ => {}
             }
         }
+        
+        tracing::error!("🚨 Kaspa node gRPC connection lost! Stratum halting to force restart...");
+        std::process::exit(1);
     });
 
     Ok(())

@@ -12,10 +12,11 @@ use kaspa_math::Uint192;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, Duration};
-use std::fmt::Write; // ⚡ REQUIRED TO BUILD THE 80-CHAR ICERIVER HEX STRING
+use std::fmt::Write;
 
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct StratumJob {
     pub job_id: String,
@@ -52,9 +53,15 @@ impl JobManager {
                 let mut stale_keys = Vec::new();
 
                 for entry in gc_manager.job_timestamps.iter() {
-                    if now.duration_since(*entry.value()) > Duration::from_secs(120) {
+                    if now.duration_since(*entry.value()) > Duration::from_secs(300) {
                         stale_keys.push(entry.key().clone());
                     }
+                }
+
+                let active_count = gc_manager.active_jobs.len();
+                if stale_keys.len() >= active_count && active_count > 0 {
+                    stale_keys.sort_by_key(|k| gc_manager.job_timestamps.get(k).map(|v| *v).unwrap_or(now));
+                    stale_keys.pop(); 
                 }
 
                 for key in stale_keys {
@@ -104,7 +111,6 @@ impl JobManager {
             self.active_jobs.insert(job_id.clone(), (consensus_header.clone(), block.clone()));
             self.job_timestamps.insert(job_id.clone(), Instant::now()); 
 
-            // 1. EXACT BRIDGE CRYPTOGRAPHY: Hash the state with Time = 0 and Nonce = 0
             let pre_pow_hash = kaspa_consensus_core::hashing::header::hash_override_nonce_time(
                 &consensus_header, 
                 0, 
@@ -112,7 +118,6 @@ impl JobManager {
             );
             let hb = pre_pow_hash.as_bytes();
 
-            // 2. THE BIG JOB STRING: IceRiver demands a single 80-char hex string (32-byte Hash + 8-byte LE Timestamp)
             let mut large_job_param = String::with_capacity(80);
             
             for b in hb {
@@ -125,7 +130,6 @@ impl JobManager {
                 write!(&mut large_job_param, "{:02x}", b).unwrap();
             }
 
-            // 3. THE ICERIVER PAYLOAD: Exactly two elements in the array. No booleans, no integer arrays!
             let notify_payload = json!({
                 "id": null,
                 "method": "mining.notify",

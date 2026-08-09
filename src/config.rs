@@ -2,6 +2,7 @@ use serde::Deserialize;
 use std::fs;
 use anyhow::{Context, Result};
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize, Clone)]
 pub struct StratumConfig {
     pub stratum_port: String,

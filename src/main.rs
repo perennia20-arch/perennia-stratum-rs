@@ -5,11 +5,15 @@ mod kaspad_client;
 mod job_manager; 
 mod diff_engine; 
 mod oracle;
+mod sor; // ⚡ Inject the new Live SOR Engine
+mod chronos; // ⚡ Inject the Chronos Engine
 
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
+use axum::{routing::post, Router};
+use sqlx::postgres::PgPoolOptions;
 use job_manager::JobManager;
 
 #[tokio::main]
@@ -19,10 +23,28 @@ async fn main() -> anyhow::Result<()> {
         .finish();
     tracing::subscriber::set_global_default(subscriber).expect("Failed to init tracing");
 
-    tracing::info!("Booting Perennia Multi-Tier Stratum Engine...");
+    tracing::info!("Booting Perennia Core Engine (Hybrid Mainnet + Stratum)...");
 
     let config = Arc::new(config::StratumConfig::load("config.yaml")?);
-    tracing::info!("Targeted Pool Wallet: {}", config.mining_address);
+    tracing::info!("Targeted Treasury Wallet: {}", config.mining_address);
+
+    tracing::info!("Initializing PostgreSQL Pool...");
+    let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://postgres:password@127.0.0.1:5432/perennia".to_string());
+    
+    let pool = PgPoolOptions::new()
+        .max_connections(10)
+        .connect(&db_url)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("Failed to connect to PostgreSQL (Ensure DB is running): {}", e);
+            panic!("Database connection required for routing dependencies: {}", e);
+        });
+
+    // ⚡ Ignite Chronos Backend Daemon
+    let pool_chronos = pool.clone();
+    tokio::spawn(async move {
+        chronos::start_chronos_daemon(pool_chronos).await;
+    });
 
     telemetry::init_telemetry();
     let prom_port = config.prom_port.clone();
@@ -30,21 +52,25 @@ async fn main() -> anyhow::Result<()> {
         telemetry::start_prometheus_exporter(prom_port).await;
     });
 
-    // ⚡ Build the shared Accounting Channel
     let (valid_share_tx, valid_share_rx) = mpsc::channel(10000);
 
-    // ⚡ Spawn the background Redis Ledger Thread (Phase 1 Ingestion)
     tokio::spawn(async move {
         telemetry::start_accounting_engine(valid_share_rx).await;
     });
 
-    // ⚡ Spawn the Persistent Yield Streaming Oracle (PostgreSQL WAL)
     tokio::spawn(async move {
         oracle::start_oracle_daemon().await;
     });
 
+    // ⚡ Ignite the Global Spot Pricing Oracle Daemon
+    tokio::spawn(async move {
+        oracle::start_spot_pricing_daemon().await;
+    });
+
+    // Restore Job Manager
     let (job_manager_arc, _job_rx, block_submit_rx) = JobManager::new();
 
+    // Restore Kaspad Client
     let config_clone = config.clone();
     let jm_clone = job_manager_arc.clone();
     
@@ -54,8 +80,21 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // ⚡ STRICT REQUIREMENT 1: 3-Tier Tokio Listeners
-    
+    // ⚡ API Isolation: The Smart Order Router execution engine binds cleanly to port 8002
+    let app = Router::new()
+        .route("/v1/sor/execute", post(sor::handle_sor_execute))
+        .with_state(pool);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8002").await?;
+    tokio::spawn(async move {
+        tracing::info!("🚀 Axum HTTP Server bound instantly on port 8002 (SOR Protocol Armed)");
+        if let Err(e) = axum::serve(listener, app).await {
+            tracing::error!("Axum Server Error: {}", e);
+        }
+    });
+
+    // ⚡ Restore 3-Tier Tokio Listeners for Physical Hash Power
+
     // Tier 1: GPU/Mobile | Bind: 0.0.0.0:5551 | Diff: 1.0 | Throttle: 0ms
     let cfg_t1 = config.clone();
     let jm_t1 = job_manager_arc.clone();

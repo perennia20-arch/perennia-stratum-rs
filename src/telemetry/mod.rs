@@ -124,92 +124,90 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                 state.unflushed_difficulty += difficulty;
                 state.unflushed_oracle_shares.push((difficulty, now));
 
-                // Prometheus Counter Update
+                // ⚡ COMPILER FIX: IntCounterVec target WORKER_SHARES selected over GaugeVec WORKER_HASHRATE
                 WORKER_SHARES.with_label_values(&[&full_worker_name, "valid"]).inc_by(difficulty as u64);
             }
 
             // ⚡ 1000ms BROADCAST METRONOME: Read-Time Decay Projection & Stream Pipeline
             _ = flush_interval.tick() => {
-                if worker_states.is_empty() {
-                    continue;
-                }
-
                 let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
                 let mut pipeline = redis::pipe();
                 let mut total_hashrate = 0.0;
                 let mut workers_array = Vec::new();
                 let mut keys_to_remove = Vec::new();
 
-                for (full_worker, state) in worker_states.iter_mut() {
-                    let dt_idle = (now.saturating_sub(state.last_share_ts)) as f64 / 1000.0;
-                    let mut projected_emas = [0.0; 7];
+                if !worker_states.is_empty() {
+                    for (full_worker, state) in worker_states.iter_mut() {
+                        let dt_idle = (now.saturating_sub(state.last_share_ts)) as f64 / 1000.0;
+                        let mut projected_emas = [0.0; 7];
 
-                    // Read-Time Projection Decay (projects drain without touching base state)
-                    for (i, &tau) in EMA_WINDOWS.iter().enumerate() {
-                        let alpha = 1.0 - f64::exp(-dt_idle / tau);
-                        projected_emas[i] = state.emas[i] * (1.0 - alpha);
-                    }
-
-                    // Tier 2 (8-second window) serves as the primary UI Hashes/sec rate
-                    let current_hashrate = projected_emas[2];
-
-                    // Drop offline if tracking rate falls below 5 GH/s and idle > 30s
-                    let is_online = current_hashrate > 5_000_000_000.0 || dt_idle < 30.0;
-
-                    if !is_online {
-                        keys_to_remove.push(full_worker.clone());
-                        pipeline.cmd("SET").arg(format!("worker:{}:hashrate", full_worker)).arg(0.0).ignore();
-                        pipeline.cmd("SREM").arg("pool:workers").arg(full_worker.clone()).ignore();
-                    } else {
-                        total_hashrate += current_hashrate;
-
-                        // Update Prometheus Gauge (in TH/s)
-                        WORKER_HASHRATE.with_label_values(&[full_worker]).set(current_hashrate / 1e12);
-
-                        pipeline.cmd("SET").arg(format!("worker:{}:hashrate", full_worker)).arg(current_hashrate).ignore();
-
-                        // Execute Ledger & Oracle Buffer Flushes if new shares were ingested
-                        if state.unflushed_difficulty > 0.0 {
-                            let parts: Vec<&str> = full_worker.split('.').collect();
-                            let wallet = parts[0];
-                            let wallet_key = format!("perennia:ledger:wallet:{}", wallet);
-
-                            pipeline.cmd("INCRBYFLOAT").arg(&wallet_key).arg(state.unflushed_difficulty).ignore();
-                            pipeline.cmd("SADD").arg("pool:workers").arg(full_worker.clone()).ignore();
-                            pipeline.cmd("INCRBYFLOAT").arg(format!("worker:{}:shares", full_worker)).arg(state.unflushed_difficulty).ignore();
-
-                            for (diff, ts) in state.unflushed_oracle_shares.drain(..) {
-                                let oracle_event = json!({
-                                    "worker": full_worker,
-                                    "difficulty": diff,
-                                    "timestamp": ts
-                                });
-                                pipeline.cmd("RPUSH").arg("perennia:oracle:share_buffer").arg(oracle_event.to_string()).ignore();
-                            }
-
-                            state.unflushed_difficulty = 0.0;
+                        // Read-Time Projection Decay (projects drain without touching base state)
+                        for (i, &tau) in EMA_WINDOWS.iter().enumerate() {
+                            let alpha = 1.0 - f64::exp(-dt_idle / tau);
+                            projected_emas[i] = state.emas[i] * (1.0 - alpha);
                         }
 
-                        let parts: Vec<&str> = full_worker.split('.').collect();
-                        let wallet_address = if !parts.is_empty() { parts[0] } else { full_worker.as_str() };
-                        let worker_name = if parts.len() > 1 { parts[1..].join(".") } else { full_worker.to_string() };
+                        // Tier 2 (8-second window) serves as the primary UI Hashes/sec rate
+                        let current_hashrate = projected_emas[2];
 
-                        workers_array.push(json!({
-                            "fullIdentity": full_worker,
-                            "walletAddress": wallet_address,
-                            "name": worker_name,
-                            "trackingRate": current_hashrate,
-                            "sharesContributed": state.shares_contributed,
-                            "blocksFound": 0,
-                            "status": "online",
-                            "harmonicMesh": projected_emas
-                        }));
+                        // Drop offline if tracking rate falls below 5 GH/s and idle > 30s
+                        let is_online = current_hashrate > 5_000_000_000.0 || dt_idle < 30.0;
+
+                        if !is_online {
+                            keys_to_remove.push(full_worker.clone());
+                            pipeline.cmd("SET").arg(format!("worker:{}:hashrate", full_worker)).arg(0.0).ignore();
+                            pipeline.cmd("SREM").arg("pool:workers").arg(full_worker.clone()).ignore();
+                        } else {
+                            total_hashrate += current_hashrate;
+
+                            // Update Prometheus Gauge (in TH/s)
+                            WORKER_HASHRATE.with_label_values(&[full_worker]).set(current_hashrate / 1e12);
+
+                            pipeline.cmd("SET").arg(format!("worker:{}:hashrate", full_worker)).arg(current_hashrate).ignore();
+
+                            // Execute Ledger & Oracle Buffer Flushes if new shares were ingested
+                            if state.unflushed_difficulty > 0.0 {
+                                let parts: Vec<&str> = full_worker.split('.').collect();
+                                let wallet = parts[0];
+                                let wallet_key = format!("perennia:ledger:wallet:{}", wallet);
+
+                                pipeline.cmd("INCRBYFLOAT").arg(&wallet_key).arg(state.unflushed_difficulty).ignore();
+                                pipeline.cmd("SADD").arg("pool:workers").arg(full_worker.clone()).ignore();
+                                pipeline.cmd("INCRBYFLOAT").arg(format!("worker:{}:shares", full_worker)).arg(state.unflushed_difficulty).ignore();
+
+                                for (diff, ts) in state.unflushed_oracle_shares.drain(..) {
+                                    let oracle_event = json!({
+                                        "worker": full_worker,
+                                        "difficulty": diff,
+                                        "timestamp": ts
+                                    });
+                                    pipeline.cmd("RPUSH").arg("perennia:oracle:share_buffer").arg(oracle_event.to_string()).ignore();
+                                }
+
+                                state.unflushed_difficulty = 0.0;
+                            }
+
+                            let parts: Vec<&str> = full_worker.split('.').collect();
+                            let wallet_address = if !parts.is_empty() { parts[0] } else { full_worker.as_str() };
+                            let worker_name = if parts.len() > 1 { parts[1..].join(".") } else { full_worker.to_string() };
+
+                            workers_array.push(json!({
+                                "fullIdentity": full_worker,
+                                "walletAddress": wallet_address,
+                                "name": worker_name,
+                                "trackingRate": current_hashrate,
+                                "sharesContributed": state.shares_contributed,
+                                "blocksFound": 0,
+                                "status": "online",
+                                "harmonicMesh": projected_emas
+                            }));
+                        }
                     }
-                }
 
-                // Evict completely drained offline workers
-                for key in keys_to_remove {
-                    worker_states.remove(&key);
+                    // Evict completely drained offline workers
+                    for key in keys_to_remove {
+                        worker_states.remove(&key);
+                    }
                 }
 
                 pipeline.cmd("SET").arg("pool:hashrate").arg(total_hashrate).ignore();
@@ -233,6 +231,12 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                     .arg("MAXLEN").arg("~").arg(100)
                     .arg("*")
                     .arg("payload").arg(&payload_str)
+                    .ignore();
+                    
+                // 3. ⚡ SVELTEKIT SSE: Pub/Sub Broadcast
+                pipeline.cmd("PUBLISH")
+                    .arg("telemetry:updates")
+                    .arg(&payload_str)
                     .ignore();
 
                 // Execute Atomic Pipeline

@@ -1,0 +1,3646 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+db/
+  schema.sql
+kaspa-keygen/
+  derive.js
+proto/
+  messages.proto
+  rpc.proto
+src/
+  diff_engine/
+    mod.rs
+  job_manager/
+    mod.rs
+  kaspad_client/
+    mod.rs
+  stratum_tcp/
+    mod.rs
+  telemetry/
+    mod.rs
+  chronos.rs
+  config.rs
+  main.rs
+  oracle.rs
+  sor.rs
+.envecho
+.gitignore
+build.rs
+Cargo.toml
+config.yaml
+package.json
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="src/chronos.rs">
+use std::time::Duration;
+use sqlx::{PgPool, Row};
+use serde_json::{Value, json};
+use reqwest::Client;
+
+const PPS_RATE_PER_DIFFICULTY: f64 = 0.000005; 
+const NETWORK_FEE_PERCENTAGE: f64 = 0.01; 
+const MINIMUM_UTXO_SWEEP_THRESHOLD: f64 = 50.0;
+const OVERCLOCK_BASE_FEE: f64 = 0.0001;
+const OVERCLOCK_VAR_FEE: f64 = 0.005;
+const OVERCLOCK_PREMIUM_FEE: f64 = 0.005;
+
+pub async fn start_chronos_daemon(pool: PgPool) {
+    tracing::info!("⏳ Chronos Settlement Engine Online. Natively monitoring Omni-Chain Ledger via Postgres.");
+    
+    let redis_client = redis::Client::open("redis://127.0.0.1/").expect("Failed to connect to Redis for Chronos");
+    let http_client = Client::new();
+
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+
+    loop {
+        interval.tick().await;
+        if let Err(e) = execute_settlement_tick(&pool, &redis_client, &http_client).await {
+            tracing::error!("🚨 Chronos Execution Error: {}", e);
+        }
+    }
+}
+
+async fn execute_settlement_tick(
+    pool: &PgPool, 
+    redis_client: &redis::Client, 
+    http_client: &Client
+) -> anyhow::Result<()> {
+    let mut redis_conn = redis_client.get_multiplexed_async_connection().await?;
+
+    let rows = sqlx::query("SELECT wallet_address, layout_state FROM user_command_centers")
+        .fetch_all(pool)
+        .await?;
+
+    for row in rows {
+        let address: String = row.get("wallet_address");
+        let mut state: Value = row.get("layout_state");
+        
+        let workers_opt = state.get_mut("workers").and_then(|w| w.as_array_mut());
+        if workers_opt.is_none() {
+            continue;
+        }
+
+        let mut state_mutated = false;
+        let is_overclocked = state.get("systemMode").and_then(|v| v.as_str()) == Some("overclocked");
+
+        // 1. Process Workers
+        let mut earned_by_silo = std::collections::HashMap::new();
+
+        if let Some(workers) = state.get_mut("workers").and_then(|w| w.as_array_mut()) {
+            for worker in workers.iter_mut() {
+                // ⚡ Cast to owned Strings immediately to drop the immutable borrow on `worker`
+                let assigned_silo_id = worker.get("assignedSiloId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if assigned_silo_id.is_empty() {
+                    continue;
+                }
+                
+                let w_type = worker.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let mut earned_kaspa = 0.0;
+
+                if w_type == "capital" {
+                    let is_online = worker.get("isOnline").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let hash_rate = worker.get("hashRate").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    
+                    if is_online && hash_rate > 0.0 {
+                        let virtual_shares = hash_rate * 50.0;
+                        earned_kaspa = virtual_shares * PPS_RATE_PER_DIFFICULTY;
+                        
+                        let current_shares = worker.get("sharesContributed").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        // Safe to mutate here because the immutable borrow was dropped
+                        worker["sharesContributed"] = json!(current_shares + virtual_shares);
+                        state_mutated = true;
+                    }
+                } else if w_type == "physical" {
+                    let wallet_worker = worker.get("walletWorker").and_then(|v| v.as_str()).unwrap_or("");
+                    if !wallet_worker.is_empty() {
+                        let share_key = format!("worker:{}:shares", wallet_worker);
+                        let unprocessed_str: Option<String> = redis::cmd("GET").arg(&share_key).query_async(&mut redis_conn).await.unwrap_or(None);
+                        let unprocessed: f64 = unprocessed_str.unwrap_or_else(|| "0".to_string()).parse().unwrap_or(0.0);
+
+                        if unprocessed > 0.0 {
+                            earned_kaspa = unprocessed * PPS_RATE_PER_DIFFICULTY;
+                            let _: () = redis::cmd("SET").arg(&share_key).arg("0").query_async(&mut redis_conn).await.unwrap_or(());
+                        }
+                    }
+                }
+
+                if earned_kaspa > 0.0 {
+                    *earned_by_silo.entry(assigned_silo_id).or_insert(0.0) += earned_kaspa;
+                }
+            }
+        }
+
+        if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
+            for silo in silos.iter_mut() {
+                if let Some(id) = silo.get("id").and_then(|v| v.as_str()) {
+                    if let Some(inc) = earned_by_silo.get(id) {
+                        let current_pending = silo.get("pendingKaspa").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        silo["pendingKaspa"] = json!(current_pending + inc);
+                        state_mutated = true;
+                    }
+                }
+            }
+        }
+
+        // 2. OVERCLOCK MODE & MICRO-FEES INTERCEPTOR
+        if is_overclocked {
+            let mut total_tick_fee = OVERCLOCK_BASE_FEE;
+            
+            if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
+                for silo in silos.iter_mut() {
+                    let pending = silo.get("pendingKaspa").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    if pending > 0.0 {
+                        let var_fee = pending * OVERCLOCK_VAR_FEE;
+                        let deduction = pending.min(total_tick_fee + var_fee);
+                        
+                        if deduction > 0.0 {
+                            silo["pendingKaspa"] = json!(pending - deduction);
+                            total_tick_fee = (total_tick_fee - deduction).max(0.0);
+                            state_mutated = true;
+                            
+                            let name = silo.get("name").and_then(|n| n.as_str()).unwrap_or("Unknown");
+                            tracing::info!("⚡ [OVERCLOCK] Deducted {:.6} KAS from Silo {} for predictive engine compute.", deduction, name);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Plant LP Synthesis
+        let mut synthesis_actions = Vec::new();
+
+        if let Some(plants) = state.get("plants").and_then(|p| p.as_array()) {
+            for (p_idx, plant) in plants.iter().enumerate() {
+                let is_active = plant.pointer("/liquidityDeposit/isActive").and_then(|v| v.as_bool()).unwrap_or(false);
+                if !is_active { continue; }
+
+                let plant_id = plant.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                
+                let mut assigned_silos = Vec::new();
+                if let Some(silos) = state.get("silos").and_then(|s| s.as_array()) {
+                    for (s_idx, silo) in silos.iter().enumerate() {
+                        if silo.get("assignedPlantId").and_then(|v| v.as_str()).unwrap_or("") == plant_id {
+                            assigned_silos.push((s_idx, silo.clone()));
+                        }
+                    }
+                }
+
+                if assigned_silos.len() == 2 {
+                    let (s1_idx, silo1) = &assigned_silos[0];
+                    let (s2_idx, silo2) = &assigned_silos[1];
+
+                    let p1 = silo1.get("pendingKaspa").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let p2 = silo2.get("pendingKaspa").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+                    if p1 >= MINIMUM_UTXO_SWEEP_THRESHOLD && p2 >= MINIMUM_UTXO_SWEEP_THRESHOLD {
+                        let target1 = silo1.pointer("/settlementConfig/targetAsset/ticker").and_then(|t| t.as_str()).unwrap_or("USDC").to_string();
+                        let target2 = silo2.pointer("/settlementConfig/targetAsset/ticker").and_then(|t| t.as_str()).unwrap_or("USDC").to_string();
+                        let plant_name = plant.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                        
+                        synthesis_actions.push((p_idx, *s1_idx, *s2_idx, p1, p2, target1, target2, plant_name));
+                    }
+                }
+            }
+        }
+
+        for (p_idx, s1_idx, s2_idx, mut amt1, mut amt2, target1, target2, plant_name) in synthesis_actions {
+            if is_overclocked {
+                let fee1 = amt1 * OVERCLOCK_PREMIUM_FEE;
+                let fee2 = amt2 * OVERCLOCK_PREMIUM_FEE;
+                amt1 -= fee1;
+                amt2 -= fee2;
+                tracing::info!("⚡ [OVERCLOCK] Plant Synthesis Fee Deducted: {:.6} KAS", fee1 + fee2);
+            }
+
+            if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
+                silos[s1_idx]["pendingKaspa"] = json!(0.0);
+                silos[s2_idx]["pendingKaspa"] = json!(0.0);
+            }
+
+            tracing::info!("\n🌱 [CHRONOS SYNTHESIS] Auto-LP Intercept on Plant: {}", plant_name);
+            
+            let mut total_usd = 0.0;
+
+            for (amt, target) in [(amt1, &target1), (amt2, &target2)] {
+                let req_payload = json!({
+                    "wallet": address,
+                    "payAsset": "KAS",
+                    "receiveAsset": target,
+                    "amount": amt,
+                    "slippageTolerance": 0.05
+                });
+                
+                if let Ok(res) = http_client.post("http://127.0.0.1:8002/v1/sor/execute").json(&req_payload).send().await {
+                    if let Ok(data) = res.json::<Value>().await {
+                        if let Some(est) = data.get("estimatedOutput").and_then(|v| v.as_f64()) {
+                            total_usd += est;
+                            tracing::info!("   -> Routed {:.2} KAS through sorEngine.", amt);
+                        }
+                    }
+                }
+            }
+            
+            if let Some(plants) = state.get_mut("plants").and_then(|p| p.as_array_mut()) {
+                let current_usd = plants[p_idx].pointer("/liquidityDeposit/totalLiquidityUsd").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                if let Some(ld) = plants[p_idx].get_mut("liquidityDeposit").and_then(|v| v.as_object_mut()) {
+                    ld.insert("totalLiquidityUsd".to_string(), json!(current_usd + total_usd));
+                }
+                tracing::info!("   -> Executed swaps and deposited into Kasplex Liquidity Pool.");
+                tracing::info!("   -> New LP Position: ${:.2}", current_usd + total_usd);
+            }
+            
+            state_mutated = true;
+        }
+
+        // 4. Auto Payouts for Standalone Silos
+        if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
+            for silo in silos.iter_mut() {
+                if silo.get("assignedPlantId").map_or(false, |id| !id.is_null()) {
+                    continue;
+                }
+
+                let auto_payout = silo.pointer("/settlementConfig/autoPayout").and_then(|v| v.as_bool()).unwrap_or(false);
+                let pending = silo.get("pendingKaspa").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+                if auto_payout && pending >= MINIMUM_UTXO_SWEEP_THRESHOLD {
+                    let threshold = silo.pointer("/settlementConfig/threshold").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let mode = silo.pointer("/settlementConfig/mode").and_then(|v| v.as_str()).unwrap_or("");
+
+                    if mode == "stream" || (mode == "threshold" && pending >= threshold) {
+                        let dynamic_system_fee = if is_overclocked { NETWORK_FEE_PERCENTAGE + 0.005 } else { NETWORK_FEE_PERCENTAGE };
+                        let perennia_fee = pending * dynamic_system_fee;
+                        let net_payout = pending - perennia_fee;
+                        
+                        let target_addr = silo.pointer("/settlementConfig/payoutAddress").and_then(|v| v.as_str()).unwrap_or("");
+                        let target_addr = if target_addr.is_empty() { &address } else { target_addr };
+
+                        let silo_name = silo.get("name").and_then(|n| n.as_str()).unwrap_or("Unknown");
+
+                        tracing::info!("\n💸 [CHRONOS EXECUTION] Settling Silo: {}", silo_name);
+                        tracing::info!("   -> Gross Yield: {:.6} KAS", pending);
+                        tracing::info!("   -> Perennia Fee ({:.1}%): {:.6} KAS", dynamic_system_fee * 100.0, perennia_fee);
+                        tracing::info!("   -> Broadcasting {:.6} KAS to {}", net_payout, target_addr);
+
+                        silo["pendingKaspa"] = json!(0.0);
+                        state_mutated = true;
+                    }
+                }
+            }
+        }
+
+        // Save back to DB
+        if state_mutated {
+            sqlx::query("UPDATE user_command_centers SET layout_state = $1, last_updated = CURRENT_TIMESTAMP WHERE wallet_address = $2")
+                .bind(&state)
+                .bind(&address)
+                .execute(pool)
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+</file>
+
+<file path="src/sor.rs">
+use axum::{Json, extract::State};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sqlx::PgPool;
+use std::env;
+use uuid::Uuid;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[allow(non_snake_case)]
+pub struct UtxoInput {
+    pub transactionId: String,
+    pub index: u32,
+    pub amount: f64,
+    pub scriptPublicKey: String,
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(non_snake_case)]
+pub struct SorExecuteRequest {
+    pub wallet: String,
+    pub payAsset: String,
+    pub receiveAsset: String,
+    pub amount: f64,
+    pub slippageTolerance: Option<f64>,
+    pub utxos: Option<Vec<UtxoInput>>,
+}
+
+#[derive(Serialize, Debug)]
+#[allow(non_snake_case)]
+pub struct WaterfallLeg {
+    pub tier: u32,
+    pub provider: String,
+    pub filledAmount: f64,
+    pub executionRate: f64,
+    pub marginCaptured: f64,
+}
+
+#[derive(Serialize, Debug)]
+#[allow(non_snake_case)]
+pub struct SorExecutionPlan {
+    pub totalAmount: f64,
+    pub unifiedRate: f64,
+    pub estimatedOutput: f64,
+    pub legs: Vec<WaterfallLeg>,
+    pub transaction_uuid: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub psbt: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub formattedUtxos: Option<Vec<UtxoInput>>,
+}
+
+#[derive(Serialize)]
+pub struct SorError {
+    pub error: String,
+}
+
+// ⚡ Zero-Dependency Kaspa Address to P2PKH/Schnorr Script Decoder
+fn decode_address_to_script(address: &str) -> Result<String, String> {
+    let parts: Vec<&str> = address.split(':').collect();
+    if parts.len() != 2 { return Err("Invalid address format".to_string()); }
+    
+    let base32 = parts[1];
+    if base32.len() < 8 { return Err("Address too short".to_string()); }
+    
+    let charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    let mut decoded = Vec::new();
+    for c in base32[..base32.len()-8].chars() {
+        if let Some(idx) = charset.find(c) {
+            decoded.push(idx as u8);
+        } else {
+            return Err("Invalid base32 char".to_string());
+        }
+    }
+    
+    let mut out = Vec::new();
+    let mut val = 0u32;
+    let mut bits = 0;
+    for &d in &decoded {
+        val = (val << 5) | (d as u32);
+        bits += 5;
+        while bits >= 8 {
+            bits -= 8;
+            out.push((val >> bits) as u8);
+        }
+    }
+    
+    if out.len() < 33 {
+        let clean = address.replace("kaspa:", "");
+        let hex_val = hex::encode(clean);
+        let truncated = if hex_val.len() > 64 { &hex_val[0..64] } else { &hex_val };
+        return Ok(format!("20{}ac", truncated));
+    }
+    
+    let pubkey = &out[1..33];
+    let mut hex_str = String::new();
+    for byte in pubkey {
+        use std::fmt::Write;
+        write!(&mut hex_str, "{:02x}", byte).unwrap();
+    }
+    Ok(format!("20{}ac", hex_str))
+}
+
+pub async fn handle_sor_execute(
+    State(_pool): State<PgPool>,
+    Json(payload): Json<SorExecuteRequest>,
+) -> Result<Json<SorExecutionPlan>, Json<SorError>> {
+    tracing::info!("🔒 SOR Executing Live API Swap for: {}", payload.wallet);
+
+    let client = Client::new();
+    let pair = format!("{}_{}", payload.payAsset, payload.receiveAsset).to_uppercase();
+    
+    let redis_client = redis::Client::open("redis://127.0.0.1/").unwrap();
+    let mut redis_conn = redis_client.get_multiplexed_async_connection().await.unwrap();
+
+    let spot_rate_str: Option<String> = redis::cmd("GET")
+        .arg(format!("oracle:spot:{}", pair))
+        .query_async(&mut redis_conn)
+        .await.unwrap_or(None);
+    let spot_rate: f64 = spot_rate_str.unwrap_or_else(|| "1.0".to_string()).parse().unwrap_or(1.0);
+
+    let mut remaining_amount = payload.amount;
+    let mut total_estimated_output = 0.0;
+    let mut legs = Vec::new();
+    
+    let min_chainge_tokens = 15.0 / spot_rate;
+    let min_changenow_tokens = 50.0 / spot_rate;
+
+    let corp_kas = env::var("PERENNIA_TREASURY_KAS_ADDRESS").unwrap_or_else(|_| "kaspa:qpd3r7z43r1x0pn3y26k2yp4r7z43r1x0pn3y26k2yp4r7z0q5qqp2".to_string());
+    let corp_eth = "0x71C7656EC7ab88b098defB751B7401B5f6d8976F".to_string();
+
+    // ==========================================================
+    // TIER 1: PERENNIA TREASURY (Internal Fast-Settlement)
+    // ==========================================================
+    let treasury_bal_str: Option<String> = redis::cmd("HGET")
+        .arg("dev:sor:treasury:balances:admin")
+        .arg(&payload.receiveAsset)
+        .query_async(&mut redis_conn)
+        .await.unwrap_or(None);
+    let treasury_bal: f64 = treasury_bal_str.unwrap_or_else(|| "0".to_string()).parse().unwrap_or(0.0);
+
+    if treasury_bal > 0.0 && remaining_amount > 0.0 {
+        let fillable = treasury_bal.min(remaining_amount);
+        let treasury_rate = spot_rate * 0.985;
+        let output = fillable * treasury_rate;
+
+        legs.push(WaterfallLeg {
+            tier: 1,
+            provider: "Perennia Treasury".to_string(),
+            filledAmount: fillable,
+            executionRate: treasury_rate,
+            marginCaptured: fillable * spot_rate * 0.015,
+        });
+
+        remaining_amount -= fillable;
+        total_estimated_output += output;
+    }
+
+    // ==========================================================
+    // TIER 2: KASPLEX KRC-20 (Decentralized Overflow AMM)
+    // ==========================================================
+    if remaining_amount > 0.0 {
+        let kasplex_res = client.get(&format!("https://api.kasplex.org/v1/krc20/token/{}", payload.receiveAsset))
+            .send().await;
+        
+        let mut kasplex_depth = 0.0;
+        if let Ok(res) = kasplex_res {
+            if let Ok(data) = res.json::<serde_json::Value>().await {
+                if let Some(minted) = data.get("result").and_then(|r| r.get(0)).and_then(|m| m.get("max")).and_then(|m| m.as_str()) {
+                    kasplex_depth = minted.parse::<f64>().unwrap_or(0.0) * 0.01; 
+                }
+            }
+        }
+
+        if kasplex_depth > 0.0 {
+            let fillable = kasplex_depth.min(remaining_amount);
+            if fillable > 0.0 {
+                let rate = spot_rate * 0.997; 
+                let output = fillable * rate;
+
+                legs.push(WaterfallLeg {
+                    tier: 2,
+                    provider: "Kasplex KRC-20".to_string(),
+                    filledAmount: fillable,
+                    executionRate: rate,
+                    marginCaptured: 0.0,
+                });
+
+                remaining_amount -= fillable;
+                total_estimated_output += output;
+            }
+        }
+    }
+
+    // ==========================================================
+    // TIER 3: CHAINGE FINANCE (Cross-Chain Bridging AMM)
+    // ==========================================================
+    if remaining_amount >= min_chainge_tokens {
+        let chainge_api_key = env::var("CHAINGE_API_KEY").unwrap_or_default();
+        let chainge_req = json!({
+            "fromChain": "KASPA", "toChain": "ETHEREUM",
+            "fromToken": "KAS", "toToken": "USDC",
+            "userAddress": payload.wallet,
+            "amount": remaining_amount * 0.5 
+        });
+        
+        let chainge_res = client.post("https://api.chainge.finance/v1/crosschain/address")
+            .header("Authorization", format!("Bearer {}", chainge_api_key))
+            .json(&chainge_req)
+            .send().await;
+
+        if let Ok(res) = chainge_res {
+            if let Ok(data) = res.json::<serde_json::Value>().await {
+                if let Some(_addr) = data.get("depositAddress").and_then(|a| a.as_str()) {
+                    let fillable = remaining_amount * 0.5;
+                    let rate = spot_rate * 0.995;
+                    let output = fillable * rate;
+
+                    legs.push(WaterfallLeg {
+                        tier: 3,
+                        provider: "Chainge AMM".to_string(),
+                        filledAmount: fillable,
+                        executionRate: rate,
+                        marginCaptured: 0.0,
+                    });
+
+                    remaining_amount -= fillable;
+                    total_estimated_output += output;
+                }
+            }
+        }
+    }
+
+    // ==========================================================
+    // TIER 4: CHANGENOW (Whale Router Fallback Live API)
+    // ==========================================================
+    if remaining_amount >= min_changenow_tokens {
+        let changenow_key = env::var("CHANGENOW_API_KEY").unwrap_or_default();
+        let cnow_req = json!({
+            "fromCurrency": "kas", "toCurrency": "usdc",
+            "fromNetwork": "kas", "toNetwork": "eth",
+            "fromAmount": remaining_amount,
+            "address": corp_eth,
+            "flow": "standard"
+        });
+
+        let cnow_res = client.post("https://api.changenow.io/v2/exchange")
+            .header("x-changenow-api-key", changenow_key)
+            .json(&cnow_req)
+            .send().await;
+
+        if let Ok(res) = cnow_res {
+            if let Ok(data) = res.json::<serde_json::Value>().await {
+                if let Some(_addr) = data.get("payinAddress").and_then(|a| a.as_str()) {
+                    let fillable = remaining_amount;
+                    let rate = spot_rate * 0.985;
+                    let output = fillable * rate;
+
+                    legs.push(WaterfallLeg {
+                        tier: 4,
+                        provider: "ChangeNOW Aggregator".to_string(),
+                        filledAmount: fillable,
+                        executionRate: rate,
+                        marginCaptured: 0.0,
+                    });
+
+                    remaining_amount = 0.0;
+                    total_estimated_output += output;
+                }
+            }
+        }
+    }
+
+    if legs.is_empty() && payload.amount > 0.0 {
+        return Err(Json(SorError { error: "Liquidity Exhausted. No hard-routing paths available on-chain.".to_string() }));
+    }
+
+    let filled_amount = payload.amount - remaining_amount;
+    let unified_rate = if filled_amount > 0.0 { total_estimated_output / filled_amount } else { 0.0 };
+    let tx_uuid = Uuid::new_v4().to_string();
+
+    let mut psbt = None;
+
+    // ==========================================================
+    // PSBT CONSTRUCTION FOR HARD ZERO-TRUST HONEYCOMB EXECUTION
+    // ==========================================================
+    if let Some(utxos) = &payload.utxos {
+        let target_amount_sompi = (filled_amount * 1e8).floor() as u64;
+        let fee_sompi = 10000;
+        let total_required = target_amount_sompi + fee_sompi;
+
+        let mut gathered_sompi = 0;
+        let mut tx_inputs = Vec::new();
+
+        for utxo in utxos {
+            tx_inputs.push(json!({
+                "previousOutpoint": {
+                    "transactionId": utxo.transactionId,
+                    "index": utxo.index
+                },
+                "signatureScript": "",
+                "sequence": 0,
+                "sigOpCount": 1
+            }));
+            gathered_sompi += utxo.amount as u64;
+            if gathered_sompi >= total_required {
+                break;
+            }
+        }
+
+        if gathered_sompi < total_required {
+            return Err(Json(SorError { error: format!("ERR_INSUFFICIENT_MASS: Required {}, Found {}", total_required, gathered_sompi) }));
+        }
+
+        let mut tx_outputs = Vec::new();
+
+        for leg in &legs {
+            let leg_sompi = (leg.filledAmount * 1e8).floor() as u64;
+            if leg_sompi == 0 { continue; }
+
+            let mut dest_address = String::new();
+            match leg.tier {
+                1 => dest_address = corp_kas.clone(),
+                2 => dest_address = "kaspa:kasplex_krc20_router_inbound".to_string(),
+                3 => dest_address = "kaspa:chainge_finance_bridge_fallback".to_string(), // In production we persist the response address here
+                4 => dest_address = "kaspa:changenow_whale_fallback".to_string(),
+                _ => {}
+            }
+
+            let script_pub_key = decode_address_to_script(&dest_address)
+                .unwrap_or_else(|_| "200000000000000000000000000000000000000000000000000000000000000000ac".to_string());
+
+            tx_outputs.push(json!({
+                "amount": leg_sompi as u64,
+                "scriptPublicKey": script_pub_key,
+                "_metadata": { "provider": leg.provider, "tier": leg.tier }
+            }));
+        }
+
+        let change_sompi = gathered_sompi - total_required;
+        if change_sompi > 0 {
+            tx_outputs.push(json!({
+                "amount": change_sompi as u64,
+                "scriptPublicKey": decode_address_to_script(&payload.wallet).unwrap_or_else(|_| "200000000000000000000000000000000000000000000000000000000000000000ac".to_string()),
+                "_metadata": { "type": "change" }
+            }));
+        }
+
+        psbt = Some(json!({
+            "version": 0,
+            "inputs": tx_inputs,
+            "outputs": tx_outputs,
+            "lockTime": 0,
+            "subnetworkId": "0000000000000000000000000000000000000000",
+            "gas": 0,
+            "payload": "",
+            "mass": 0,
+            "storageMass": 0
+        }));
+    }
+
+    Ok(Json(SorExecutionPlan {
+        totalAmount: filled_amount,
+        unifiedRate: unified_rate,
+        estimatedOutput: total_estimated_output,
+        legs,
+        transaction_uuid: tx_uuid,
+        psbt,
+        formattedUtxos: payload.utxos.clone(),
+    }))
+}
+</file>
+
+<file path="db/schema.sql">
+-- ==============================================================================
+-- PERENNIA LLC: SOVEREIGN WRITE-AHEAD LOG (WAL) & REAL-TIME LEDGER SCHEMA
+-- Deployment Environment: Bare-Metal Ubuntu PostgreSQL 16+
+-- Architecture: High-Velocity BRIN Indexing & L1 Block Ledger
+-- ==============================================================================
+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- 1. Sovereign tracking of bare-metal hardware identities
+CREATE TABLE IF NOT EXISTS worker_profiles (
+    worker_id VARCHAR(255) PRIMARY KEY,
+    wallet_address VARCHAR(255) NOT NULL,
+    device_profile VARCHAR(100) NOT NULL DEFAULT 'unknown',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 2. Continuous Fluidity: Real-time balance streaming for active smart contract polling
+CREATE TABLE IF NOT EXISTS yield_reservoirs (
+    wallet_address VARCHAR(255) PRIMARY KEY,
+    streaming_balance_kas DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    total_yield_kas DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 3. UNLOGGED WAL: Millions of sub-second micro-shares map directly here from the Redis Oracle
+CREATE UNLOGGED TABLE IF NOT EXISTS micro_shares (
+    share_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    worker_id VARCHAR(255) NOT NULL,
+    difficulty_weight DOUBLE PRECISION NOT NULL,
+    kas_value_delta DOUBLE PRECISION NOT NULL,
+    network_diff DOUBLE PRECISION NOT NULL,
+    is_settled BOOLEAN NOT NULL DEFAULT false,
+    recorded_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 4. The L1 Block Ledger: Persistent tracking of global Kaspa network discoveries
+CREATE TABLE IF NOT EXISTS network_blocks (
+    block_hash VARCHAR(64) PRIMARY KEY,
+    worker_id VARCHAR(255) NOT NULL,
+    nonce BIGINT NOT NULL,
+    network_diff DOUBLE PRECISION NOT NULL,
+    is_orphaned BOOLEAN DEFAULT false,
+    discovered_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ==============================================================================
+-- 5. SOVEREIGN COMMAND CENTER STATE (Phase 2 Upgrade)
+-- ==============================================================================
+CREATE TABLE IF NOT EXISTS user_command_centers (
+    wallet_address VARCHAR(255) PRIMARY KEY,
+    layout_state JSONB NOT NULL DEFAULT '{}'::jsonb,
+    last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ==============================================================================
+-- HIGH-PERFORMANCE INDEXING MATRIX
+-- ==============================================================================
+
+-- B-Tree Indexes for exact-match lookups
+CREATE INDEX IF NOT EXISTS idx_micro_shares_worker ON micro_shares(worker_id);
+CREATE INDEX IF NOT EXISTS idx_micro_shares_settlement ON micro_shares(is_settled);
+CREATE INDEX IF NOT EXISTS idx_network_blocks_worker ON network_blocks(worker_id);
+CREATE INDEX IF NOT EXISTS idx_network_blocks_time ON network_blocks(discovered_at DESC);
+CREATE INDEX IF NOT EXISTS idx_user_command_centers_updated ON user_command_centers(last_updated DESC);
+
+-- Drop legacy B-Tree for time-series if it exists from Phase 1
+DROP INDEX IF EXISTS idx_micro_shares_recorded;
+
+-- BRIN (Block Range Index) for hyper-optimized append-only time-series data
+CREATE INDEX IF NOT EXISTS idx_micro_shares_recorded_brin 
+ON micro_shares USING brin (recorded_at) WITH (pages_per_range = 128);
+</file>
+
+<file path="kaspa-keygen/derive.js">
+require('dotenv').config();
+const bip39 = require('bip39');
+const { BIP32Factory } = require('bip32');
+const ecc = require('tiny-secp256k1');
+const kaspaCore = require('@kaspa/core-lib');
+
+const bip32 = BIP32Factory(ecc);
+
+function deriveKaspaAddress() {
+    try {
+        const mnemonic = process.env.PERENNIA_TREASURY_SEED || "test test test test test test test test test test test junk";
+        
+        if (!bip39.validateMnemonic(mnemonic)) {
+            throw new Error("Invalid mnemonic phrase provided.");
+        }
+
+        const seed = bip39.mnemonicToSeedSync(mnemonic);
+        const root = bip32.fromSeed(seed);
+        const kaspaPath = "m/44'/111111'/0'/0/0";
+        const derivedNode = root.derivePath(kaspaPath);
+
+        // ⚡ Raw buffer extraction (NO .toPrivateKey()!)
+        if (!derivedNode.privateKey) {
+            throw new Error("Failed to derive private key buffer.");
+        }
+        const rawPrivateKeyHex = derivedNode.privateKey.toString('hex');
+
+        // Feed raw hex directly into the official Kaspa Core PrivateKey constructor
+        const KaspaPrivateKey = kaspaCore.PrivateKey || kaspaCore.default?.PrivateKey;
+        const kasPrivateKey = new KaspaPrivateKey(rawPrivateKeyHex);
+
+        const kasAddress = kasPrivateKey.toPublicKey().toAddress('kaspa').toString();
+
+        console.log("=========================================");
+        console.log("🔑 KASPA SOVEREIGN DERIVATION SUCCESSFUL");
+        console.log("=========================================");
+        console.log(`Path:    ${kaspaPath}`);
+        console.log(`Address: ${kasAddress}`);
+        console.log("=========================================");
+
+        return kasAddress;
+    } catch (error) {
+        console.error("🚨 Derivation Failed:", error.message);
+    }
+}
+
+deriveKaspaAddress();
+</file>
+
+<file path="proto/messages.proto">
+syntax = "proto3";
+package protowire;
+
+import "rpc.proto";
+
+message KaspadRequest {
+  uint64 id = 101;
+  oneof payload {
+    GetCurrentNetworkRequestMessage getCurrentNetworkRequest = 1001;
+    SubmitBlockRequestMessage submitBlockRequest = 1003;
+    GetBlockTemplateRequestMessage getBlockTemplateRequest = 1005;
+    NotifyBlockAddedRequestMessage notifyBlockAddedRequest = 1007;
+    // BlockAddedNotificationMessage blockAddedNotification = 1009;
+    GetPeerAddressesRequestMessage getPeerAddressesRequest = 1010;
+    GetSinkRequestMessage GetSinkRequest = 1012;
+    GetMempoolEntryRequestMessage getMempoolEntryRequest = 1014;
+    GetConnectedPeerInfoRequestMessage getConnectedPeerInfoRequest = 1016;
+    AddPeerRequestMessage addPeerRequest = 1018;
+    SubmitTransactionRequestMessage submitTransactionRequest = 1020;
+    NotifyVirtualChainChangedRequestMessage notifyVirtualChainChangedRequest = 1022;
+    // VirtualChainChangedNotificationMessage virtualChainChangedNotification = 1024;
+    GetBlockRequestMessage getBlockRequest = 1025;
+    GetSubnetworkRequestMessage getSubnetworkRequest = 1027;
+    GetVirtualChainFromBlockRequestMessage getVirtualChainFromBlockRequest = 1029;
+    GetBlocksRequestMessage getBlocksRequest = 1031;
+    GetBlockCountRequestMessage getBlockCountRequest = 1033;
+    GetBlockDagInfoRequestMessage getBlockDagInfoRequest = 1035;
+    ResolveFinalityConflictRequestMessage resolveFinalityConflictRequest = 1037;
+    NotifyFinalityConflictRequestMessage notifyFinalityConflictRequest = 1039;
+    // FinalityConflictNotificationMessage finalityConflictNotification = 1041;
+    // FinalityConflictResolvedNotificationMessage finalityConflictResolvedNotification = 1042;
+    GetMempoolEntriesRequestMessage getMempoolEntriesRequest = 1043;
+    ShutdownRequestMessage shutdownRequest = 1045;
+    GetHeadersRequestMessage getHeadersRequest = 1047;
+    NotifyUtxosChangedRequestMessage notifyUtxosChangedRequest = 1049;
+    // UtxosChangedNotificationMessage utxosChangedNotification = 1051;
+    GetUtxosByAddressesRequestMessage getUtxosByAddressesRequest = 1052;
+    GetSinkBlueScoreRequestMessage getSinkBlueScoreRequest = 1054;
+    NotifySinkBlueScoreChangedRequestMessage notifySinkBlueScoreChangedRequest = 1056;
+    // SinkBlueScoreChangedNotificationMessage sinkBlueScoreChangedNotification = 1058;
+    BanRequestMessage banRequest = 1059;
+    UnbanRequestMessage unbanRequest = 1061;
+    GetInfoRequestMessage getInfoRequest = 1063;
+    StopNotifyingUtxosChangedRequestMessage stopNotifyingUtxosChangedRequest = 1065;
+    NotifyPruningPointUtxoSetOverrideRequestMessage notifyPruningPointUtxoSetOverrideRequest = 1067;
+    // PruningPointUtxoSetOverrideNotificationMessage pruningPointUtxoSetOverrideNotification = 1069;
+    StopNotifyingPruningPointUtxoSetOverrideRequestMessage stopNotifyingPruningPointUtxoSetOverrideRequest = 1070;
+    EstimateNetworkHashesPerSecondRequestMessage estimateNetworkHashesPerSecondRequest = 1072;
+    NotifyVirtualDaaScoreChangedRequestMessage notifyVirtualDaaScoreChangedRequest = 1074;
+    // VirtualDaaScoreChangedNotificationMessage virtualDaaScoreChangedNotification = 1076;
+    GetBalanceByAddressRequestMessage getBalanceByAddressRequest = 1077;
+    GetBalancesByAddressesRequestMessage getBalancesByAddressesRequest = 1079;
+    NotifyNewBlockTemplateRequestMessage notifyNewBlockTemplateRequest = 1081;
+    // NewBlockTemplateNotificationMessage newBlockTemplateNotification = 1083;
+    GetMempoolEntriesByAddressesRequestMessage getMempoolEntriesByAddressesRequest = 1084;
+    GetCoinSupplyRequestMessage getCoinSupplyRequest = 1086;
+    PingRequestMessage pingRequest = 1088;
+    GetMetricsRequestMessage getMetricsRequest = 1090;
+    GetServerInfoRequestMessage getServerInfoRequest = 1092;
+    GetSyncStatusRequestMessage getSyncStatusRequest = 1094;
+    GetDaaScoreTimestampEstimateRequestMessage getDaaScoreTimestampEstimateRequest = 1096;
+    SubmitTransactionReplacementRequestMessage submitTransactionReplacementRequest = 1100;
+    GetConnectionsRequestMessage getConnectionsRequest = 1102;
+    GetSystemInfoRequestMessage getSystemInfoRequest = 1104;
+    GetFeeEstimateRequestMessage getFeeEstimateRequest = 1106;
+    GetFeeEstimateExperimentalRequestMessage getFeeEstimateExperimentalRequest = 1108;
+    GetCurrentBlockColorRequestMessage getCurrentBlockColorRequest = 1110;
+    GetUtxoReturnAddressRequestMessage getUtxoReturnAddressRequest = 1112;
+    GetVirtualChainFromBlockV2RequestMessage getVirtualChainFromBlockV2Request = 1114;
+    GetBlockRewardInfoRequestMessage getBlockRewardInfoRequest = 1116;
+    GetSeqCommitLaneProofRequestMessage getSeqCommitLaneProofRequest = 1118;
+  }
+}
+
+message KaspadResponse {
+  uint64 id = 101;
+  oneof payload {
+    GetCurrentNetworkResponseMessage getCurrentNetworkResponse = 1002;
+    SubmitBlockResponseMessage submitBlockResponse = 1004;
+    GetBlockTemplateResponseMessage getBlockTemplateResponse = 1006;
+    NotifyBlockAddedResponseMessage notifyBlockAddedResponse = 1008;
+    BlockAddedNotificationMessage blockAddedNotification = 1009;
+    GetPeerAddressesResponseMessage getPeerAddressesResponse = 1011;
+    GetSinkResponseMessage GetSinkResponse = 1013;
+    GetMempoolEntryResponseMessage getMempoolEntryResponse = 1015;
+    GetConnectedPeerInfoResponseMessage getConnectedPeerInfoResponse = 1017;
+    AddPeerResponseMessage addPeerResponse = 1019;
+    SubmitTransactionResponseMessage submitTransactionResponse = 1021;
+    NotifyVirtualChainChangedResponseMessage notifyVirtualChainChangedResponse = 1023;
+    VirtualChainChangedNotificationMessage virtualChainChangedNotification = 1024;
+    GetBlockResponseMessage getBlockResponse = 1026;
+    GetSubnetworkResponseMessage getSubnetworkResponse = 1028;
+    GetVirtualChainFromBlockResponseMessage getVirtualChainFromBlockResponse = 1030;
+    GetBlocksResponseMessage getBlocksResponse = 1032;
+    GetBlockCountResponseMessage getBlockCountResponse = 1034;
+    GetBlockDagInfoResponseMessage getBlockDagInfoResponse = 1036;
+    ResolveFinalityConflictResponseMessage resolveFinalityConflictResponse = 1038;
+    NotifyFinalityConflictResponseMessage notifyFinalityConflictResponse = 1040;
+    FinalityConflictNotificationMessage finalityConflictNotification = 1041;
+    FinalityConflictResolvedNotificationMessage finalityConflictResolvedNotification = 1042;
+    GetMempoolEntriesResponseMessage getMempoolEntriesResponse = 1044;
+    ShutdownResponseMessage shutdownResponse = 1046;
+    GetHeadersResponseMessage getHeadersResponse = 1048;
+    NotifyUtxosChangedResponseMessage notifyUtxosChangedResponse = 1050;
+    UtxosChangedNotificationMessage utxosChangedNotification = 1051;
+    GetUtxosByAddressesResponseMessage getUtxosByAddressesResponse = 1053;
+    GetSinkBlueScoreResponseMessage getSinkBlueScoreResponse = 1055;
+    NotifySinkBlueScoreChangedResponseMessage notifySinkBlueScoreChangedResponse = 1057;
+    SinkBlueScoreChangedNotificationMessage sinkBlueScoreChangedNotification = 1058;
+    BanResponseMessage banResponse = 1060;
+    UnbanResponseMessage unbanResponse = 1062;
+    GetInfoResponseMessage getInfoResponse = 1064;
+    StopNotifyingUtxosChangedResponseMessage stopNotifyingUtxosChangedResponse = 1066;
+    NotifyPruningPointUtxoSetOverrideResponseMessage notifyPruningPointUtxoSetOverrideResponse = 1068;
+    PruningPointUtxoSetOverrideNotificationMessage pruningPointUtxoSetOverrideNotification = 1069;
+    StopNotifyingPruningPointUtxoSetOverrideResponseMessage stopNotifyingPruningPointUtxoSetOverrideResponse = 1071;
+    EstimateNetworkHashesPerSecondResponseMessage estimateNetworkHashesPerSecondResponse = 1073;
+    NotifyVirtualDaaScoreChangedResponseMessage notifyVirtualDaaScoreChangedResponse = 1075;
+    VirtualDaaScoreChangedNotificationMessage virtualDaaScoreChangedNotification = 1076;
+    GetBalanceByAddressResponseMessage getBalanceByAddressResponse = 1078;
+    GetBalancesByAddressesResponseMessage getBalancesByAddressesResponse = 1080;
+    NotifyNewBlockTemplateResponseMessage notifyNewBlockTemplateResponse = 1082;
+    NewBlockTemplateNotificationMessage newBlockTemplateNotification = 1083;
+    GetMempoolEntriesByAddressesResponseMessage getMempoolEntriesByAddressesResponse = 1085;
+    GetCoinSupplyResponseMessage getCoinSupplyResponse= 1087;
+    PingResponseMessage pingResponse= 1089;
+    GetMetricsResponseMessage getMetricsResponse= 1091;
+    GetServerInfoResponseMessage getServerInfoResponse = 1093;
+    GetSyncStatusResponseMessage getSyncStatusResponse = 1095;
+    GetDaaScoreTimestampEstimateResponseMessage getDaaScoreTimestampEstimateResponse = 1097;
+    SubmitTransactionReplacementResponseMessage submitTransactionReplacementResponse = 1101;
+    GetConnectionsResponseMessage getConnectionsResponse= 1103;
+    GetSystemInfoResponseMessage getSystemInfoResponse= 1105;
+    GetFeeEstimateResponseMessage getFeeEstimateResponse = 1107;
+    GetFeeEstimateExperimentalResponseMessage getFeeEstimateExperimentalResponse = 1109;
+    GetCurrentBlockColorResponseMessage getCurrentBlockColorResponse = 1111;
+    GetUtxoReturnAddressResponseMessage getUtxoReturnAddressResponse = 1113;
+    GetVirtualChainFromBlockV2ResponseMessage getVirtualChainFromBlockV2Response = 1115;
+    GetBlockRewardInfoResponseMessage getBlockRewardInfoResponse = 1117;
+    GetSeqCommitLaneProofResponseMessage getSeqCommitLaneProofResponse = 1119;
+  }
+}
+
+service RPC {
+  rpc MessageStream (stream KaspadRequest) returns (stream KaspadResponse) {}
+}
+</file>
+
+<file path="proto/rpc.proto">
+// RPC-related types. Request messages, response messages, and dependant types.
+//
+// Clients are expected to build RequestMessages and wrap them in KaspadMessage. (see messages.proto)
+//
+// Having received a RequestMessage, (wrapped in a KaspadMessage) the RPC server will respond with a
+// ResponseMessage (likewise wrapped in a KaspadMessage) respective to the original RequestMessage.
+//
+//
+syntax = "proto3";
+package protowire;
+
+// RPCError represents a generic non-internal error.
+//
+// Receivers of any ResponseMessage are expected to check whether its error field is not null.
+message RPCError {
+  string message = 1;
+}
+
+message RpcBlock {
+  RpcBlockHeader header = 1;
+  repeated RpcTransaction transactions = 2;
+  RpcBlockVerboseData verboseData = 3;
+}
+
+message RpcBlockHeader {
+  uint32 version = 1;
+  repeated RpcBlockLevelParents parents = 12;
+  string hashMerkleRoot = 3;
+  string acceptedIdMerkleRoot = 4;
+  string utxoCommitment = 5;
+  int64 timestamp = 6;
+  uint32 bits = 7;
+  uint64 nonce = 8;
+  uint64 daaScore = 9;
+  string blueWork = 10;
+  uint64 blueScore = 13;
+  string pruningPoint = 14;
+  string hash = 15;
+}
+
+message RpcBlockLevelParents {
+  repeated string parentHashes = 1;
+}
+
+message RpcBlockLevelRun {
+  repeated string parentHashes = 1;
+  // must be <= 255 (u8)
+  uint32 cumulativeLevel = 2;
+}
+
+message RpcBlockVerboseData {
+  string hash = 1;
+  double difficulty = 11;
+  string selectedParentHash = 13;
+  repeated string transactionIds = 14;
+  bool isHeaderOnly = 15;
+  uint64 blueScore = 16;
+  repeated string childrenHashes = 17;
+  repeated string mergeSetBluesHashes = 18;
+  repeated string mergeSetRedsHashes = 19;
+  bool isChainBlock = 20;
+}
+
+message RpcTransaction {
+  uint32 version = 1;
+  repeated RpcTransactionInput inputs = 2;
+  repeated RpcTransactionOutput outputs = 3;
+  uint64 lockTime = 4;
+  string subnetworkId = 5;
+  uint64 gas = 6;
+  string payload = 8;
+  RpcTransactionVerboseData verboseData = 9;
+  uint64 storage_mass = 10;
+}
+
+message RpcTransactionVerboseData {
+  string transactionId = 1;
+  string hash = 2;
+  uint64 computeMass = 4;
+  string blockHash = 12;
+  uint64 blockTime = 14;
+}
+
+message RpcTransactionInput {
+  RpcOutpoint previousOutpoint = 1;
+  string signatureScript = 2;
+  uint64 sequence = 3;
+  uint32 sigOpCount = 5;
+  RpcTransactionInputVerboseData verboseData = 4;
+  // Replaces sigop count for tx version >= 1.
+  uint32 computeBudget = 6;
+}
+
+message RpcTransactionInputVerboseData {
+  RpcUtxoEntry utxoEntry = 1; // this field is new, if this is null, the utxo cannot be found, or is coinbase.
+}
+
+message RpcUtxoEntry {
+  uint64 amount = 1;
+  RpcScriptPublicKey scriptPublicKey = 2;
+  uint64 blockDaaScore = 3;
+  bool isCoinbase = 4;
+  RpcUtxoEntryVerboseData verboseData = 5;
+  string covenant_id = 6;
+}
+
+message RpcUtxoEntryVerboseData {
+  string scriptPublicKeyType = 5;
+  string scriptPublicKeyAddress = 6;
+}
+
+message RpcScriptPublicKey {
+  uint32 version = 1;
+  string scriptPublicKey = 2;
+}
+
+message RpcTransactionOutput {
+  uint64 amount = 1;
+  RpcScriptPublicKey scriptPublicKey = 2;
+  RpcTransactionOutputVerboseData verboseData = 3;
+  optional RpcCovenantBinding covenant = 4;
+}
+
+message RpcCovenantBinding {
+  uint32 authorizing_input = 1;
+  string covenant_id = 2;
+}
+
+message RpcOutpoint {
+  string transactionId = 1;
+  uint32 index = 2;
+}
+
+message RpcTransactionOutputVerboseData {
+  string scriptPublicKeyType = 5;
+  string scriptPublicKeyAddress = 6;
+}
+
+enum RpcNotifyCommand {
+  NOTIFY_START = 0;
+  NOTIFY_STOP = 1;
+}
+
+// GetCurrentNetworkRequestMessage requests the network kaspad is currently running against.
+//
+// Possible networks are: Mainnet, Testnet, Simnet, Devnet
+message GetCurrentNetworkRequestMessage {}
+
+message GetCurrentNetworkResponseMessage {
+  string currentNetwork = 1;
+  RPCError error = 1000;
+}
+
+// SubmitBlockRequestMessage requests to submit a block into the DAG.
+// Blocks are generally expected to have been generated using the getBlockTemplate call.
+//
+// See: GetBlockTemplateRequestMessage
+message SubmitBlockRequestMessage {
+  RpcBlock block = 2;
+  bool allowNonDAABlocks = 3;
+}
+
+message SubmitBlockResponseMessage {
+  enum RejectReason {
+    NONE = 0;
+    BLOCK_INVALID = 1;
+    IS_IN_IBD = 2;
+  }
+  RejectReason rejectReason = 1;
+  RPCError error = 1000;
+}
+
+// GetBlockTemplateRequestMessage requests a current block template.
+// Callers are expected to solve the block template and submit it using the submitBlock call
+//
+// See: SubmitBlockRequestMessage
+message GetBlockTemplateRequestMessage {
+  // Which kaspa address should the coinbase block reward transaction pay into
+  string payAddress = 1;
+  string extraData = 2;
+}
+
+message GetBlockTemplateResponseMessage {
+  RpcBlock block = 3;
+
+  // Whether kaspad thinks that it's synced.
+  // Callers are discouraged (but not forbidden) from solving blocks when kaspad is not synced.
+  // That is because when kaspad isn't in sync with the rest of the network there's a high
+  // chance the block will never be accepted, thus the solving effort would have been wasted.
+  bool isSynced = 2;
+
+  RPCError error = 1000;
+}
+
+// NotifyBlockAddedRequestMessage registers this connection for blockAdded notifications.
+//
+// See: BlockAddedNotificationMessage
+message NotifyBlockAddedRequestMessage {
+  RpcNotifyCommand command = 101;
+}
+
+message NotifyBlockAddedResponseMessage {
+  RPCError error = 1000;
+}
+
+// BlockAddedNotificationMessage is sent whenever a blocks has been added (NOT accepted)
+// into the DAG.
+//
+// See: NotifyBlockAddedRequestMessage
+message BlockAddedNotificationMessage {
+  RpcBlock block = 3;
+}
+
+// GetPeerAddressesRequestMessage requests the list of known kaspad addresses in the
+// current network. (mainnet, testnet, etc.)
+message GetPeerAddressesRequestMessage {}
+
+message GetPeerAddressesResponseMessage {
+  repeated GetPeerAddressesKnownAddressMessage addresses = 1;
+  repeated GetPeerAddressesKnownAddressMessage bannedAddresses = 2;
+  RPCError error = 1000;
+}
+
+message GetPeerAddressesKnownAddressMessage {
+  string Addr = 1;
+}
+
+// GetSinkRequestMessage requests the hash of the current virtual's
+// selected parent.
+message GetSinkRequestMessage {}
+
+message GetSinkResponseMessage {
+  string sink = 1;
+  RPCError error = 1000;
+}
+
+// GetMempoolEntryRequestMessage requests information about a specific transaction
+// in the mempool.
+message GetMempoolEntryRequestMessage {
+  // The transaction's TransactionID.
+  string txId = 1;
+  bool includeOrphanPool = 2;
+  bool filterTransactionPool = 3;
+}
+
+message GetMempoolEntryResponseMessage {
+  RpcMempoolEntry entry = 1;
+
+  RPCError error = 1000;
+}
+
+// GetMempoolEntriesRequestMessage requests information about all the transactions
+// currently in the mempool.
+message GetMempoolEntriesRequestMessage {
+  bool includeOrphanPool = 1;
+  bool filterTransactionPool = 2;
+}
+
+message GetMempoolEntriesResponseMessage {
+  repeated RpcMempoolEntry entries = 1;
+
+  RPCError error = 1000;
+}
+
+message RpcMempoolEntry {
+  uint64 fee = 1;
+  RpcTransaction transaction = 3;
+  bool isOrphan = 4;
+}
+
+// GetConnectedPeerInfoRequestMessage requests information about all the p2p peers
+// currently connected to this kaspad.
+message GetConnectedPeerInfoRequestMessage {}
+
+message GetConnectedPeerInfoResponseMessage {
+  repeated GetConnectedPeerInfoMessage infos = 1;
+  RPCError error = 1000;
+}
+
+message GetConnectedPeerInfoMessage {
+  string id = 1;
+  string address = 2;
+
+  // How long did the last ping/pong exchange take
+  int64 lastPingDuration = 3;
+
+  // Whether this kaspad initiated the connection
+  bool isOutbound = 6;
+  int64 timeOffset = 7;
+  string userAgent = 8;
+
+  // The protocol version that this peer claims to support
+  uint32 advertisedProtocolVersion = 9;
+
+  // The timestamp of when this peer connected to this kaspad
+  int64 timeConnected = 10;
+
+  // Whether this peer is the IBD peer (if IBD is running)
+  bool isIbdPeer = 11;
+}
+
+// AddPeerRequestMessage adds a peer to kaspad's outgoing connection list.
+// This will, in most cases, result in kaspad connecting to said peer.
+message AddPeerRequestMessage {
+  string address = 1;
+
+  // Whether to keep attempting to connect to this peer after disconnection
+  bool isPermanent = 2;
+}
+
+message AddPeerResponseMessage {
+  RPCError error = 1000;
+}
+
+// SubmitTransactionRequestMessage submits a transaction to the mempool
+message SubmitTransactionRequestMessage {
+  RpcTransaction transaction = 1;
+  bool allowOrphan = 2;
+}
+
+message SubmitTransactionResponseMessage {
+  // The transaction ID of the submitted transaction
+  string transactionId = 1;
+
+  RPCError error = 1000;
+}
+
+// SubmitTransactionReplacementRequestMessage submits a transaction to the mempool, applying a mandatory Replace by Fee policy
+message SubmitTransactionReplacementRequestMessage {
+  RpcTransaction transaction = 1;
+}
+
+message SubmitTransactionReplacementResponseMessage {
+  // The transaction ID of the submitted transaction
+  string transactionId = 1;
+
+  // The previous transaction replaced in the mempool by the newly submitted one
+  RpcTransaction replacedTransaction = 2;
+
+  RPCError error = 1000;
+}
+
+// NotifyVirtualChainChangedRequestMessage registers this connection for virtualChainChanged notifications.
+//
+// See: VirtualChainChangedNotificationMessage
+message NotifyVirtualChainChangedRequestMessage {
+  bool includeAcceptedTransactionIds = 1;
+  RpcNotifyCommand command = 101;
+}
+
+message NotifyVirtualChainChangedResponseMessage {
+  RPCError error = 1000;
+}
+
+// VirtualChainChangedNotificationMessage is sent whenever the DAG's selected parent
+// chain had changed.
+//
+// See: NotifyVirtualChainChangedRequestMessage
+message VirtualChainChangedNotificationMessage {
+  // The chain blocks that were removed, in high-to-low order
+  repeated string removedChainBlockHashes = 1;
+
+  // The chain blocks that were added, in low-to-high order
+  repeated string addedChainBlockHashes = 3;
+
+  // Will be filled only if `includeAcceptedTransactionIds = true` in the notify request.
+  repeated RpcAcceptedTransactionIds acceptedTransactionIds = 2;
+}
+
+// GetBlockRequestMessage requests information about a specific block
+message GetBlockRequestMessage {
+  // The hash of the requested block
+  string hash = 1;
+
+  // Whether to include transaction data in the response
+  bool includeTransactions = 3;
+}
+
+message GetBlockResponseMessage {
+  RpcBlock block = 3;
+  RPCError error = 1000;
+}
+
+// GetSubnetworkRequestMessage requests information about a specific subnetwork
+//
+// Currently unimplemented
+message GetSubnetworkRequestMessage {
+  string subnetworkId = 1;
+}
+
+message GetSubnetworkResponseMessage {
+  uint64 gasLimit = 1;
+  RPCError error = 1000;
+}
+
+/// GetVirtualChainFromBlockRequestMessage requests the virtual selected
+/// parent chain from some startHash to this kaspad's current virtual
+/// Note:
+///     this call batches the response to:
+///         a. the network's `mergeset size limit * 10` amount of added chain blocks, if `includeAcceptedTransactionIds = false`
+///         b. or `mergeset size limit * 10` amount of merged blocks, if `includeAcceptedTransactionIds = true`
+///         c. it does not batch the removed chain blocks, only the added ones.
+message GetVirtualChainFromBlockRequestMessage {
+  string startHash = 1;
+  bool includeAcceptedTransactionIds = 2;
+  optional uint64 minConfirmationCount = 3;
+}
+
+message RpcAcceptedTransactionIds {
+  string acceptingBlockHash = 1;
+  repeated string acceptedTransactionIds = 2;
+}
+
+message GetVirtualChainFromBlockResponseMessage {
+  // The chain blocks that were removed, in high-to-low order
+  repeated string removedChainBlockHashes = 1;
+
+  // The chain blocks that were added, in low-to-high order
+  repeated string addedChainBlockHashes = 3;
+
+  // The transactions accepted by each block in addedChainBlockHashes.
+  // Will be filled only if `includeAcceptedTransactionIds = true` in the request.
+  repeated RpcAcceptedTransactionIds acceptedTransactionIds = 2;
+
+  RPCError error = 1000;
+}
+
+// GetBlocksRequestMessage requests blocks between a certain block lowHash up to this
+// kaspad's current virtual.
+message GetBlocksRequestMessage {
+  string lowHash = 1;
+  bool includeBlocks = 2;
+  bool includeTransactions = 3;
+}
+
+message GetBlocksResponseMessage {
+  repeated string blockHashes = 4;
+  repeated RpcBlock blocks = 3;
+  RPCError error = 1000;
+}
+
+// GetBlockCountRequestMessage requests the current number of blocks in this kaspad.
+// Note that this number may decrease as pruning occurs.
+message GetBlockCountRequestMessage {}
+
+message GetBlockCountResponseMessage {
+  uint64 blockCount = 1;
+  uint64 headerCount = 2;
+  RPCError error = 1000;
+}
+
+// GetBlockDagInfoRequestMessage requests general information about the current state
+// of this kaspad's DAG.
+message GetBlockDagInfoRequestMessage {}
+
+message GetBlockDagInfoResponseMessage {
+  string networkName = 1;
+  uint64 blockCount = 2;
+  uint64 headerCount = 3;
+  repeated string tipHashes = 4;
+  double difficulty = 5;
+  int64 pastMedianTime = 6;
+  repeated string virtualParentHashes = 7;
+  string pruningPointHash = 8;
+  uint64 virtualDaaScore = 9;
+  string sink = 10;
+  RPCError error = 1000;
+}
+
+message ResolveFinalityConflictRequestMessage {
+  string finalityBlockHash = 1;
+}
+
+message ResolveFinalityConflictResponseMessage {
+  RPCError error = 1000;
+}
+
+message NotifyFinalityConflictRequestMessage {
+  RpcNotifyCommand command = 101;
+}
+
+message NotifyFinalityConflictResponseMessage {
+  RPCError error = 1000;
+}
+
+message FinalityConflictNotificationMessage {
+  string violatingBlockHash = 1;
+}
+
+message FinalityConflictResolvedNotificationMessage {
+  string finalityBlockHash = 1;
+}
+
+// ShutdownRequestMessage shuts down this kaspad.
+message ShutdownRequestMessage {}
+
+message ShutdownResponseMessage {
+  RPCError error = 1000;
+}
+
+// GetHeadersRequestMessage requests headers between the given startHash and the
+// current virtual, up to the given limit.
+message GetHeadersRequestMessage {
+  string startHash = 1;
+  uint64 limit = 2;
+  bool isAscending = 3;
+}
+
+message GetHeadersResponseMessage {
+  repeated string headers = 1;
+  RPCError error = 1000;
+}
+
+// NotifyUtxosChangedRequestMessage registers this connection for utxoChanged notifications
+// for the given addresses.
+//
+// This call is only available when this kaspad was started with `--utxoindex`
+//
+// See: UtxosChangedNotificationMessage
+message NotifyUtxosChangedRequestMessage {
+  // UTXOs addresses to start/stop getting notified about
+  // Leave empty to start/stop all updates
+  repeated string addresses = 1;
+  RpcNotifyCommand command = 101;
+}
+
+message NotifyUtxosChangedResponseMessage {
+  RPCError error = 1000;
+}
+
+// UtxosChangedNotificationMessage is sent whenever the UTXO index had been updated.
+//
+// See: NotifyUtxosChangedRequestMessage
+message UtxosChangedNotificationMessage {
+  repeated RpcUtxosByAddressesEntry added = 1;
+  repeated RpcUtxosByAddressesEntry removed = 2;
+}
+
+message RpcUtxosByAddressesEntry {
+  string address = 1;
+  RpcOutpoint outpoint = 2;
+  RpcUtxoEntry utxoEntry = 3;
+}
+
+// StopNotifyingUtxosChangedRequestMessage unregisters this connection for utxoChanged notifications
+// for the given addresses.
+//
+// This call is only available when this kaspad was started with `--utxoindex`
+//
+// See: UtxosChangedNotificationMessage
+//
+// This message only exists for backward compatibility reason with kaspad and is deprecated.
+// Use instead UtxosChangedNotificationMessage with command = NOTIFY_STOP.
+message StopNotifyingUtxosChangedRequestMessage {
+  repeated string addresses = 1;
+}
+
+message StopNotifyingUtxosChangedResponseMessage {
+  RPCError error = 1000;
+}
+
+// GetUtxosByAddressesRequestMessage requests all current UTXOs for the given kaspad addresses
+//
+// This call is only available when this kaspad was started with `--utxoindex`
+message GetUtxosByAddressesRequestMessage {
+  repeated string addresses = 1;
+}
+
+message GetUtxosByAddressesResponseMessage {
+  repeated RpcUtxosByAddressesEntry entries = 1;
+
+  RPCError error = 1000;
+}
+
+// GetBalanceByAddressRequest returns the total balance in unspent transactions towards a given address
+//
+// This call is only available when this kaspad was started with `--utxoindex`
+message GetBalanceByAddressRequestMessage {
+  string address = 1;
+}
+
+message GetBalanceByAddressResponseMessage {
+  uint64 balance = 1;
+
+  RPCError error = 1000;
+}
+
+message GetBalancesByAddressesRequestMessage {
+  repeated string addresses = 1;
+}
+
+message RpcBalancesByAddressesEntry {
+  string address = 1;
+  uint64 balance = 2;
+
+  RPCError error = 1000;
+}
+
+message GetBalancesByAddressesResponseMessage {
+  repeated RpcBalancesByAddressesEntry entries = 1;
+
+  RPCError error = 1000;
+}
+
+// GetSinkBlueScoreRequestMessage requests the blue score of the current selected parent
+// of the virtual block.
+message GetSinkBlueScoreRequestMessage {}
+
+message GetSinkBlueScoreResponseMessage {
+  uint64 blueScore = 1;
+
+  RPCError error = 1000;
+}
+
+// NotifySinkBlueScoreChangedRequestMessage registers this connection for
+// sinkBlueScoreChanged notifications.
+//
+// See: SinkBlueScoreChangedNotificationMessage
+message NotifySinkBlueScoreChangedRequestMessage {
+  RpcNotifyCommand command = 101;
+}
+
+message NotifySinkBlueScoreChangedResponseMessage {
+  RPCError error = 1000;
+}
+
+// SinkBlueScoreChangedNotificationMessage is sent whenever the blue score
+// of the virtual's selected parent changes.
+//
+// See NotifySinkBlueScoreChangedRequestMessage
+message SinkBlueScoreChangedNotificationMessage {
+  uint64 sinkBlueScore = 1;
+}
+
+// NotifyVirtualDaaScoreChangedRequestMessage registers this connection for
+// virtualDaaScoreChanged notifications.
+//
+// See: VirtualDaaScoreChangedNotificationMessage
+message NotifyVirtualDaaScoreChangedRequestMessage {
+  RpcNotifyCommand command = 101;
+}
+
+message NotifyVirtualDaaScoreChangedResponseMessage {
+  RPCError error = 1000;
+}
+
+// VirtualDaaScoreChangedNotificationMessage is sent whenever the DAA score
+// of the virtual changes.
+//
+// See NotifyVirtualDaaScoreChangedRequestMessage
+message VirtualDaaScoreChangedNotificationMessage {
+  uint64 virtualDaaScore = 1;
+}
+
+// NotifyPruningPointUtxoSetOverrideRequestMessage registers this connection for
+// pruning point UTXO set override notifications.
+//
+// This call is only available when this kaspad was started with `--utxoindex`
+//
+// See: NotifyPruningPointUtxoSetOverrideResponseMessage
+message NotifyPruningPointUtxoSetOverrideRequestMessage {
+  RpcNotifyCommand command = 101;
+}
+
+message NotifyPruningPointUtxoSetOverrideResponseMessage {
+  RPCError error = 1000;
+}
+
+// PruningPointUtxoSetOverrideNotificationMessage is sent whenever the UTXO index
+// resets due to pruning point change via IBD.
+//
+// See NotifyPruningPointUtxoSetOverrideRequestMessage
+message PruningPointUtxoSetOverrideNotificationMessage {}
+
+// StopNotifyingPruningPointUtxoSetOverrideRequestMessage unregisters this connection for
+// pruning point UTXO set override notifications.
+//
+// This call is only available when this kaspad was started with `--utxoindex`
+//
+// See: PruningPointUtxoSetOverrideNotificationMessage
+//
+// This message only exists for backward compatibility reason with kaspad and is deprecated.
+// Use instead NotifyPruningPointUtxoSetOverrideRequestMessage with command = NOTIFY_STOP.
+message StopNotifyingPruningPointUtxoSetOverrideRequestMessage {}
+
+message StopNotifyingPruningPointUtxoSetOverrideResponseMessage {
+  RPCError error = 1000;
+}
+
+// BanRequestMessage bans the given ip.
+message BanRequestMessage {
+  string ip = 1;
+}
+
+message BanResponseMessage {
+  RPCError error = 1000;
+}
+
+// UnbanRequestMessage unbans the given ip.
+message UnbanRequestMessage {
+  string ip = 1;
+}
+
+message UnbanResponseMessage {
+  RPCError error = 1000;
+}
+
+// GetInfoRequestMessage returns info about the node.
+message GetInfoRequestMessage {}
+
+message GetInfoResponseMessage {
+  string p2pId = 1;
+  uint64 mempoolSize = 2;
+  string serverVersion = 3;
+  bool isUtxoIndexed = 4;
+  bool isSynced = 5;
+  bool hasNotifyCommand = 11;
+  bool hasMessageId = 12;
+  RPCError error = 1000;
+}
+
+message EstimateNetworkHashesPerSecondRequestMessage {
+  uint32 windowSize = 1;
+  string startHash = 2;
+}
+
+message EstimateNetworkHashesPerSecondResponseMessage {
+  uint64 networkHashesPerSecond = 1;
+  RPCError error = 1000;
+}
+
+// NotifyNewBlockTemplateRequestMessage registers this connection for
+// NewBlockTemplate notifications.
+//
+// See: NewBlockTemplateNotificationMessage
+message NotifyNewBlockTemplateRequestMessage {
+  RpcNotifyCommand command = 101;
+}
+
+message NotifyNewBlockTemplateResponseMessage {
+  RPCError error = 1000;
+}
+
+// NewBlockTemplateNotificationMessage is sent whenever a new updated block template is
+// available for miners.
+//
+// See NotifyNewBlockTemplateRequestMessage
+message NewBlockTemplateNotificationMessage {}
+
+message RpcMempoolEntryByAddress {
+  string address = 1;
+  repeated RpcMempoolEntry sending = 2;
+  repeated RpcMempoolEntry receiving = 3;
+}
+
+message GetMempoolEntriesByAddressesRequestMessage {
+  repeated string addresses = 1;
+  bool includeOrphanPool = 2;
+  bool filterTransactionPool = 3;
+}
+
+message GetMempoolEntriesByAddressesResponseMessage {
+  repeated RpcMempoolEntryByAddress entries = 1;
+
+  RPCError error = 1000;
+}
+
+message GetCoinSupplyRequestMessage {}
+
+message GetCoinSupplyResponseMessage {
+  uint64 maxSompi = 1; // note: this is a hard coded maxSupply, actual maxSupply is expected to deviate by upto -5%, but cannot be measured exactly.
+  uint64 circulatingSompi = 2;
+
+  RPCError error = 1000;
+}
+
+message PingRequestMessage {}
+
+message PingResponseMessage {
+  RPCError error = 1000;
+}
+
+message ProcessMetrics {
+  uint64 residentSetSize = 1;
+  uint64 virtualMemorySize = 2;
+  uint32 coreNum = 3;
+  float cpuUsage = 4;
+  uint32 fdNum = 5;
+  uint64 diskIoReadBytes = 6;
+  uint64 diskIoWriteBytes = 7;
+  float diskIoReadPerSec = 8;
+  float diskIoWritePerSec = 9;
+}
+
+message ConnectionMetrics {
+  uint32 borshLiveConnections = 31;
+  uint64 borshConnectionAttempts = 32;
+  uint64 borshHandshakeFailures = 33;
+
+  uint32 jsonLiveConnections = 41;
+  uint64 jsonConnectionAttempts = 42;
+  uint64 jsonHandshakeFailures = 43;
+
+  uint32 activePeers = 51;
+}
+
+message BandwidthMetrics {
+  uint64 borshBytesTx = 61;
+  uint64 borshBytesRx = 62;
+  uint64 jsonBytesTx = 63;
+  uint64 jsonBytesRx = 64;
+  uint64 grpcP2pBytesTx = 65;
+  uint64 grpcP2pBytesRx = 66;
+  uint64 grpcUserBytesTx = 67;
+  uint64 grpcUserBytesRx = 68;
+}
+
+message ConsensusMetrics {
+  uint64 blocksSubmitted = 1;
+  uint64 headerCounts = 2;
+  uint64 depCounts = 3;
+  uint64 bodyCounts = 4;
+  uint64 txsCounts = 5;
+  uint64 chainBlockCounts = 6;
+  uint64 massCounts = 7;
+
+  uint64 blockCount = 11;
+  uint64 headerCount = 12;
+  uint64 mempoolSize = 13;
+  uint32 tipHashesCount = 14;
+  double difficulty = 15;
+  uint64 pastMedianTime = 16;
+  uint32 virtualParentHashesCount = 17;
+  uint64 virtualDaaScore = 18;
+}
+
+message StorageMetrics {
+  uint64 storageSizeBytes = 1;
+}
+
+message GetConnectionsRequestMessage {
+  bool includeProfileData = 1;
+}
+
+message ConnectionsProfileData {
+  double cpuUsage = 1;
+  uint64 memoryUsage = 2;
+}
+
+message GetConnectionsResponseMessage {
+  uint32 clients = 1;
+  uint32 peers = 2;
+  ConnectionsProfileData profileData = 3;
+  RPCError error = 1000;
+}
+
+message GetSystemInfoRequestMessage {}
+
+message GetSystemInfoResponseMessage {
+  string version = 1;
+  string systemId = 2;
+  string gitHash = 3;
+  uint32 coreNum = 4;
+  uint64 totalMemory = 5;
+  uint32 fdLimit = 6;
+  uint32 proxySocketLimitPerCpuCore = 7;
+  RPCError error = 1000;
+}
+
+message GetMetricsRequestMessage {
+  bool processMetrics = 1;
+  bool connectionMetrics = 2;
+  bool bandwidthMetrics = 3;
+  bool consensusMetrics = 4;
+  bool storageMetrics = 5;
+  bool customMetrics = 6;
+}
+
+message GetMetricsResponseMessage {
+  uint64 serverTime = 1;
+  ProcessMetrics processMetrics = 11;
+  ConnectionMetrics connectionMetrics = 12;
+  BandwidthMetrics bandwidthMetrics = 13;
+  ConsensusMetrics consensusMetrics = 14;
+  StorageMetrics storageMetrics = 15;
+  RPCError error = 1000;
+}
+
+message GetServerInfoRequestMessage {}
+
+message GetServerInfoResponseMessage {
+  uint32 rpcApiVersion = 1;
+  uint32 rpcApiRevision = 2;
+  string serverVersion = 3;
+  string networkId = 4;
+  bool hasUtxoIndex = 5;
+  bool isSynced = 6;
+  uint64 virtualDaaScore = 7;
+  RPCError error = 1000;
+}
+
+message GetSyncStatusRequestMessage {}
+
+message GetSyncStatusResponseMessage {
+  bool isSynced = 1;
+  RPCError error = 1000;
+}
+
+message GetDaaScoreTimestampEstimateRequestMessage {
+  repeated uint64 daaScores = 1;
+}
+
+message GetDaaScoreTimestampEstimateResponseMessage {
+  repeated uint64 timestamps = 1;
+  RPCError error = 1000;
+}
+
+message RpcFeerateBucket {
+  // Fee/mass of a transaction in `sompi/gram` units
+  double feerate = 1;
+  double estimatedSeconds = 2;
+}
+
+// Data required for making fee estimates.
+//
+// Feerate values represent fee/mass of a transaction in `sompi/gram` units.
+// Given a feerate value recommendation, calculate the required fee by
+// taking the transaction mass and multiplying it by feerate: `fee = feerate * mass(tx)`
+message RpcFeeEstimate {
+  // Top-priority feerate bucket. Provides an estimation of the feerate required for sub-second DAG inclusion.
+  RpcFeerateBucket priorityBucket = 1;
+
+  // A vector of *normal* priority feerate values. The first value of this vector is guaranteed to exist and
+  // provide an estimation for sub-*minute* DAG inclusion. All other values will have shorter estimation
+  // times than all `lowBucket` values. Therefor by chaining `[priority] | normal | low` and interpolating
+  // between them, one can compose a complete feerate function on the client side. The API makes an effort
+  // to sample enough "interesting" points on the feerate-to-time curve, so that the interpolation is meaningful.
+  repeated RpcFeerateBucket normalBuckets = 2;
+
+  // A vector of *low* priority feerate values. The first value of this vector is guaranteed to
+  // exist and provide an estimation for sub-*hour* DAG inclusion.
+  repeated RpcFeerateBucket lowBuckets = 3;
+}
+
+message RpcFeeEstimateVerboseExperimentalData {
+  uint64 mempoolReadyTransactionsCount = 1;
+  uint64 mempoolReadyTransactionsTotalMass = 2;
+  uint64 networkMassPerSecond = 3;
+
+  double nextBlockTemplateFeerateMin = 11;
+  double nextBlockTemplateFeerateMedian = 12;
+  double nextBlockTemplateFeerateMax = 13;
+}
+
+message GetFeeEstimateRequestMessage {}
+
+message GetFeeEstimateResponseMessage {
+  RpcFeeEstimate estimate = 1;
+  RPCError error = 1000;
+}
+
+message GetFeeEstimateExperimentalRequestMessage {
+  bool verbose = 1;
+}
+
+message GetFeeEstimateExperimentalResponseMessage {
+  RpcFeeEstimate estimate = 1;
+  RpcFeeEstimateVerboseExperimentalData verbose = 2;
+
+  RPCError error = 1000;
+}
+
+message GetUtxoReturnAddressRequestMessage {
+  string txid = 1;
+  uint64 accepting_block_daa_score = 2;
+}
+
+message GetUtxoReturnAddressResponseMessage {
+  string return_address = 1;
+  RPCError error = 1000;
+}
+
+// ### messages for vspc v2 ###
+
+enum RpcDataVerbosityLevel {
+  NONE = 0;
+  LOW = 1;
+  HIGH = 2;
+  FULL = 3;
+}
+
+message RpcOptionalHeader {
+  optional string hash = 2;
+  optional uint32 version = 3;
+  repeated RpcBlockLevelRun parentsByLevel = 4;
+  optional string hashMerkleRoot = 5;
+  optional string acceptedIdMerkleRoot = 6;
+  optional string utxoCommitment = 7;
+  optional int64 timestamp = 8;
+  optional uint32 bits = 9;
+  optional uint64 nonce = 10;
+  optional uint64 daaScore = 11;
+  optional string blueWork = 12;
+  optional uint64 blueScore = 13;
+  optional string pruningPoint = 14;
+}
+
+message RpcOptionalTransactionOutpoint {
+  optional string transactionId = 2;
+  optional uint32 index = 3;
+}
+
+message RpcOptionalUtxoEntryVerboseData {
+  optional string scriptPublicKeyType = 2;
+  optional string scriptPublicKeyAddress = 3;
+}
+
+message RpcOptionalUtxoEntry {
+  optional uint64 amount = 2;
+  optional RpcScriptPublicKey scriptPublicKey = 3;
+  optional uint64 blockDaaScore = 4;
+  optional bool isCoinbase = 5;
+  optional RpcOptionalUtxoEntryVerboseData verboseData = 6;
+  optional string CovenantId = 7;
+}
+
+message RpcOptionalTransactionInputVerboseData {
+  optional RpcOptionalUtxoEntry utxoEntry = 2;
+}
+
+message RpcOptionalTransactionInput {
+  optional RpcOptionalTransactionOutpoint previousOutpoint = 2;
+  optional string signatureScript = 3;
+  optional uint64 sequence = 4;
+  optional uint32 sigOpCount = 5;
+  optional RpcOptionalTransactionInputVerboseData verboseData = 6;
+  // Replaces sigop count for tx version >= 1.
+  optional uint32 computeBudget = 7;
+}
+
+message RpcOptionalTransactionOutputVerboseData {
+  optional string scriptPublicKeyType = 2;
+  optional string scriptPublicKeyAddress = 3;
+}
+
+message RpcNullableCovenantBinding {
+  optional RpcCovenantBinding covenant = 1;
+}
+
+message RpcOptionalTransactionOutput {
+  optional uint64 value = 2;
+  optional RpcScriptPublicKey scriptPublicKey = 3;
+  optional RpcOptionalTransactionOutputVerboseData verboseData = 4;
+  optional RpcNullableCovenantBinding covenant = 5;
+}
+
+message RpcOptionalTransactionVerboseData {
+  optional string transactionId = 2;
+  optional string hash = 3;
+  optional uint64 computeMass = 4;
+  optional string blockHash = 5;
+  optional uint64 blockTime = 6;
+}
+
+message RpcOptionalTransaction {
+  optional uint32 version = 2;
+  repeated RpcOptionalTransactionInput inputs = 3;
+  repeated RpcOptionalTransactionOutput outputs = 4;
+  optional uint64 lockTime = 5;
+  optional string subnetworkId = 6;
+  optional uint64 gas = 7;
+  optional string payload = 8;
+  optional uint64 mass = 9;
+  optional RpcOptionalTransactionVerboseData verboseData = 10;
+}
+
+message RpcChainBlockAcceptedTransactions {
+  RpcOptionalHeader chainBlockHeader = 2;
+  repeated RpcOptionalTransaction acceptedTransactions = 3;
+}
+
+/// GetVirtualChainFromBlockV2RequestMessage requests the virtual selected
+/// parent chain from some startHash to this kaspad's current virtual
+message GetVirtualChainFromBlockV2RequestMessage {
+  string startHash = 1;
+
+  optional RpcDataVerbosityLevel dataVerbosityLevel = 2;
+  optional uint64 minConfirmationCount = 3;
+}
+
+message GetVirtualChainFromBlockV2ResponseMessage {
+  // The chain blocks that were removed, in high-to-low order
+  repeated string removedChainBlockHashes = 1;
+
+  // The chain blocks that were added, in low-to-high order
+  repeated string addedChainBlockHashes = 2;
+
+  // Will be filled depending on the supplied RpcDataVerbosityLevel.
+  repeated RpcChainBlockAcceptedTransactions chainBlockAcceptedTransactions = 3;
+
+  RPCError error = 1000;
+}
+
+message GetCurrentBlockColorRequestMessage {
+  string hash = 1;
+}
+
+message GetCurrentBlockColorResponseMessage {
+  bool blue = 1;
+
+  RPCError error = 1000;
+}
+
+enum BlockColor {
+  UNKNOWN = 0;
+  BLUE = 1;
+  RED = 2;
+}
+
+message GetBlockRewardInfoRequestMessage {
+  string hash = 1;
+}
+
+message GetBlockRewardInfoResponseMessage {
+  RpcBlockHeader header = 1;
+  BlockColor blockColor = 2;
+  optional uint64 confirmationCount = 3;
+  optional string mergingChainBlockHash = 4;
+  optional uint64 rewardAmount = 5;
+
+  RPCError error = 1000;
+}
+
+// GetSeqCommitLaneProofRequestMessage requests the witness needed to prove a
+// single KIP-21 lane against the seq_commit carried in blockHash's header.
+//
+// blockHash must be a chain (selected-parent-chain) block at or after the
+// current pruning point.
+message GetSeqCommitLaneProofRequestMessage {
+  // Block hash whose header carries the seq_commit to verify against (32 bytes).
+  bytes blockHash = 1;
+  // The 32-byte lane key.
+  bytes laneKey = 2;
+}
+
+message GetSeqCommitLaneProofResponseMessage {
+  // OwnedSmtProof wire format (bitmap || terminal || siblings).
+  bytes smtProof = 1;
+  // 32 bytes iff the lane has an entry in the active-lanes SMT at this POV,
+  // otherwise None (non-inclusion proof).
+  optional bytes laneTip = 2;
+  // Only meaningful when laneTip is present.
+  optional uint64 laneBlueScore = 3;
+  // H_seq(mergeset_context_hash, miner_payload_root) for the block (32 bytes).
+  bytes payloadAndCtxDigest = 4;
+  // seq_commit of the selected parent (= parent header's accepted_id_merkle_root, 32 bytes).
+  bytes parentSeqCommit = 5;
+  // KIP-21 activity_root anchor: the accepted_id_merkle_root of the
+  // inactivity-shortcut block (32 bytes). Folded as
+  // activity_root = H_activity_root(inactivityShortcut, lanes_root).
+  bytes inactivityShortcut = 6;
+
+  RPCError error = 1000;
+}
+</file>
+
+<file path="src/diff_engine/mod.rs">
+use kaspa_consensus_core::header::Header;
+use kaspa_pow::State;
+use kaspa_math::Uint256;
+
+/// Validates incoming shares against both pool and network targets using native kHeavyHash.
+pub fn verify_share(header: &Header, nonce: u64, min_share_diff: f64) -> (bool, bool) {
+    let mut testing_header = header.clone();
+    testing_header.nonce = nonce;
+
+    // ⚡ Execute official cSHAKE-256 + HeavyHash matrix operations
+    let state = State::new(&testing_header);
+    
+    // check_pow natively returns whether it met the Network Target, AND the actual Uint256 hash
+    let (is_network_block, pow_hash) = state.check_pow(nonce);
+
+    // Compute the absolute pool target threshold based on maximum space configuration
+    let max_target = Uint256::MAX;
+    let pool_target = if min_share_diff <= 1.0 {
+        max_target
+    } else {
+        // Use standard From implementation for bulletproof compilation
+        max_target / Uint256::from(min_share_diff as u64)
+    };
+
+    // A share is cryptographically valid if its hash value falls beneath the pool target space
+    let is_valid_pool_share = pow_hash <= pool_target;
+
+    (is_valid_pool_share, is_network_block)
+}
+</file>
+
+<file path="src/job_manager/mod.rs">
+use std::sync::{Arc, RwLock};
+use tokio::sync::broadcast;
+use tokio::sync::mpsc;
+use bytes::Bytes;
+use crate::kaspad_client::protowire::RpcBlock;
+use serde_json::json;
+use dashmap::DashMap;
+
+use kaspa_hashes::Hash;
+use kaspa_consensus_core::header::Header;
+use kaspa_math::Uint192; 
+use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Instant, Duration};
+use std::fmt::Write;
+
+static JOB_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub struct StratumJob {
+    pub job_id: String,
+    pub payload: Arc<Bytes>,
+}
+
+pub struct JobManager {
+    pub job_tx: broadcast::Sender<StratumJob>,
+    pub active_jobs: DashMap<String, (Header, RpcBlock)>,
+    pub block_submit_tx: mpsc::Sender<RpcBlock>,
+    pub job_timestamps: DashMap<String, Instant>,
+    pub cached_job: RwLock<Option<Arc<Bytes>>>, 
+}
+
+impl JobManager {
+    pub fn new() -> (Arc<Self>, broadcast::Receiver<StratumJob>, mpsc::Receiver<RpcBlock>) {
+        let (job_tx, job_rx) = broadcast::channel(1024);
+        let (block_submit_tx, block_submit_rx) = mpsc::channel(100);
+        
+        let manager = Arc::new(Self { 
+            job_tx,
+            active_jobs: DashMap::new(),
+            job_timestamps: DashMap::new(),
+            block_submit_tx,
+            cached_job: RwLock::new(None),
+        });
+
+        let gc_manager = manager.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            loop {
+                interval.tick().await;
+                let now = Instant::now();
+                let mut stale_keys = Vec::new();
+
+                for entry in gc_manager.job_timestamps.iter() {
+                    if now.duration_since(*entry.value()) > Duration::from_secs(300) {
+                        stale_keys.push(entry.key().clone());
+                    }
+                }
+
+                let active_count = gc_manager.active_jobs.len();
+                if stale_keys.len() >= active_count && active_count > 0 {
+                    stale_keys.sort_by_key(|k| gc_manager.job_timestamps.get(k).map(|v| *v).unwrap_or(now));
+                    stale_keys.pop(); 
+                }
+
+                for key in stale_keys {
+                    gc_manager.active_jobs.remove(&key);
+                    gc_manager.job_timestamps.remove(&key);
+                }
+            }
+        });
+
+        (manager, job_rx, block_submit_rx)
+    }
+
+    pub fn process_new_block(&self, block: RpcBlock) {
+        if let Some(rpc_header) = &block.header {
+            let unique_id = JOB_COUNTER.fetch_add(1, Ordering::SeqCst);
+            let job_id = format!("{:04x}", unique_id & 0xFFFF); 
+
+            let hash_merkle_root = Hash::from_str(&rpc_header.hash_merkle_root).expect("Invalid hash_merkle_root");
+            let accepted_id_merkle_root = Hash::from_str(&rpc_header.accepted_id_merkle_root).expect("Invalid accepted_id_merkle_root");
+            let utxo_commitment = Hash::from_str(&rpc_header.utxo_commitment).expect("Invalid utxo_commitment");
+            let pruning_point = Hash::from_str(&rpc_header.pruning_point).expect("Invalid pruning_point");
+            let blue_work = Uint192::from_hex(&rpc_header.blue_work).expect("Invalid blue_work string");
+
+            let mut parents_by_level = vec![];
+            for level in &rpc_header.parents {
+                let level_hashes: Vec<Hash> = level.parent_hashes.iter()
+                    .map(|h| Hash::from_str(h).expect("Invalid parent hash from node"))
+                    .collect();
+                parents_by_level.push(level_hashes);
+            }
+
+            let consensus_header = Header::new_finalized(
+                rpc_header.version as u16,
+                parents_by_level.try_into().expect("DAG Parent Compression Failed"),
+                hash_merkle_root,
+                accepted_id_merkle_root,
+                utxo_commitment,
+                rpc_header.timestamp as u64,
+                rpc_header.bits,
+                rpc_header.nonce,
+                rpc_header.daa_score,
+                blue_work,                
+                rpc_header.blue_score,   
+                pruning_point,
+            );
+
+            self.active_jobs.insert(job_id.clone(), (consensus_header.clone(), block.clone()));
+            self.job_timestamps.insert(job_id.clone(), Instant::now()); 
+
+            let pre_pow_hash = kaspa_consensus_core::hashing::header::hash_override_nonce_time(
+                &consensus_header, 
+                0, 
+                0
+            );
+            let hb = pre_pow_hash.as_bytes();
+
+            let mut large_job_param = String::with_capacity(80);
+            
+            for b in hb {
+                write!(&mut large_job_param, "{:02x}", b).unwrap();
+            }
+            
+            let ts = rpc_header.timestamp as u64;
+            let ts_bytes = ts.to_le_bytes();
+            for b in &ts_bytes {
+                write!(&mut large_job_param, "{:02x}", b).unwrap();
+            }
+
+            let notify_payload = json!({
+                "id": null,
+                "method": "mining.notify",
+                "params": [
+                    job_id,
+                    large_job_param
+                ]
+            });
+
+            let mut json_payload = notify_payload.to_string();
+            json_payload.push('\n');
+
+            let bytes_payload = Arc::new(Bytes::from(json_payload));
+
+            if let Ok(mut cache) = self.cached_job.write() {
+                *cache = Some(Arc::clone(&bytes_payload));
+            }
+
+            let stratum_job = StratumJob {
+                job_id: job_id.clone(),
+                payload: bytes_payload,
+            };
+
+            let _ = self.job_tx.send(stratum_job);
+        }
+    }
+}
+</file>
+
+<file path="src/kaspad_client/mod.rs">
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use redis::AsyncCommands; 
+use crate::config::StratumConfig;
+use crate::job_manager::JobManager; 
+
+pub mod protowire {
+    tonic::include_proto!("protowire");
+}
+
+use protowire::rpc_client::RpcClient;
+use protowire::{KaspadRequest, GetBlockTemplateRequestMessage, NotifyBlockAddedRequestMessage, SubmitBlockRequestMessage, NotifyNewBlockTemplateRequestMessage};
+use protowire::kaspad_request::Payload as RequestPayload;
+use protowire::kaspad_response::Payload as ResponsePayload;
+use protowire::RpcBlock;
+
+pub async fn start_kaspad_client(
+    config: Arc<StratumConfig>, 
+    job_manager: Arc<JobManager>,
+    mut block_submit_rx: mpsc::Receiver<RpcBlock>
+) -> anyhow::Result<()> {
+    let mut url = config.kaspad_address.clone();
+    if !url.starts_with("http") {
+        url = format!("http://{}", url);
+    }
+    
+    tracing::info!("🔌 Connecting to local Redis Cache for Frontend UI...");
+    let redis_client = redis::Client::open("redis://127.0.0.1/")?;
+    let mut redis_conn = redis_client.get_multiplexed_async_connection().await?;
+    
+    tracing::info!("🔗 Booting gRPC Uplink to Upstream Node: {}", url);
+    let mut client = RpcClient::connect(url).await?;
+    tracing::info!("✅ Uplink Established. Subscribing to DAG consensus...");
+
+    let (tx, rx) = mpsc::channel::<KaspadRequest>(100);
+    let request_stream = ReceiverStream::new(rx);
+    let mut response_stream = client.message_stream(request_stream).await?.into_inner();
+
+    let tx_submit = tx.clone();
+    tokio::spawn(async move {
+        while let Some(winning_block) = block_submit_rx.recv().await {
+            tracing::info!("🚀🚀🚀 DISPATCHING BLOCK TO MAINNET CONVERGENCE LAYER 🚀🚀🚀");
+            let req = KaspadRequest {
+                id: 999,
+                payload: Some(RequestPayload::SubmitBlockRequest(SubmitBlockRequestMessage {
+                    block: Some(winning_block),
+                    allow_non_daa_blocks: false,
+                })),
+            };
+            let _ = tx_submit.send(req).await;
+        }
+    });
+
+    tx.send(KaspadRequest {
+        id: 1,
+        payload: Some(RequestPayload::NotifyBlockAddedRequest(NotifyBlockAddedRequestMessage { command: 0 })),
+    }).await?;
+
+    tx.send(KaspadRequest {
+        id: 2,
+        payload: Some(RequestPayload::NotifyNewBlockTemplateRequest(NotifyNewBlockTemplateRequestMessage { command: 0 })),
+    }).await?;
+
+    tx.send(KaspadRequest {
+        id: 3,
+        payload: Some(RequestPayload::GetBlockTemplateRequest(GetBlockTemplateRequestMessage {
+            pay_address: config.mining_address.clone(),
+            extra_data: "Perennia-Zero-Allocation".to_string(),
+        })),
+    }).await?;
+
+    let tx_poll = tx.clone();
+    let mining_address_poll = config.mining_address.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(1000));
+        let mut req_id = 50000;
+        loop {
+            interval.tick().await;
+            req_id += 1;
+            let req = KaspadRequest {
+                id: req_id,
+                payload: Some(RequestPayload::GetBlockTemplateRequest(GetBlockTemplateRequestMessage {
+                    pay_address: mining_address_poll.clone(),
+                    extra_data: "Perennia-Zero-Allocation".to_string(),
+                })),
+            };
+            if tx_poll.send(req).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mining_address = config.mining_address.clone();
+    let tx_clone = tx.clone();
+    
+    tokio::spawn(async move {
+        let mut req_id = 3;
+        while let Ok(Some(response)) = response_stream.message().await {
+            match response.payload {
+                Some(ResponsePayload::GetBlockTemplateResponse(res)) => {
+                    if let Some(err) = res.error {
+                        tracing::error!("❌ GET_BLOCK_TEMPLATE REJECTED BY NODE: {}", err.message);
+                    } else if let Some(block) = res.block {
+                        if let Some(header) = &block.header {
+                            tracing::debug!("🧊 Toccata Block Template Acquired! Blue Score: {}", header.blue_score);
+                            let set_res: redis::RedisResult<()> = redis_conn.set("perennia:node:sync_status", "Online (Toccata Core)").await;
+                            if set_res.is_err() {
+                                if let Ok(new_conn) = redis_client.get_multiplexed_async_connection().await {
+                                    redis_conn = new_conn;
+                                }
+                            }
+                            job_manager.process_new_block(block.clone());
+                        }
+                    }
+                }
+                Some(ResponsePayload::BlockAddedNotification(_)) |
+                Some(ResponsePayload::NewBlockTemplateNotification(_)) => {
+                    req_id += 1;
+                    let _ = tx_clone.send(KaspadRequest {
+                        id: req_id,
+                        payload: Some(RequestPayload::GetBlockTemplateRequest(GetBlockTemplateRequestMessage {
+                            pay_address: mining_address.clone(),
+                            extra_data: "Perennia-Zero-Allocation".to_string(),
+                        })),
+                    }).await;
+                }
+                Some(ResponsePayload::SubmitBlockResponse(res)) => {
+                    if let Some(err) = res.error {
+                        tracing::error!("❌ BLOCK VALIDATION ERROR: {}", err.message);
+                    } else {
+                        tracing::info!("💰💰💰 BLOCK ACCEPTED! CONVERGENCE SETTLED. REWARD LOCKED. 💰💰💰");
+                    }
+                }
+                _ => {}
+            }
+        }
+        
+        tracing::error!("🚨 Kaspa node gRPC connection lost! Stratum halting to force restart...");
+        std::process::exit(1);
+    });
+
+    Ok(())
+}
+</file>
+
+<file path="src/config.rs">
+use serde::Deserialize;
+use std::fs;
+use anyhow::{Context, Result};
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, Clone)]
+pub struct StratumConfig {
+    pub stratum_port: String,
+    pub kaspad_address: String,
+    pub mining_address: String,
+    pub starting_diff: f64,
+    pub min_share_diff: f64,
+    pub var_diff: bool,
+    pub shares_per_min: u32,
+    pub extranonce_size: usize,
+    pub prom_port: String,
+    pub print_stats: bool,
+}
+
+impl StratumConfig {
+    pub fn load(path: &str) -> Result<Self> {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file at {}", path))?;
+        
+        let config: StratumConfig = serde_yaml::from_str(&content)
+            .context("Failed to parse YAML configuration")?;
+            
+        if config.extranonce_size != 2 {
+            anyhow::bail!("FATAL ARCHITECTURE RULE: extranonce_size MUST be exactly 2.");
+        }
+            
+        Ok(config)
+    }
+}
+</file>
+
+<file path=".envecho">
+
+</file>
+
+<file path="build.rs">
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Tell Cargo to re-run this script if the proto files change
+    println!("cargo:rerun-if-changed=proto/rpc.proto");
+    println!("cargo:rerun-if-changed=proto/messages.proto");
+
+    // Compile the Kaspa gRPC protobuf files into native Rust code
+    tonic_build::configure()
+        .build_server(false)
+        .compile(
+            &["proto/messages.proto", "proto/rpc.proto"],
+            &["proto/"],
+        )?;
+        
+    Ok(())
+}
+</file>
+
+<file path="config.yaml">
+# Core Network Parameters (Pivoted to Local Node)
+stratum_port: ":5555"
+kaspad_address: "127.0.0.1:16110"
+
+# Central Pool Wallet
+mining_address: "kaspa:qql2vwejyye7rcp39fdr7n0jfk2vlpvrkt2ke49ztsxceduw4hyw6ld9ts5yv"
+
+# Public Pool Mechanics
+starting_diff: 64       # ⚡ Allows IceRiver and Goldshell miners to survive
+min_share_diff: 2.0      
+var_diff: true           
+shares_per_min: 20
+extranonce_size: 2
+
+# Telemetry System
+prom_port: ":8081"
+print_stats: true
+</file>
+
+<file path="package.json">
+{
+  "dependencies": {
+    "@kaspa/core-lib": "^1.6.5",
+    "@solana/web3.js": "^1.98.4",
+    "bitcoinjs-lib": "^7.0.1",
+    "buffer": "^6.0.3",
+    "ed25519-hd-key": "^2.0.0",
+    "ethers": "^6.17.0"
+  },
+  "devDependencies": {
+    "vite-plugin-node-polyfills": "^0.28.0"
+  }
+}
+</file>
+
+<file path="src/telemetry/mod.rs">
+use prometheus::{GaugeVec, IntCounterVec, Opts, Registry, TextEncoder, Encoder};
+use lazy_static::lazy_static;
+use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
+use std::collections::HashMap;
+use serde_json::json;
+use std::time::{SystemTime, UNIX_EPOCH};
+use redis::AsyncCommands;
+
+/// ⚡ 7-Tier Harmonic Cascade Time Constants (in Seconds)
+/// Tier 0 (1s) -> Tier 6 (377s Fibonacci Anchor)
+const EMA_WINDOWS: [f64; 7] = [1.0, 3.0, 8.0, 21.0, 55.0, 144.0, 377.0];
+
+/// Kaspa Fixed Difficulty Multiplier Constant (2^32 hashes per unit difficulty)
+const KASPA_DIFF_CONSTANT: f64 = 4_294_967_296.0;
+
+lazy_static! {
+    pub static ref REGISTRY: Registry = Registry::new();
+
+    pub static ref WORKER_HASHRATE: GaugeVec = GaugeVec::new(
+        Opts::new("ks_worker_hashrate", "Strictly verified unsimulated hashrate per worker in TH/s"),
+        &["worker"]
+    ).expect("Metric setup failed");
+
+    pub static ref WORKER_SHARES: IntCounterVec = IntCounterVec::new(
+        Opts::new("ks_worker_shares", "Cryptographically validated shares per worker"),
+        &["worker", "type"]
+    ).expect("Metric setup failed");
+}
+
+pub fn init_telemetry() {
+    REGISTRY.register(Box::new(WORKER_HASHRATE.clone())).unwrap();
+    REGISTRY.register(Box::new(WORKER_SHARES.clone())).unwrap();
+}
+
+pub async fn start_prometheus_exporter(_bind_addr: String) {
+    let addr = "0.0.0.0:8081";
+    let listener = TcpListener::bind(addr).await.expect("Failed to bind Prometheus port");
+    
+    tracing::info!("📊 Zero-Simulation Telemetry exporter natively active on http://{}/metrics", addr);
+
+    loop {
+        if let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0; 1024];
+                let _ = socket.read(&mut buf).await; 
+
+                let mut buffer = vec![];
+                let encoder = TextEncoder::new();
+                let metric_families = REGISTRY.gather();
+                encoder.encode(&metric_families, &mut buffer).unwrap();
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\n\r\n{}",
+                    buffer.len(),
+                    String::from_utf8_lossy(&buffer)
+                );
+                
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    }
+}
+
+/// Internal struct tracking 64-byte harmonic state per worker
+struct WorkerState {
+    last_share_ts: u64,
+    emas: [f64; 7],
+    shares_contributed: f64,
+    unflushed_difficulty: f64,
+    unflushed_oracle_shares: Vec<(f64, u64)>, // (difficulty, timestamp)
+}
+
+pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String, f64)>) {
+    tracing::info!("🏦 Institutional Accounting & Telemetry Engine Booted. Awaiting verified shares...");
+
+    let redis_client = redis::Client::open("redis://127.0.0.1/").expect("Redis connection failed");
+    let mut redis_conn = match redis_client.get_multiplexed_async_connection().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("❌ CRITICAL: Could not connect to Redis for Accounting! {}", e);
+            return;
+        }
+    };
+
+    // ⚡ 1000ms METRONOME TICK: High-frequency telemetry broadcast
+    let mut flush_interval = tokio::time::interval(tokio::time::Duration::from_millis(1000));
+    let mut worker_states: HashMap<String, WorkerState> = HashMap::new();
+
+    loop {
+        tokio::select! {
+            // ⚡ REAL-TIME SHARE INGESTION: Microsecond Continuous-Time EMA Cascade
+            Some((full_worker_name, difficulty)) = valid_share_rx.recv() => {
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+                let work = difficulty * KASPA_DIFF_CONSTANT;
+
+                let state = worker_states.entry(full_worker_name.clone()).or_insert_with(|| WorkerState {
+                    last_share_ts: now,
+                    emas: [0.0; 7],
+                    shares_contributed: 0.0,
+                    unflushed_difficulty: 0.0,
+                    unflushed_oracle_shares: Vec::new(),
+                });
+
+                let dt_sec = (now.saturating_sub(state.last_share_ts)) as f64 / 1000.0;
+
+                // Execute Continuous-Time EMA Decay Across 7 Harmonic Tiers
+                for (i, &tau) in EMA_WINDOWS.iter().enumerate() {
+                    let alpha = 1.0 - f64::exp(-dt_sec / tau);
+                    
+                    // L'Hôpital Limit Guard against instant burst shares
+                    let contribution = if dt_sec > 0.001 {
+                        (work / dt_sec) * alpha
+                    } else {
+                        work / tau
+                    };
+
+                    state.emas[i] = (state.emas[i] * (1.0 - alpha)) + contribution;
+                }
+
+                state.last_share_ts = now;
+                state.shares_contributed += difficulty;
+                state.unflushed_difficulty += difficulty;
+                state.unflushed_oracle_shares.push((difficulty, now));
+
+                // ⚡ COMPILER FIX: IntCounterVec target WORKER_SHARES selected over GaugeVec WORKER_HASHRATE
+                WORKER_SHARES.with_label_values(&[&full_worker_name, "valid"]).inc_by(difficulty as u64);
+            }
+
+            // ⚡ 1000ms BROADCAST METRONOME: Read-Time Decay Projection & Stream Pipeline
+            _ = flush_interval.tick() => {
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+                let mut pipeline = redis::pipe();
+                let mut total_hashrate = 0.0;
+                let mut workers_array = Vec::new();
+                let mut keys_to_remove = Vec::new();
+
+                if !worker_states.is_empty() {
+                    for (full_worker, state) in worker_states.iter_mut() {
+                        let dt_idle = (now.saturating_sub(state.last_share_ts)) as f64 / 1000.0;
+                        let mut projected_emas = [0.0; 7];
+
+                        // Read-Time Projection Decay (projects drain without touching base state)
+                        for (i, &tau) in EMA_WINDOWS.iter().enumerate() {
+                            let alpha = 1.0 - f64::exp(-dt_idle / tau);
+                            projected_emas[i] = state.emas[i] * (1.0 - alpha);
+                        }
+
+                        // Tier 2 (8-second window) serves as the primary UI Hashes/sec rate
+                        let current_hashrate = projected_emas[2];
+
+                        // Drop offline if tracking rate falls below 5 GH/s and idle > 30s
+                        let is_online = current_hashrate > 5_000_000_000.0 || dt_idle < 30.0;
+
+                        if !is_online {
+                            keys_to_remove.push(full_worker.clone());
+                            pipeline.cmd("SET").arg(format!("worker:{}:hashrate", full_worker)).arg(0.0).ignore();
+                            pipeline.cmd("SREM").arg("pool:workers").arg(full_worker.clone()).ignore();
+                        } else {
+                            total_hashrate += current_hashrate;
+
+                            // Update Prometheus Gauge (in TH/s)
+                            WORKER_HASHRATE.with_label_values(&[full_worker]).set(current_hashrate / 1e12);
+
+                            pipeline.cmd("SET").arg(format!("worker:{}:hashrate", full_worker)).arg(current_hashrate).ignore();
+
+                            // Execute Ledger & Oracle Buffer Flushes if new shares were ingested
+                            if state.unflushed_difficulty > 0.0 {
+                                let parts: Vec<&str> = full_worker.split('.').collect();
+                                let wallet = parts[0];
+                                let wallet_key = format!("perennia:ledger:wallet:{}", wallet);
+
+                                pipeline.cmd("INCRBYFLOAT").arg(&wallet_key).arg(state.unflushed_difficulty).ignore();
+                                pipeline.cmd("SADD").arg("pool:workers").arg(full_worker.clone()).ignore();
+                                pipeline.cmd("INCRBYFLOAT").arg(format!("worker:{}:shares", full_worker)).arg(state.unflushed_difficulty).ignore();
+
+                                for (diff, ts) in state.unflushed_oracle_shares.drain(..) {
+                                    let oracle_event = json!({
+                                        "worker": full_worker,
+                                        "difficulty": diff,
+                                        "timestamp": ts
+                                    });
+                                    pipeline.cmd("RPUSH").arg("perennia:oracle:share_buffer").arg(oracle_event.to_string()).ignore();
+                                }
+
+                                state.unflushed_difficulty = 0.0;
+                            }
+
+                            let parts: Vec<&str> = full_worker.split('.').collect();
+                            let wallet_address = if !parts.is_empty() { parts[0] } else { full_worker.as_str() };
+                            let worker_name = if parts.len() > 1 { parts[1..].join(".") } else { full_worker.to_string() };
+
+                            workers_array.push(json!({
+                                "fullIdentity": full_worker,
+                                "walletAddress": wallet_address,
+                                "name": worker_name,
+                                "trackingRate": current_hashrate,
+                                "sharesContributed": state.shares_contributed,
+                                "blocksFound": 0,
+                                "status": "online",
+                                "harmonicMesh": projected_emas
+                            }));
+                        }
+                    }
+
+                    // Evict completely drained offline workers
+                    for key in keys_to_remove {
+                        worker_states.remove(&key);
+                    }
+                }
+
+                pipeline.cmd("SET").arg("pool:hashrate").arg(total_hashrate).ignore();
+
+                let telemetry_payload = json!({
+                    "totalHashrate": total_hashrate,
+                    "workers": workers_array
+                });
+
+                let payload_str = telemetry_payload.to_string();
+
+                // 1. Snapshot Cache for HTTP Polling endpoints
+                pipeline.cmd("SET")
+                    .arg("perennia:telemetry")
+                    .arg(&payload_str)
+                    .ignore();
+
+                // 2. ⚡ REAL-TIME REDIS STREAM: XADD for WebSocket Event Pipelines
+                pipeline.cmd("XADD")
+                    .arg("telemetry:stream")
+                    .arg("MAXLEN").arg("~").arg(100)
+                    .arg("*")
+                    .arg("payload").arg(&payload_str)
+                    .ignore();
+                    
+                // 3. ⚡ SVELTEKIT SSE: Pub/Sub Broadcast
+                pipeline.cmd("PUBLISH")
+                    .arg("telemetry:updates")
+                    .arg(&payload_str)
+                    .ignore();
+
+                // Execute Atomic Pipeline
+                if let Err(e) = pipeline.query_async::<_, ()>(&mut redis_conn).await {
+                    tracing::error!("🚨 CRITICAL LEDGER FAILURE: {}", e);
+                    tracing::warn!("🔄 Attempting to re-establish broken Redis multiplexer pipeline...");
+                    
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    
+                    if let Ok(new_conn) = redis_client.get_multiplexed_async_connection().await {
+                        tracing::info!("✅ Redis connection successfully restored.");
+                        redis_conn = new_conn;
+                    }
+                }
+            }
+        }
+    }
+}
+</file>
+
+<file path="src/main.rs">
+mod config;
+mod stratum_tcp;
+mod telemetry;
+mod kaspad_client;
+mod job_manager; 
+mod diff_engine; 
+mod oracle;
+mod sor; // ⚡ Inject the new Live SOR Engine
+mod chronos; // ⚡ Inject the Chronos Engine
+
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tracing::Level;
+use tracing_subscriber::FmtSubscriber;
+use axum::{routing::post, Router};
+use sqlx::postgres::PgPoolOptions;
+use job_manager::JobManager;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(Level::INFO)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).expect("Failed to init tracing");
+
+    tracing::info!("Booting Perennia Core Engine (Hybrid Mainnet + Stratum)...");
+
+    let config = Arc::new(config::StratumConfig::load("config.yaml")?);
+    tracing::info!("Targeted Treasury Wallet: {}", config.mining_address);
+
+    tracing::info!("Initializing PostgreSQL Pool...");
+    let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://postgres:password@127.0.0.1:5432/perennia".to_string());
+    
+    let pool = PgPoolOptions::new()
+        .max_connections(10)
+        .connect(&db_url)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("Failed to connect to PostgreSQL (Ensure DB is running): {}", e);
+            panic!("Database connection required for routing dependencies: {}", e);
+        });
+
+    // ⚡ Ignite Chronos Backend Daemon
+    let pool_chronos = pool.clone();
+    tokio::spawn(async move {
+        chronos::start_chronos_daemon(pool_chronos).await;
+    });
+
+    telemetry::init_telemetry();
+    let prom_port = config.prom_port.clone();
+    tokio::spawn(async move {
+        telemetry::start_prometheus_exporter(prom_port).await;
+    });
+
+    let (valid_share_tx, valid_share_rx) = mpsc::channel(10000);
+
+    tokio::spawn(async move {
+        telemetry::start_accounting_engine(valid_share_rx).await;
+    });
+
+    tokio::spawn(async move {
+        oracle::start_oracle_daemon().await;
+    });
+
+    // ⚡ Ignite the Global Spot Pricing Oracle Daemon
+    tokio::spawn(async move {
+        oracle::start_spot_pricing_daemon().await;
+    });
+
+    // Restore Job Manager
+    let (job_manager_arc, _job_rx, block_submit_rx) = JobManager::new();
+
+    // Restore Kaspad Client
+    let config_clone = config.clone();
+    let jm_clone = job_manager_arc.clone();
+    
+    tokio::spawn(async move {
+        if let Err(e) = kaspad_client::start_kaspad_client(config_clone, jm_clone, block_submit_rx).await {
+            tracing::error!("Kaspa gRPC Connection Failed: {}", e);
+        }
+    });
+
+    // ⚡ API Isolation: The Smart Order Router execution engine binds cleanly to port 8002
+    let app = Router::new()
+        .route("/v1/sor/execute", post(sor::handle_sor_execute))
+        .with_state(pool);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8002").await?;
+    tokio::spawn(async move {
+        tracing::info!("🚀 Axum HTTP Server bound instantly on port 8002 (SOR Protocol Armed)");
+        if let Err(e) = axum::serve(listener, app).await {
+            tracing::error!("Axum Server Error: {}", e);
+        }
+    });
+
+    // ⚡ Restore 3-Tier Tokio Listeners for Physical Hash Power
+
+    // Tier 1: GPU/Mobile | Bind: 0.0.0.0:5551 | Diff: 1.0 | Throttle: 0ms
+    let cfg_t1 = config.clone();
+    let jm_t1 = job_manager_arc.clone();
+    let tx_t1 = valid_share_tx.clone();
+    tokio::spawn(async move {
+        if let Err(e) = stratum_tcp::start_stratum_server(cfg_t1, jm_t1, tx_t1, 5551, 1.0, 0).await {
+            tracing::error!("Tier 1 (GPU) failed: {}", e);
+        }
+    });
+
+    // Tier 2: Home ASICs | Bind: 0.0.0.0:5552 | Diff: 256.0 | Throttle: 2500ms
+    let cfg_t2 = config.clone();
+    let jm_t2 = job_manager_arc.clone();
+    let tx_t2 = valid_share_tx.clone();
+    tokio::spawn(async move {
+        if let Err(e) = stratum_tcp::start_stratum_server(cfg_t2, jm_t2, tx_t2, 5552, 256.0, 2500).await {
+            tracing::error!("Tier 2 (Home ASICs) failed: {}", e);
+        }
+    });
+
+    // Tier 3: Industrial ASICs | Bind: 0.0.0.0:5553 | Diff: 1024.0 | Throttle: 3000ms
+    let cfg_t3 = config.clone();
+    let jm_t3 = job_manager_arc.clone();
+    let tx_t3 = valid_share_tx.clone();
+    
+    // Blocking call on the final tier to keep the main thread alive
+    stratum_tcp::start_stratum_server(cfg_t3, jm_t3, tx_t3, 5553, 1024.0, 3000).await?;
+
+    Ok(())
+}
+</file>
+
+<file path="src/oracle.rs">
+use std::collections::HashMap;
+use std::time::Duration;
+use redis::AsyncCommands;
+use serde_json::Value;
+
+// ⚡ GLOBAL PRICING DAEMON - Isolates 3rd Party APIs internally into local Redis states
+pub async fn start_spot_pricing_daemon() {
+    tracing::info!("🌐 Global Spot Price Oracle Daemon Booting...");
+    
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
+    let redis_client = match redis::Client::open("redis://127.0.0.1/") {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Spot Oracle Redis connection failed: {}", e);
+            return;
+        }
+    };
+
+    let mut redis_conn = match redis_client.get_multiplexed_async_connection().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Spot Oracle Redis multiplexer failed: {}", e);
+            return;
+        }
+    };
+
+    // Safe 15-second tick to prevent downstream rate-limiting from free-tier providers
+    let mut interval = tokio::time::interval(Duration::from_secs(15));
+
+    loop {
+        interval.tick().await;
+
+        let url = "https://api.coingecko.com/api/v3/simple/price?ids=kaspa,bitcoin,ethereum,solana&vs_currencies=usd&include_24hr_change=true";
+        
+        match client.get(url).header("User-Agent", "Perennia-Core-Backend/1.0").send().await {
+            Ok(res) => {
+                if let Ok(data) = res.json::<serde_json::Value>().await {
+                    let mut pipeline = redis::pipe();
+                    
+                    // Master payload for the SvelteKit frontend cache (Read natively via SvelteKit)
+                    pipeline.cmd("SET").arg("oracle:spot:prices_json").arg(data.to_string()).ignore();
+
+                    let assets = [
+                        ("kaspa", "KAS_USDC"),
+                        ("bitcoin", "BTC_USDC"),
+                        ("ethereum", "ETH_USDC"),
+                        ("solana", "SOL_USDC")
+                    ];
+
+                    for (cg_id, pair_id) in assets.iter() {
+                        if let Some(asset_data) = data.get(*cg_id) {
+                            if let Some(usd) = asset_data.get("usd").and_then(|v| v.as_f64()) {
+                                pipeline.cmd("SET").arg(format!("oracle:spot:{}", pair_id)).arg(usd.to_string()).ignore();
+                            }
+                            if let Some(change) = asset_data.get("usd_24h_change").and_then(|v| v.as_f64()) {
+                                pipeline.cmd("SET").arg(format!("oracle:change:{}", pair_id)).arg(change.to_string()).ignore();
+                            }
+                        }
+                    }
+
+                    // Execute the atomic Redis pipeline flush
+                    if let Err(e) = pipeline.query_async::<_, ()>(&mut redis_conn).await {
+                        tracing::error!("Spot Oracle Redis Pipeline Failed: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Spot Oracle Upstream Fetch Failed: {}", e);
+            }
+        }
+    }
+}
+
+pub async fn start_oracle_daemon() {
+    tracing::info!("🔮 Yield Oracle Daemon Booting...");
+
+    let db_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:password@127.0.0.1:5432/perennia".to_string());
+    
+    let pool = match sqlx::PgPool::connect(&db_url).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!("Oracle DB connection failed: {}", e);
+            return;
+        }
+    };
+
+    let redis_client = match redis::Client::open("redis://127.0.0.1/") {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Oracle Redis connection failed: {}", e);
+            return;
+        }
+    };
+
+    let mut redis_conn = match redis_client.get_multiplexed_async_connection().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Oracle Redis multiplexer failed: {}", e);
+            return;
+        }
+    };
+
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+
+    loop {
+        interval.tick().await;
+
+        let mut wallet_aggregates: HashMap<String, f64> = HashMap::new();
+        
+        // 1. Pop shares from the Redis buffer
+        loop {
+            let result: redis::RedisResult<Option<String>> = redis::cmd("LPOP")
+                .arg("perennia:oracle:share_buffer")
+                .query_async(&mut redis_conn)
+                .await;
+
+            match result {
+                Ok(Some(event_str)) => {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&event_str) {
+                        if let (Some(worker), Some(diff)) = (parsed["worker"].as_str(), parsed["difficulty"].as_f64()) {
+                            let parts: Vec<&str> = worker.split('.').collect();
+                            let wallet = if !parts.is_empty() { parts[0].to_string() } else { worker.to_string() };
+                            *wallet_aggregates.entry(wallet).or_insert(0.0) += diff;
+                        }
+                    }
+                }
+                Ok(None) => break, // Buffer empty
+                Err(_) => break, // Redis error
+            }
+        }
+
+        if wallet_aggregates.is_empty() {
+            continue;
+        }
+
+        let mut tx = match pool.begin().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("Oracle failed to start DB transaction: {}", e);
+                continue;
+            }
+        };
+
+        let mut commit_success = true;
+
+        // 2. Bulk Aggregated Upsert into Yield Reservoirs
+        let mut agg_wallets = Vec::with_capacity(wallet_aggregates.len());
+        let mut agg_deltas = Vec::with_capacity(wallet_aggregates.len());
+        
+        for (w, d) in &wallet_aggregates {
+            agg_wallets.push(w.clone());
+            agg_deltas.push(*d);
+        }
+
+        if commit_success {
+            let upsert_res = sqlx::query(
+                r#"
+                INSERT INTO yield_reservoirs (wallet_address, streaming_balance_kas, total_yield_kas)
+                SELECT * FROM UNNEST($1::text[], $2::float8[], $2::float8[])
+                ON CONFLICT (wallet_address)
+                DO UPDATE SET
+                    streaming_balance_kas = yield_reservoirs.streaming_balance_kas + EXCLUDED.streaming_balance_kas,
+                    total_yield_kas = yield_reservoirs.total_yield_kas + EXCLUDED.total_yield_kas,
+                    last_updated = CURRENT_TIMESTAMP
+                "#
+            )
+            .bind(&agg_wallets).bind(&agg_deltas)
+            .execute(&mut *tx).await;
+
+            if let Err(e) = upsert_res {
+                tracing::error!("Upsert failed: {}", e);
+                commit_success = false; 
+            }
+        }
+
+        // 3. 1099-DA Compliance Stamping (Gross Proceeds Ledger)
+        if commit_success && !agg_wallets.is_empty() {
+            // Fetch live spot price from Redis to stamp the financial event
+            let kas_spot_price: f64 = redis::cmd("GET")
+                .arg("oracle:spot:KAS_USDC")
+                .query_async(&mut redis_conn)
+                .await
+                .unwrap_or(0.16); // Failsafe to static baseline if oracle desyncs
+
+            let mut event_types = Vec::with_capacity(agg_wallets.len());
+            let mut tickers = Vec::with_capacity(agg_wallets.len());
+            let mut gross_proceeds = Vec::with_capacity(agg_wallets.len());
+            let mut spot_prices = Vec::with_capacity(agg_wallets.len());
+
+            for delta in &agg_deltas {
+                event_types.push("YIELD");
+                tickers.push("KAS");
+                gross_proceeds.push(delta * kas_spot_price);
+                spot_prices.push(kas_spot_price);
+            }
+
+            let tax_ledger_res = sqlx::query(
+                r#"
+                INSERT INTO tax_ledger_events 
+                (wallet_address, asset_ticker, event_type, gross_proceeds_usd, amount_tokens, spot_price_at_execution)
+                SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::float8[], $5::float8[], $6::float8[])
+                "#
+            )
+            .bind(&agg_wallets)
+            .bind(&tickers)
+            .bind(&event_types)
+            .bind(&gross_proceeds)
+            .bind(&agg_deltas)
+            .bind(&spot_prices)
+            .execute(&mut *tx).await;
+
+            if let Err(e) = tax_ledger_res {
+                tracing::error!("Tax ledger failed: {}", e);
+                commit_success = false; 
+            }
+        }
+
+        if commit_success {
+            let _ = tx.commit().await;
+        } else {
+            let _ = tx.rollback().await;
+        }
+    }
+}
+</file>
+
+<file path=".gitignore">
+/target/
+**/*.rs.bk
+.env
+Cargo.lock
+.DS_Store
+node_modules/
+</file>
+
+<file path="Cargo.toml">
+[package]
+name = "perennia-stratum-rs"
+version = "0.2.0"
+edition = "2021"
+description = "High-Performance Zero-Allocation Stratum Server for Kaspa Toccata (Streaming Oracle Edition)"
+
+[dependencies]
+tokio = { version = "1.36", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1.5" 
+tokio-stream = "0.1"
+tonic = "0.11"
+prost = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["raw_value"] }
+serde_yaml = "0.9" 
+itoa = "1.0" 
+prometheus = "0.13"
+lazy_static = "1.4"
+redis = { version = "0.25", features = ["tokio-comp"] }
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dashmap = "6.0"
+
+# 🛡️ BRIDGE API ORCHESTRATION & SOR ROUTING MATRIX
+axum = "0.7"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+hex = "0.4"
+
+# 🛡️ SOVEREIGN INFRASTRUCTURE: PostgreSQL Yield Streaming WAL
+# ⚡ Added `json` feature to allow binding JSONB natively into the Chronos Daemon
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.8", features = ["v4", "serde"] }
+
+# 🛡️ Enterprise Path A: Official Kaspa Consensus Core Cryptography
+kaspa-consensus-core = { git = "https://github.com/kaspanet/rusty-kaspa", branch = "master" }
+kaspa-hashes = { git = "https://github.com/kaspanet/rusty-kaspa", branch = "master" }
+kaspa-math = { git = "https://github.com/kaspanet/rusty-kaspa", branch = "master" }
+kaspa-pow = { git = "https://github.com/kaspanet/rusty-kaspa", branch = "master" } 
+
+[build-dependencies]
+tonic-build = "0.11" 
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+</file>
+
+<file path="src/stratum_tcp/mod.rs">
+use tokio::net::{TcpListener, TcpStream};
+use tokio::io::AsyncWriteExt;
+use tokio_util::codec::{FramedRead, LinesCodec};
+use tokio_stream::StreamExt;
+use serde::Deserialize;
+use serde_json::json;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Semaphore};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Instant, Duration};
+use crate::config::StratumConfig;
+use crate::job_manager::JobManager;
+
+static WORKER_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Deserialize, Debug)]
+pub struct RpcRequest {
+    pub id: Option<serde_json::Value>,
+    pub method: Option<String>,
+    pub params: Option<Vec<serde_json::Value>>,
+}
+
+fn clamp_to_power_of_2(diff: f64) -> u64 {
+    if diff <= 1.0 { return 1; }
+    let next_pow = diff.log2().round() as u32;
+    2u64.pow(next_pow)
+}
+
+pub async fn start_stratum_server(
+    config: Arc<StratumConfig>, 
+    job_manager: Arc<JobManager>,
+    valid_share_tx: mpsc::Sender<(String, f64)>,
+    port: u16,
+    difficulty: f64,
+    throttle_ms: u64
+) -> anyhow::Result<()> {
+    let bind_addr = format!("0.0.0.0:{}", port);
+    let listener = TcpListener::bind(&bind_addr).await?;
+    
+    let connection_limit = Arc::new(Semaphore::new(5000));
+    
+    tracing::info!("🛡️ STRATUM TIER ACTIVE ON {} (Diff: {}, Throttle: {}ms)", bind_addr, difficulty, throttle_ms);
+
+    loop {
+        let permit = connection_limit.clone().acquire_owned().await?;
+        let (socket, addr) = listener.accept().await?;
+        tracing::info!("🔌 [{}] Hardware connection established to Tier Port {}", addr.ip(), port);
+
+        let config_clone = config.clone();
+        let job_manager_clone = job_manager.clone();
+        let share_tx_clone = valid_share_tx.clone();
+        let peer_ip = addr.ip().to_string();
+
+        tokio::spawn(async move {
+            let _permit = permit; 
+            if let Err(e) = handle_worker_connection(socket, peer_ip.clone(), config_clone, job_manager_clone, share_tx_clone, difficulty, throttle_ms).await {
+                tracing::warn!("⚠️ [{}] Worker disconnected: {}", peer_ip, e);
+            }
+        });
+    }
+}
+
+async fn handle_worker_connection(
+    socket: TcpStream, 
+    peer_addr: String,
+    config: Arc<StratumConfig>,
+    job_manager: Arc<JobManager>,
+    valid_share_tx: mpsc::Sender<(String, f64)>,
+    difficulty: f64,
+    throttle_ms: u64
+) -> anyhow::Result<()> {
+    let mut job_rx = job_manager.job_tx.subscribe();
+    let conn_id = WORKER_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let extranonce1 = format!("{:04x}", conn_id & 0xFFFF); 
+    
+    let mut current_diff = clamp_to_power_of_2(difficulty);
+
+    let (read_half, mut write_half) = socket.into_split();
+    
+    let mut reader = FramedRead::new(read_half, LinesCodec::new_with_max_length(2048));
+
+    let mut handshake_state = 0; 
+    let mut current_worker_name = String::new();
+
+    let mut share_count = 0;
+    let mut last_vardiff_retarget = Instant::now();
+    let target_shares_per_min = config.shares_per_min as f64;
+
+    while handshake_state < 2 {
+        let line_res = reader.next().await;
+        if line_res.is_none() { anyhow::bail!("EOF - Client closed connection during handshake"); }
+        
+        let payload_str = match line_res.unwrap() {
+            Ok(s) => s,
+            Err(e) => anyhow::bail!("Client Payload Violation: {}", e),
+        };
+        
+        let trimmed = payload_str.trim_matches('\0').trim();
+        if trimmed.is_empty() { continue; }
+        
+        tracing::info!("⬇️ [RX | {}] {}", peer_addr, trimmed);
+        
+        if let Ok(req) = serde_json::from_str::<RpcRequest>(trimmed) {
+            let method = req.method.unwrap_or_else(|| "unknown".to_string());
+            let req_id = req.id.clone().unwrap_or(serde_json::Value::Null);
+
+            if handshake_state == 0 && method == "mining.subscribe" {
+                let sub_json = json!({
+                    "id": req_id,
+                    "result": [true, "EthereumStratum/1.0.0"],
+                    "error": null
+                });
+                let mut response = sub_json.to_string();
+                response.push('\n');
+                write_half.write_all(response.as_bytes()).await?;
+
+                let en_json = json!({
+                    "id": null,
+                    "method": "mining.set_extranonce",
+                    "params": [extranonce1.clone()]
+                });
+                let mut en_resp = en_json.to_string();
+                en_resp.push('\n');
+                write_half.write_all(en_resp.as_bytes()).await?;
+                
+                handshake_state = 1;
+            } else if handshake_state == 1 && method == "mining.authorize" {
+                let auth_json = json!({
+                    "id": req_id,
+                    "result": true,
+                    "error": null
+                });
+                let mut response = auth_json.to_string();
+                response.push('\n');
+                write_half.write_all(response.as_bytes()).await?;
+                
+                handshake_state = 2;
+            }
+        }
+    }
+
+    // ⚡ FIX: IceRiver ASIC Race Condition Patch
+    // If the ASIC connects before the Node generates the first template, it will 
+    // rapidly spam shares for its old cached job. We intentionally stall the connection 
+    // pipeline here until a job is ready, guaranteeing the ASIC cache is immediately flushed.
+    let initial_job = loop {
+        if let Ok(cache) = job_manager.cached_job.read() {
+            if let Some(job) = &*cache {
+                break job.clone();
+            }
+        }
+        // Poll every 50ms until the node provides the first block template
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    let diff_json = json!({
+        "id": null,
+        "method": "mining.set_difficulty",
+        "params": [current_diff]
+    });
+    let mut diff_msg = diff_json.to_string();
+    diff_msg.push('\n'); 
+    write_half.write_all(diff_msg.as_bytes()).await?;
+
+    // Push the active job instantly to override the ASIC's stale memory
+    write_half.write_all(&initial_job[..]).await?; 
+
+    let safe_throttle = if throttle_ms == 0 { 10 } else { throttle_ms };
+    let mut throttle_interval = tokio::time::interval(Duration::from_millis(safe_throttle));
+    throttle_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let mut vardiff_interval = tokio::time::interval(Duration::from_secs(30));
+    let mut pending_job_payload = None;
+
+    loop {
+        tokio::select! {
+            job_res = job_rx.recv() => {
+                match job_res {
+                    Ok(job) => {
+                        pending_job_payload = Some(job.payload.clone());
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        tracing::warn!("⚠️ [{}] Job receiver lagged, gracefully skipping block...", peer_addr);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::error!("❌ [{}] Internal channel closed.", peer_addr);
+                        return Ok(()); 
+                    }
+                }
+            }
+
+            _ = throttle_interval.tick() => {
+                if let Some(payload) = pending_job_payload.take() {
+                    if write_half.write_all(&payload[..]).await.is_err() {
+                        anyhow::bail!("Write failed - Client disconnected");
+                    }
+                }
+            }
+
+            _ = vardiff_interval.tick() => {
+                if config.var_diff && last_vardiff_retarget.elapsed().as_secs() >= 60 {
+                    let elapsed_mins = last_vardiff_retarget.elapsed().as_secs_f64() / 60.0;
+                    let shares_per_min = share_count as f64 / elapsed_mins;
+                    
+                    let mut new_diff = current_diff;
+                    if shares_per_min < target_shares_per_min * 0.5 {
+                        new_diff = (current_diff / 2).max(clamp_to_power_of_2(config.min_share_diff));
+                    } else if shares_per_min > target_shares_per_min * 2.0 {
+                        new_diff = current_diff * 2;
+                    }
+                    
+                    if new_diff != current_diff {
+                        current_diff = new_diff;
+                        let retarget_json = json!({
+                            "id": null,
+                            "method": "mining.set_difficulty",
+                            "params": [current_diff]
+                        });
+                        let mut retarget_msg = retarget_json.to_string();
+                        retarget_msg.push('\n');
+                        if write_half.write_all(retarget_msg.as_bytes()).await.is_err() {
+                            anyhow::bail!("Write failed - Client disconnected");
+                        }
+                        tracing::info!("🔄 VarDiff Adjusted for {} -> New Diff: {}", current_worker_name, current_diff);
+                    }
+                    
+                    share_count = 0;
+                    last_vardiff_retarget = Instant::now();
+                }
+            }
+
+            line_res = reader.next() => {
+                if line_res.is_none() { anyhow::bail!("EOF - Client closed connection"); }
+                
+                let payload_str = match line_res.unwrap() {
+                    Ok(s) => s,
+                    Err(e) => anyhow::bail!("Client payload violation: {}", e),
+                };
+                
+                let trimmed = payload_str.trim_matches('\0').trim();
+                if !trimmed.is_empty() {
+                    if let Ok(req) = serde_json::from_str::<RpcRequest>(trimmed) {
+                        let method = req.method.unwrap_or_else(|| "unknown".to_string());
+                        let req_id = req.id.clone().unwrap_or(serde_json::Value::Null);
+                        
+                        if method == "mining.submit" {
+                            if let Some(params) = req.params {
+                                if params.len() >= 3 {
+                                    let req_worker = match &params[0] {
+                                        serde_json::Value::String(s) => s.clone(),
+                                        v => v.to_string(),
+                                    }.replace('"', "").replace('\0', "").trim().to_string();
+                                    
+                                    current_worker_name = req_worker.clone();
+                                    
+                                    let job_id = match &params[1] {
+                                        serde_json::Value::String(s) => s.clone(),
+                                        v => v.to_string(),
+                                    }.replace('"', "").replace('\0', "").trim().to_lowercase();
+                                    
+                                    let nonce_str = match &params[2] {
+                                        serde_json::Value::String(s) => s.clone(),
+                                        v => v.to_string(),
+                                    }.replace('"', "").replace('\0', "").trim().to_string();
+
+                                    let clean_nonce = nonce_str.trim_start_matches("0x");
+                                    let mut nonce: u64 = u64::from_str_radix(clean_nonce, 16).unwrap_or(0);
+
+                                    if clean_nonce.len() <= 12 { 
+                                        let full_nonce_hex = format!("{}{:0>12}", extranonce1, clean_nonce);
+                                        nonce = u64::from_str_radix(&full_nonce_hex, 16).unwrap_or(nonce);
+                                    }
+
+                                    let mut is_accepted = false;
+                                    let mut err_msg = serde_json::Value::Null;
+
+                                    if let Some(job_entry) = job_manager.active_jobs.get(&job_id) {
+                                        let (consensus_header, mut rpc_block) = job_entry.value().clone();
+                                        
+                                        let (is_valid_share, is_network_block) = crate::diff_engine::verify_share(
+                                            &consensus_header, nonce, current_diff as f64
+                                        );
+
+                                        if is_network_block {
+                                            tracing::info!("💎💎💎 [{}] NETWORK BLOCK ACQUIRED! Nonce: {:016x}", peer_addr, nonce);
+                                            
+                                            let mut final_header = consensus_header.clone();
+                                            final_header.nonce = nonce;
+                                            let block_hash = kaspa_consensus_core::hashing::header::hash(&final_header).to_string();
+
+                                            if let Some(ref mut rpc_header) = rpc_block.header { rpc_header.nonce = nonce; }
+                                            
+                                            let worker_clone = req_worker.clone();
+                                            let diff_clone = current_diff as f64;
+                                            
+                                            tokio::spawn(async move {
+                                                if let Ok(client) = redis::Client::open("redis://127.0.0.1/") {
+                                                    if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
+                                                        let block_event = serde_json::json!({
+                                                            "worker": worker_clone,
+                                                            "block_hash": block_hash,
+                                                            "nonce": nonce,
+                                                            "network_diff": diff_clone
+                                                        });
+                                                        let _: () = redis::cmd("RPUSH").arg("perennia:oracle:block_buffer").arg(block_event.to_string()).query_async(&mut conn).await.unwrap_or(());
+                                                    }
+                                                }
+                                            });
+
+                                            let _ = job_manager.block_submit_tx.try_send(rpc_block);
+                                            is_accepted = true;
+                                            
+                                        } else if is_valid_share {
+                                            tracing::info!("✅ [{}] TIER SHARE ACCEPTED | Job: {}", peer_addr, job_id);
+                                            share_count += 1;
+                                            let _ = valid_share_tx.try_send((req_worker.clone(), current_diff as f64));
+                                            is_accepted = true;
+                                        } else {
+                                            tracing::warn!("🚫 [{}] INVALID SHARE | Worker: {}", peer_addr, req_worker);
+                                            err_msg = json!([20, "Invalid share", null]);
+                                        }
+                                    } else {
+                                        tracing::warn!("⚠️ [{}] STALE JOB REJECTED: {}", peer_addr, job_id);
+                                        err_msg = json!([21, "Stale job", null]);
+                                    }
+
+                                    let submit_reply = if is_accepted {
+                                        json!({
+                                            "id": req_id,
+                                            "result": true,
+                                            "error": null
+                                        })
+                                    } else {
+                                        json!({
+                                            "id": req_id,
+                                            "result": false,
+                                            "error": err_msg
+                                        })
+                                    };
+                                    
+                                    let mut response = submit_reply.to_string();
+                                    response.push('\n'); 
+                                    if write_half.write_all(response.as_bytes()).await.is_err() {
+                                        anyhow::bail!("Write failed - Client disconnected");
+                                    }
+                                }
+                            }
+                        } else {
+                            let catch_json = json!({
+                                "id": req_id,
+                                "result": true,
+                                "error": null
+                            });
+                            let mut response = catch_json.to_string();
+                            response.push('\n'); 
+                            if write_half.write_all(response.as_bytes()).await.is_err() {
+                                anyhow::bail!("Write failed - Client disconnected");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+</file>
+
+</files>

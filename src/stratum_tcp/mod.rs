@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, Duration};
 use crate::config::StratumConfig;
 use crate::job_manager::JobManager;
-use redis::AsyncCommands; 
 
 static WORKER_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -38,13 +37,11 @@ pub async fn start_stratum_server(
     let bind_addr = format!("0.0.0.0:{}", port);
     let listener = TcpListener::bind(&bind_addr).await?;
     
-    // ⚡ FIX: Implemented Semaphore to strictly limit File Descriptors and prevent SYN Flood crashes
     let connection_limit = Arc::new(Semaphore::new(5000));
     
     tracing::info!("🛡️ STRATUM TIER ACTIVE ON {} (Diff: {}, Throttle: {}ms)", bind_addr, difficulty, throttle_ms);
 
     loop {
-        // Wait safely until a slot opens in the connection pool
         let permit = connection_limit.clone().acquire_owned().await?;
         let (socket, addr) = listener.accept().await?;
         tracing::info!("🔌 [{}] Hardware connection established to Tier Port {}", addr.ip(), port);
@@ -55,7 +52,7 @@ pub async fn start_stratum_server(
         let peer_ip = addr.ip().to_string();
 
         tokio::spawn(async move {
-            let _permit = permit; // Safely hold the permit; dropped automatically on disconnect
+            let _permit = permit; 
             if let Err(e) = handle_worker_connection(socket, peer_ip.clone(), config_clone, job_manager_clone, share_tx_clone, difficulty, throttle_ms).await {
                 tracing::warn!("⚠️ [{}] Worker disconnected: {}", peer_ip, e);
             }
@@ -80,13 +77,11 @@ async fn handle_worker_connection(
 
     let (read_half, mut write_half) = socket.into_split();
     
-    // ⚡ FIX: OOM memory exhaustion patched via strict LinesCodec bounds (Max 2048 bytes per payload)
     let mut reader = FramedRead::new(read_half, LinesCodec::new_with_max_length(2048));
 
     let mut handshake_state = 0; 
     let mut current_worker_name = String::new();
 
-    // ⚡ FIX: VarDiff Tracking Variables
     let mut share_count = 0;
     let mut last_vardiff_retarget = Instant::now();
     let target_shares_per_min = config.shares_per_min as f64;
@@ -144,6 +139,20 @@ async fn handle_worker_connection(
         }
     }
 
+    // ⚡ FIX: IceRiver ASIC Race Condition Patch
+    // If the ASIC connects before the Node generates the first template, it will 
+    // rapidly spam shares for its old cached job. We intentionally stall the connection 
+    // pipeline here until a job is ready, guaranteeing the ASIC cache is immediately flushed.
+    let initial_job = loop {
+        if let Ok(cache) = job_manager.cached_job.read() {
+            if let Some(job) = &*cache {
+                break job.clone();
+            }
+        }
+        // Poll every 50ms until the node provides the first block template
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
     let diff_json = json!({
         "id": null,
         "method": "mining.set_difficulty",
@@ -153,41 +162,42 @@ async fn handle_worker_connection(
     diff_msg.push('\n'); 
     write_half.write_all(diff_msg.as_bytes()).await?;
 
-    let initial_job = {
-        if let Ok(cache) = job_manager.cached_job.read() {
-            (*cache).clone() 
-        } else {
-            None
-        }
-    }; 
-
-    if let Some(cached_payload) = initial_job {
-        write_half.write_all(&cached_payload[..]).await?; 
-    }
+    // Push the active job instantly to override the ASIC's stale memory
+    write_half.write_all(&initial_job[..]).await?; 
 
     let safe_throttle = if throttle_ms == 0 { 10 } else { throttle_ms };
     let mut throttle_interval = tokio::time::interval(Duration::from_millis(safe_throttle));
     throttle_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // Dynamic VarDiff Check Interval (evaluate every 30s)
     let mut vardiff_interval = tokio::time::interval(Duration::from_secs(30));
-
     let mut pending_job_payload = None;
 
     loop {
         tokio::select! {
-            Ok(job) = job_rx.recv() => {
-                pending_job_payload = Some(job.payload.clone());
+            job_res = job_rx.recv() => {
+                match job_res {
+                    Ok(job) => {
+                        pending_job_payload = Some(job.payload.clone());
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        tracing::warn!("⚠️ [{}] Job receiver lagged, gracefully skipping block...", peer_addr);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::error!("❌ [{}] Internal channel closed.", peer_addr);
+                        return Ok(()); 
+                    }
+                }
             }
 
             _ = throttle_interval.tick() => {
                 if let Some(payload) = pending_job_payload.take() {
-                    let _ = write_half.write_all(&payload[..]).await;
+                    if write_half.write_all(&payload[..]).await.is_err() {
+                        anyhow::bail!("Write failed - Client disconnected");
+                    }
                 }
             }
 
             _ = vardiff_interval.tick() => {
-                // ⚡ FIX: True VarDiff Calculation and Retargeting Mechanism
                 if config.var_diff && last_vardiff_retarget.elapsed().as_secs() >= 60 {
                     let elapsed_mins = last_vardiff_retarget.elapsed().as_secs_f64() / 60.0;
                     let shares_per_min = share_count as f64 / elapsed_mins;
@@ -208,7 +218,9 @@ async fn handle_worker_connection(
                         });
                         let mut retarget_msg = retarget_json.to_string();
                         retarget_msg.push('\n');
-                        let _ = write_half.write_all(retarget_msg.as_bytes()).await;
+                        if write_half.write_all(retarget_msg.as_bytes()).await.is_err() {
+                            anyhow::bail!("Write failed - Client disconnected");
+                        }
                         tracing::info!("🔄 VarDiff Adjusted for {} -> New Diff: {}", current_worker_name, current_diff);
                     }
                     
@@ -244,7 +256,7 @@ async fn handle_worker_connection(
                                     let job_id = match &params[1] {
                                         serde_json::Value::String(s) => s.clone(),
                                         v => v.to_string(),
-                                    }.replace('"', "").replace('\0', "").trim().to_string();
+                                    }.replace('"', "").replace('\0', "").trim().to_lowercase();
                                     
                                     let nonce_str = match &params[2] {
                                         serde_json::Value::String(s) => s.clone(),
@@ -258,6 +270,9 @@ async fn handle_worker_connection(
                                         let full_nonce_hex = format!("{}{:0>12}", extranonce1, clean_nonce);
                                         nonce = u64::from_str_radix(&full_nonce_hex, 16).unwrap_or(nonce);
                                     }
+
+                                    let mut is_accepted = false;
+                                    let mut err_msg = serde_json::Value::Null;
 
                                     if let Some(job_entry) = job_manager.active_jobs.get(&job_id) {
                                         let (consensus_header, mut rpc_block) = job_entry.value().clone();
@@ -293,30 +308,43 @@ async fn handle_worker_connection(
                                             });
 
                                             let _ = job_manager.block_submit_tx.try_send(rpc_block);
+                                            is_accepted = true;
                                             
                                         } else if is_valid_share {
                                             tracing::info!("✅ [{}] TIER SHARE ACCEPTED | Job: {}", peer_addr, job_id);
-                                            crate::telemetry::WORKER_SHARES.with_label_values(&[&req_worker, "valid"]).inc();
                                             share_count += 1;
                                             let _ = valid_share_tx.try_send((req_worker.clone(), current_diff as f64));
+                                            is_accepted = true;
                                         } else {
                                             tracing::warn!("🚫 [{}] INVALID SHARE | Worker: {}", peer_addr, req_worker);
+                                            err_msg = json!([20, "Invalid share", null]);
                                         }
                                     } else {
                                         tracing::warn!("⚠️ [{}] STALE JOB REJECTED: {}", peer_addr, job_id);
+                                        err_msg = json!([21, "Stale job", null]);
+                                    }
+
+                                    let submit_reply = if is_accepted {
+                                        json!({
+                                            "id": req_id,
+                                            "result": true,
+                                            "error": null
+                                        })
+                                    } else {
+                                        json!({
+                                            "id": req_id,
+                                            "result": false,
+                                            "error": err_msg
+                                        })
+                                    };
+                                    
+                                    let mut response = submit_reply.to_string();
+                                    response.push('\n'); 
+                                    if write_half.write_all(response.as_bytes()).await.is_err() {
+                                        anyhow::bail!("Write failed - Client disconnected");
                                     }
                                 }
                             }
-
-                            let submit_reply = json!({
-                                "id": req_id,
-                                "result": true,
-                                "error": null
-                            });
-                            let mut response = submit_reply.to_string();
-                            response.push('\n'); 
-                            let _ = write_half.write_all(response.as_bytes()).await;
-
                         } else {
                             let catch_json = json!({
                                 "id": req_id,
@@ -325,7 +353,9 @@ async fn handle_worker_connection(
                             });
                             let mut response = catch_json.to_string();
                             response.push('\n'); 
-                            let _ = write_half.write_all(response.as_bytes()).await;
+                            if write_half.write_all(response.as_bytes()).await.is_err() {
+                                anyhow::bail!("Write failed - Client disconnected");
+                            }
                         }
                     }
                 }

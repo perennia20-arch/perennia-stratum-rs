@@ -44,6 +44,15 @@ CREATE TABLE IF NOT EXISTS network_blocks (
 );
 
 -- ==============================================================================
+-- 5. SOVEREIGN COMMAND CENTER STATE (Phase 2 Upgrade)
+-- ==============================================================================
+CREATE TABLE IF NOT EXISTS user_command_centers (
+    wallet_address VARCHAR(255) PRIMARY KEY,
+    layout_state JSONB NOT NULL DEFAULT '{}'::jsonb,
+    last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ==============================================================================
 -- HIGH-PERFORMANCE INDEXING MATRIX
 -- ==============================================================================
 
@@ -52,6 +61,7 @@ CREATE INDEX IF NOT EXISTS idx_micro_shares_worker ON micro_shares(worker_id);
 CREATE INDEX IF NOT EXISTS idx_micro_shares_settlement ON micro_shares(is_settled);
 CREATE INDEX IF NOT EXISTS idx_network_blocks_worker ON network_blocks(worker_id);
 CREATE INDEX IF NOT EXISTS idx_network_blocks_time ON network_blocks(discovered_at DESC);
+CREATE INDEX IF NOT EXISTS idx_user_command_centers_updated ON user_command_centers(last_updated DESC);
 
 -- Drop legacy B-Tree for time-series if it exists from Phase 1
 DROP INDEX IF EXISTS idx_micro_shares_recorded;
@@ -59,12 +69,3 @@ DROP INDEX IF EXISTS idx_micro_shares_recorded;
 -- BRIN (Block Range Index) for hyper-optimized append-only time-series data
 CREATE INDEX IF NOT EXISTS idx_micro_shares_recorded_brin 
 ON micro_shares USING brin (recorded_at) WITH (pages_per_range = 128);
-
--- ==============================================================================
--- ⚡ SMART CONTRACT CONCURRENCY REFERENCE (DO NOT RUN DIRECTLY)
--- Example of the strict row-level lock required during L1 payout execution:
--- BEGIN;
--- SELECT streaming_balance_kas FROM yield_reservoirs WHERE wallet_address = 'kaspa:...' FOR UPDATE;
--- UPDATE yield_reservoirs SET streaming_balance_kas = 0 WHERE wallet_address = 'kaspa:...';
--- COMMIT;
--- ==============================================================================
