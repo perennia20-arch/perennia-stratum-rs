@@ -69,6 +69,9 @@ async fn handle_worker_connection(
     difficulty: f64,
     throttle_ms: u64
 ) -> anyhow::Result<()> {
+    // ⚡ FIX 1: Kill Nagle's Algorithm. Send tiny Stratum JSONs instantly!
+    socket.set_nodelay(true)?;
+
     let mut job_rx = job_manager.job_tx.subscribe();
     let conn_id = WORKER_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
     let extranonce1 = format!("{:04x}", conn_id & 0xFFFF); 
@@ -114,10 +117,11 @@ async fn handle_worker_connection(
                 response.push('\n');
                 write_half.write_all(response.as_bytes()).await?;
 
+                // ⚡ FIX 2: IceRiver Firmware requires the Extranonce2 size (4) passed here!
                 let en_json = json!({
                     "id": null,
                     "method": "mining.set_extranonce",
-                    "params": [extranonce1.clone()]
+                    "params": [extranonce1.clone(), 4] 
                 });
                 let mut en_resp = en_json.to_string();
                 en_resp.push('\n');
@@ -170,7 +174,11 @@ async fn handle_worker_connection(
     diff_msg.push('\n'); 
     write_half.write_all(diff_msg.as_bytes()).await?;
 
+    // ⚡ FIX 3: Enforce a newline on the Initial Job (Zero-Allocation approach)
     write_half.write_all(&initial_job[..]).await?; 
+    if !initial_job.ends_with(b"\n") {
+        write_half.write_all(b"\n").await?;
+    }
 
     let safe_throttle = if throttle_ms == 0 { 10 } else { throttle_ms };
     let mut throttle_interval = tokio::time::interval(Duration::from_millis(safe_throttle));
@@ -198,8 +206,14 @@ async fn handle_worker_connection(
 
             _ = throttle_interval.tick() => {
                 if let Some(payload) = pending_job_payload.take() {
+                    // ⚡ FIX 3: Enforce trailing newlines on all broadcasted jobs safely
                     if write_half.write_all(&payload[..]).await.is_err() {
                         anyhow::bail!("Write failed - Client disconnected");
+                    }
+                    if !payload.ends_with(b"\n") {
+                        if write_half.write_all(b"\n").await.is_err() {
+                            anyhow::bail!("Write failed - Client disconnected");
+                        }
                     }
                 }
             }
@@ -258,7 +272,6 @@ async fn handle_worker_connection(
                                         v => v.to_string(),
                                     }.replace('"', "").replace('\0', "").trim().to_string();
                                     
-                                    // Use authorized identity if submitted worker parameter is short/truncated
                                     let active_identity = if req_worker.starts_with("kaspa:") {
                                         req_worker.clone()
                                     } else if !current_worker_name.is_empty() {

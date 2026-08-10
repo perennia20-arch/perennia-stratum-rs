@@ -6,7 +6,6 @@ use tokio::sync::mpsc;
 use std::collections::HashMap;
 use serde_json::json;
 use std::time::{SystemTime, UNIX_EPOCH};
-use redis::AsyncCommands;
 
 /// ⚡ 7-Tier Harmonic Cascade Time Constants (in Seconds)
 /// Tier 0 (1s) -> Tier 6 (377s Fibonacci Anchor)

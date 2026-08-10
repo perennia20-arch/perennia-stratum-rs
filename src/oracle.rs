@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::time::Duration;
-use redis::AsyncCommands;
 use serde_json::Value;
 
 // ⚡ GLOBAL PRICING DAEMON - Isolates 3rd Party APIs internally into local Redis states

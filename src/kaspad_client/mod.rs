@@ -10,7 +10,7 @@ pub mod protowire {
 }
 
 use protowire::rpc_client::RpcClient;
-use protowire::{KaspadRequest, GetBlockTemplateRequestMessage, NotifyBlockAddedRequestMessage, SubmitBlockRequestMessage, NotifyNewBlockTemplateRequestMessage};
+use protowire::{KaspadRequest, GetBlockTemplateRequestMessage, NotifyBlockAddedRequestMessage, SubmitBlockRequestMessage, NotifyNewBlockTemplateRequestMessage, GetBlockDagInfoRequestMessage};
 use protowire::kaspad_request::Payload as RequestPayload;
 use protowire::kaspad_response::Payload as ResponsePayload;
 use protowire::RpcBlock;
@@ -70,6 +70,7 @@ pub async fn start_kaspad_client(
         })),
     }).await?;
 
+    // ⚡ DUAL-POLL LOOP: Fetches both Block Templates and live DAG Difficulty
     let tx_poll = tx.clone();
     let mining_address_poll = config.mining_address.clone();
     tokio::spawn(async move {
@@ -77,15 +78,25 @@ pub async fn start_kaspad_client(
         let mut req_id = 50000;
         loop {
             interval.tick().await;
+            
             req_id += 1;
-            let req = KaspadRequest {
+            let req_template = KaspadRequest {
                 id: req_id,
                 payload: Some(RequestPayload::GetBlockTemplateRequest(GetBlockTemplateRequestMessage {
                     pay_address: mining_address_poll.clone(),
                     extra_data: "Perennia-Zero-Allocation".to_string(),
                 })),
             };
-            if tx_poll.send(req).await.is_err() {
+            if tx_poll.send(req_template).await.is_err() {
+                break;
+            }
+            
+            req_id += 1;
+            let req_dag = KaspadRequest {
+                id: req_id,
+                payload: Some(RequestPayload::GetBlockDagInfoRequest(GetBlockDagInfoRequestMessage {})),
+            };
+            if tx_poll.send(req_dag).await.is_err() {
                 break;
             }
         }
@@ -102,8 +113,17 @@ pub async fn start_kaspad_client(
                     if let Some(err) = res.error {
                         tracing::error!("❌ GET_BLOCK_TEMPLATE REJECTED BY NODE: {}", err.message);
                     } else if let Some(block) = res.block {
+                        
+                        // ⚡ Mainnet Math: Dynamically extract the true block reward from the Coinbase Tx
+                        let mut block_reward = 0.0;
+                        if let Some(coinbase_tx) = block.transactions.first() {
+                            let total_sompi: u64 = coinbase_tx.outputs.iter().map(|o| o.amount).sum();
+                            block_reward = total_sompi as f64 / 100_000_000.0;
+                            let _: redis::RedisResult<()> = redis_conn.set("pool:block_reward", block_reward).await;
+                        }
+
                         if let Some(header) = &block.header {
-                            tracing::debug!("🧊 Toccata Block Template Acquired! Blue Score: {}", header.blue_score);
+                            tracing::debug!("🧊 Toccata Block Template Acquired! Blue Score: {} | Reward: {} KAS", header.blue_score, block_reward);
                             let set_res: redis::RedisResult<()> = redis_conn.set("perennia:node:sync_status", "Online (Toccata Core)").await;
                             if set_res.is_err() {
                                 if let Ok(new_conn) = redis_client.get_multiplexed_async_connection().await {
@@ -112,6 +132,14 @@ pub async fn start_kaspad_client(
                             }
                             job_manager.process_new_block(block.clone());
                         }
+                    }
+                }
+                Some(ResponsePayload::GetBlockDagInfoResponse(res)) => {
+                    if let Some(err) = res.error {
+                        tracing::error!("❌ GET_BLOCK_DAG_INFO REJECTED BY NODE: {}", err.message);
+                    } else {
+                        // ⚡ Mainnet Math: Constantly update the true network difficulty to Redis
+                        let _: redis::RedisResult<()> = redis_conn.set("pool:network_diff", res.difficulty).await;
                     }
                 }
                 Some(ResponsePayload::BlockAddedNotification(_)) |

@@ -2,9 +2,8 @@ use std::time::Duration;
 use sqlx::{PgPool, Row};
 use serde_json::{Value, json};
 use reqwest::Client;
-use redis::AsyncCommands;
 
-const PPS_RATE_PER_DIFFICULTY: f64 = 0.000005; 
+// ⚡ Static Constants
 const NETWORK_FEE_PERCENTAGE: f64 = 0.01; 
 const MINIMUM_UTXO_SWEEP_THRESHOLD: f64 = 50.0;
 const OVERCLOCK_BASE_FEE: f64 = 0.0001;
@@ -69,6 +68,17 @@ async fn execute_settlement_tick(
     http_client: &Client
 ) -> anyhow::Result<()> {
     let mut redis_conn = redis_client.get_multiplexed_async_connection().await?;
+
+    // ⚡ True Mainnet Math: Fetch real-time difficulty and block reward once per execution tick
+    let network_diff_str: Option<String> = redis::cmd("GET").arg("pool:network_diff").query_async(&mut redis_conn).await.unwrap_or(None);
+    let block_reward_str: Option<String> = redis::cmd("GET").arg("pool:block_reward").query_async(&mut redis_conn).await.unwrap_or(None);
+    
+    // ⚡ FIXED: Added turbofish ::<f64>() to parse to resolve ambiguous float typing
+    let network_diff: f64 = network_diff_str.unwrap_or_else(|| "1.0".to_string()).parse::<f64>().unwrap_or(1.0).max(1.0);
+    let block_reward: f64 = block_reward_str.unwrap_or_else(|| "0.0".to_string()).parse().unwrap_or(0.0);
+    
+    // Core PPLNS/PPS Formula: Expected Reward = (Share_Difficulty / Network_Difficulty) * Block_Reward
+    let reward_per_diff_unit = if network_diff > 0.0 { block_reward / network_diff } else { 0.0 };
 
     let rows = sqlx::query("SELECT wallet_address, layout_state FROM user_command_centers")
         .fetch_all(pool)
@@ -145,12 +155,17 @@ async fn execute_settlement_tick(
                     }
 
                     if is_online && !assigned_silo_id.is_empty() {
-                        let virtual_shares = actual_hash_rate * 50.0;
-                        earned_kaspa = virtual_shares * PPS_RATE_PER_DIFFICULTY;
+                        // ⚡ Mainnet Math: Map raw synthetic hash volume directly to network difficulty units
+                        // 1 TH/s = 1,000,000,000,000 hashes per second.
+                        // Tick interval = 10 seconds.
+                        // Difficulty unit constant = 4,294,967,296 hashes.
+                        let hashes_in_tick = actual_hash_rate * 1_000_000_000_000.0 * 10.0;
+                        let virtual_difficulty_units = hashes_in_tick / 4_294_967_296.0;
+                        
+                        earned_kaspa = virtual_difficulty_units * reward_per_diff_unit;
                         
                         let current_shares = worker.get("sharesContributed").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                        // Safe to mutate here because the immutable borrow was dropped
-                        worker["sharesContributed"] = json!(current_shares + virtual_shares);
+                        worker["sharesContributed"] = json!(current_shares + virtual_difficulty_units);
                         state_mutated = true;
                     }
                 } else if w_type == "physical" && !assigned_silo_id.is_empty() {
@@ -161,7 +176,8 @@ async fn execute_settlement_tick(
                         let unprocessed: f64 = unprocessed_str.unwrap_or_else(|| "0".to_string()).parse().unwrap_or(0.0);
 
                         if unprocessed > 0.0 {
-                            earned_kaspa = unprocessed * PPS_RATE_PER_DIFFICULTY;
+                            // ⚡ Mainnet Math: Multiply accumulated physical difficulty units by the live reward ratio
+                            earned_kaspa = unprocessed * reward_per_diff_unit;
                             let _: () = redis::cmd("SET").arg(&share_key).arg("0").query_async(&mut redis_conn).await.unwrap_or(());
                         }
                     }

@@ -101,6 +101,24 @@ fn decode_address_to_script(address: &str) -> Result<String, String> {
     Ok(format!("20{}ac", hex_str))
 }
 
+async fn get_usd_price(redis_conn: &mut redis::aio::MultiplexedConnection, asset: &str) -> f64 {
+    if asset == "USDC" || asset == "USDT" { return 1.0; }
+    let key = format!("oracle:spot:{}_USDC", asset);
+    let val_str: Option<String> = redis::cmd("GET").arg(&key).query_async(redis_conn).await.unwrap_or(None);
+    if let Some(v) = val_str {
+        v.parse().unwrap_or(1.0)
+    } else {
+        // Safe Fallbacks
+        match asset {
+            "KAS" => 0.16,
+            "BTC" => 65000.0,
+            "ETH" => 3500.0,
+            "SOL" => 150.0,
+            _ => 1.0,
+        }
+    }
+}
+
 pub async fn handle_sor_execute(
     State(_pool): State<PgPool>,
     Json(payload): Json<SorExecuteRequest>,
@@ -108,52 +126,117 @@ pub async fn handle_sor_execute(
     tracing::info!("🔒 SOR Executing Live API Swap for: {}", payload.wallet);
 
     let client = Client::new();
-    let pair = format!("{}_{}", payload.payAsset, payload.receiveAsset).to_uppercase();
-    
     let redis_client = redis::Client::open("redis://127.0.0.1/").unwrap();
     let mut redis_conn = redis_client.get_multiplexed_async_connection().await.unwrap();
 
-    let spot_rate_str: Option<String> = redis::cmd("GET")
-        .arg(format!("oracle:spot:{}", pair))
-        .query_async(&mut redis_conn)
-        .await.unwrap_or(None);
-    let spot_rate: f64 = spot_rate_str.unwrap_or_else(|| "1.0".to_string()).parse().unwrap_or(1.0);
+    // ⚡ Cross-Asset Spot Pricing Logic
+    let pay_usd = get_usd_price(&mut redis_conn, &payload.payAsset).await;
+    let rec_usd = get_usd_price(&mut redis_conn, &payload.receiveAsset).await;
+    let spot_rate = if rec_usd > 0.0 { pay_usd / rec_usd } else { 0.0 };
 
     let mut remaining_amount = payload.amount;
     let mut total_estimated_output = 0.0;
     let mut legs = Vec::new();
     
-    let min_chainge_tokens = 15.0 / spot_rate;
-    let min_changenow_tokens = 50.0 / spot_rate;
+    let min_chainge_usd = 15.0;
+    let min_changenow_usd = 50.0;
 
-    let corp_kas = env::var("PERENNIA_TREASURY_KAS_ADDRESS").unwrap_or_else(|_| "kaspa:qpd3r7z43r1x0pn3y26k2yp4r7z43r1x0pn3y26k2yp4r7z0q5qqp2".to_string());
-    let corp_eth = "0x71C7656EC7ab88b098defB751B7401B5f6d8976F".to_string();
+    // Corporate Treasury Addresses
+    let corp_kas = env::var("PERENNIA_TREASURY_KAS_ADDRESS").unwrap_or_else(|_| "kaspa:qrc3ezl770p2cjlfc3tjp6vqlldt6lgh3e80d6rm4rchtt0yrrpgzqave8579".to_string());
+    let corp_btc = env::var("PERENNIA_TREASURY_BTC_ADDRESS").unwrap_or_else(|_| "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfJH754GL".to_string());
+    let corp_eth = env::var("PERENNIA_TREASURY_ETH_ADDRESS").unwrap_or_else(|_| "0x71C7656EC7ab88b098defB751B7401B5f6d8976F".to_string());
+    let corp_sol = env::var("PERENNIA_TREASURY_SOL_ADDRESS").unwrap_or_else(|_| "HN7cAB1wJe3D1v6K18u1nC9Wvy98aV3X45kv5FgvV61a".to_string());
+
+    // Protocol Fee Configuration (1.5% Spread for Internal Zero-Cost Swaps)
+    let protocol_fee_rate = 0.015;
 
     // ==========================================================
     // TIER 1: PERENNIA TREASURY (Internal Fast-Settlement)
+    // ⚡ Real On-Chain Validation + Atomic Redis Fee Batching
     // ==========================================================
-    let treasury_bal_str: Option<String> = redis::cmd("HGET")
-        .arg("dev:sor:treasury:balances:admin")
-        .arg(&payload.receiveAsset)
-        .query_async(&mut redis_conn)
-        .await.unwrap_or(None);
-    let treasury_bal: f64 = treasury_bal_str.unwrap_or_else(|| "0".to_string()).parse().unwrap_or(0.0);
+    let mut treasury_bal = 0.0;
+
+    if payload.receiveAsset == "BTC" {
+        if let Ok(res) = client.get(&format!("https://mempool.space/api/address/{}", corp_btc)).send().await {
+            if let Ok(data) = res.json::<serde_json::Value>().await {
+                let funded = data["chain_stats"]["funded_txo_sum"].as_f64().unwrap_or(0.0);
+                let spent = data["chain_stats"]["spent_txo_sum"].as_f64().unwrap_or(0.0);
+                treasury_bal = (funded - spent) / 100_000_000.0;
+            }
+        }
+    } else if payload.receiveAsset == "ETH" {
+        let req_body = json!({ "jsonrpc": "2.0", "method": "eth_getBalance", "params": [&corp_eth, "latest"], "id": 1 });
+        if let Ok(res) = client.post("https://ethereum-rpc.publicnode.com").json(&req_body).send().await {
+            if let Ok(data) = res.json::<serde_json::Value>().await {
+                if let Some(hex_val) = data["result"].as_str() {
+                    let clean_hex = hex_val.trim_start_matches("0x");
+                    if let Ok(wei) = u64::from_str_radix(clean_hex, 16) {
+                        treasury_bal = wei as f64 / 1e18;
+                    }
+                }
+            }
+        }
+    } else if payload.receiveAsset == "SOL" {
+        let req_body = json!({ "jsonrpc": "2.0", "method": "getBalance", "params": [&corp_sol], "id": 1 });
+        if let Ok(res) = client.post("https://api.mainnet-beta.solana.com").json(&req_body).send().await {
+            if let Ok(data) = res.json::<serde_json::Value>().await {
+                treasury_bal = data["result"]["value"].as_f64().unwrap_or(0.0) / 1e9;
+            }
+        }
+    } else if payload.receiveAsset == "KAS" {
+        if let Ok(res) = client.get(&format!("https://api.kaspa.org/addresses/{}/balance", corp_kas)).send().await {
+            if let Ok(data) = res.json::<serde_json::Value>().await {
+                treasury_bal = data["balance"].as_f64().unwrap_or(0.0) / 100_000_000.0;
+            }
+        }
+    } else {
+        // Assume Kasplex KRC20
+        let clean_kas = corp_kas.replace("kaspa:", "");
+        if let Ok(res) = client.get(&format!("https://api.kasplex.org/v1/krc20/address/kaspa:{}/token/{}", clean_kas, payload.receiveAsset)).send().await {
+            if let Ok(data) = res.json::<serde_json::Value>().await {
+                if let Some(token) = data["result"].as_array().and_then(|arr| arr.first()) {
+                    let bal_str = token["balance"].as_str().unwrap_or("0");
+                    treasury_bal = bal_str.parse::<f64>().unwrap_or(0.0) / 100_000_000.0;
+                }
+            }
+        }
+    }
 
     if treasury_bal > 0.0 && remaining_amount > 0.0 {
-        let fillable = treasury_bal.min(remaining_amount);
-        let treasury_rate = spot_rate * 0.985;
-        let output = fillable * treasury_rate;
+        let treasury_bal_in_pay_asset = if spot_rate > 0.0 { treasury_bal / spot_rate } else { 0.0 };
+        let fillable_in_pay_asset = remaining_amount.min(treasury_bal_in_pay_asset);
+        
+        if fillable_in_pay_asset > 0.0 {
+            let execution_rate = spot_rate * (1.0 - protocol_fee_rate);
+            let output = fillable_in_pay_asset * execution_rate;
+            let captured_margin = fillable_in_pay_asset * spot_rate * protocol_fee_rate;
 
-        legs.push(WaterfallLeg {
-            tier: 1,
-            provider: "Perennia Treasury".to_string(),
-            filledAmount: fillable,
-            executionRate: treasury_rate,
-            marginCaptured: fillable * spot_rate * 0.015,
-        });
+            // ⚡ ATOMIC BATCHED FEE ACCUMULATION
+            // Pushes collected protocol fee directly into Perennia's corporate batch ledger in Redis
+            let batch_fee_key = format!("perennia:fees:batch_accumulated:{}", payload.payAsset);
+            let _: () = redis::cmd("INCRBYFLOAT")
+                .arg(&batch_fee_key)
+                .arg(captured_margin)
+                .query_async(&mut redis_conn)
+                .await
+                .unwrap_or(());
 
-        remaining_amount -= fillable;
-        total_estimated_output += output;
+            legs.push(WaterfallLeg {
+                tier: 1,
+                provider: "Perennia Native Treasury".to_string(),
+                filledAmount: fillable_in_pay_asset,
+                executionRate: execution_rate,
+                marginCaptured: captured_margin,
+            });
+
+            tracing::info!(
+                "💰 [INTERNAL SWAP FEE] Captured {:.6} {} into batch key '{}'", 
+                captured_margin, payload.payAsset, batch_fee_key
+            );
+
+            remaining_amount -= fillable_in_pay_asset;
+            total_estimated_output += output;
+        }
     }
 
     // ==========================================================
@@ -173,7 +256,9 @@ pub async fn handle_sor_execute(
         }
 
         if kasplex_depth > 0.0 {
-            let fillable = kasplex_depth.min(remaining_amount);
+            let kasplex_depth_in_pay_asset = if spot_rate > 0.0 { kasplex_depth / spot_rate } else { 0.0 };
+            let fillable = kasplex_depth_in_pay_asset.min(remaining_amount);
+            
             if fillable > 0.0 {
                 let rate = spot_rate * 0.997; 
                 let output = fillable * rate;
@@ -195,7 +280,7 @@ pub async fn handle_sor_execute(
     // ==========================================================
     // TIER 3: CHAINGE FINANCE (Cross-Chain Bridging AMM)
     // ==========================================================
-    if remaining_amount >= min_chainge_tokens {
+    if remaining_amount * pay_usd >= min_chainge_usd {
         let chainge_api_key = env::var("CHAINGE_API_KEY").unwrap_or_default();
         let chainge_req = json!({
             "fromChain": "KASPA", "toChain": "ETHEREUM",
@@ -234,7 +319,7 @@ pub async fn handle_sor_execute(
     // ==========================================================
     // TIER 4: CHANGENOW (Whale Router Fallback Live API)
     // ==========================================================
-    if remaining_amount >= min_changenow_tokens {
+    if remaining_amount * pay_usd >= min_changenow_usd {
         let changenow_key = env::var("CHANGENOW_API_KEY").unwrap_or_default();
         let cnow_req = json!({
             "fromCurrency": "kas", "toCurrency": "usdc",
@@ -322,7 +407,7 @@ pub async fn handle_sor_execute(
             match leg.tier {
                 1 => dest_address = corp_kas.clone(),
                 2 => dest_address = "kaspa:kasplex_krc20_router_inbound".to_string(),
-                3 => dest_address = "kaspa:chainge_finance_bridge_fallback".to_string(), // In production we persist the response address here
+                3 => dest_address = "kaspa:chainge_finance_bridge_fallback".to_string(), 
                 4 => dest_address = "kaspa:changenow_whale_fallback".to_string(),
                 _ => {}
             }
