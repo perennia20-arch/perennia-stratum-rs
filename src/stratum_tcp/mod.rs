@@ -125,6 +125,19 @@ async fn handle_worker_connection(
                 
                 handshake_state = 1;
             } else if handshake_state == 1 && method == "mining.authorize" {
+                if let Some(ref params) = req.params {
+                    if !params.is_empty() {
+                        let auth_name = match &params[0] {
+                            serde_json::Value::String(s) => s.clone(),
+                            v => v.to_string(),
+                        }.replace('"', "").replace('\0', "").trim().to_string();
+                        if !auth_name.is_empty() {
+                            current_worker_name = auth_name;
+                            tracing::info!("🔑 [{}] Authorized Worker Identity: {}", peer_addr, current_worker_name);
+                        }
+                    }
+                }
+
                 let auth_json = json!({
                     "id": req_id,
                     "result": true,
@@ -139,17 +152,12 @@ async fn handle_worker_connection(
         }
     }
 
-    // ⚡ FIX: IceRiver ASIC Race Condition Patch
-    // If the ASIC connects before the Node generates the first template, it will 
-    // rapidly spam shares for its old cached job. We intentionally stall the connection 
-    // pipeline here until a job is ready, guaranteeing the ASIC cache is immediately flushed.
     let initial_job = loop {
         if let Ok(cache) = job_manager.cached_job.read() {
             if let Some(job) = &*cache {
                 break job.clone();
             }
         }
-        // Poll every 50ms until the node provides the first block template
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
 
@@ -162,7 +170,6 @@ async fn handle_worker_connection(
     diff_msg.push('\n'); 
     write_half.write_all(diff_msg.as_bytes()).await?;
 
-    // Push the active job instantly to override the ASIC's stale memory
     write_half.write_all(&initial_job[..]).await?; 
 
     let safe_throttle = if throttle_ms == 0 { 10 } else { throttle_ms };
@@ -244,14 +251,21 @@ async fn handle_worker_connection(
                         let req_id = req.id.clone().unwrap_or(serde_json::Value::Null);
                         
                         if method == "mining.submit" {
-                            if let Some(params) = req.params {
+                            if let Some(ref params) = req.params {
                                 if params.len() >= 3 {
                                     let req_worker = match &params[0] {
                                         serde_json::Value::String(s) => s.clone(),
                                         v => v.to_string(),
                                     }.replace('"', "").replace('\0', "").trim().to_string();
                                     
-                                    current_worker_name = req_worker.clone();
+                                    // Use authorized identity if submitted worker parameter is short/truncated
+                                    let active_identity = if req_worker.starts_with("kaspa:") {
+                                        req_worker.clone()
+                                    } else if !current_worker_name.is_empty() {
+                                        current_worker_name.clone()
+                                    } else {
+                                        req_worker.clone()
+                                    };
                                     
                                     let job_id = match &params[1] {
                                         serde_json::Value::String(s) => s.clone(),
@@ -290,7 +304,7 @@ async fn handle_worker_connection(
 
                                             if let Some(ref mut rpc_header) = rpc_block.header { rpc_header.nonce = nonce; }
                                             
-                                            let worker_clone = req_worker.clone();
+                                            let worker_clone = active_identity.clone();
                                             let diff_clone = current_diff as f64;
                                             
                                             tokio::spawn(async move {
@@ -311,12 +325,12 @@ async fn handle_worker_connection(
                                             is_accepted = true;
                                             
                                         } else if is_valid_share {
-                                            tracing::info!("✅ [{}] TIER SHARE ACCEPTED | Job: {}", peer_addr, job_id);
+                                            tracing::info!("✅ [{}] TIER SHARE ACCEPTED | Worker: {} | Job: {}", peer_addr, active_identity, job_id);
                                             share_count += 1;
-                                            let _ = valid_share_tx.try_send((req_worker.clone(), current_diff as f64));
+                                            let _ = valid_share_tx.try_send((active_identity.clone(), current_diff as f64));
                                             is_accepted = true;
                                         } else {
-                                            tracing::warn!("🚫 [{}] INVALID SHARE | Worker: {}", peer_addr, req_worker);
+                                            tracing::warn!("🚫 [{}] INVALID SHARE | Worker: {}", peer_addr, active_identity);
                                             err_msg = json!([20, "Invalid share", null]);
                                         }
                                     } else {

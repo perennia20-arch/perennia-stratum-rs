@@ -74,725 +74,6 @@ package.json
 <files>
 This section contains the contents of the repository's files.
 
-<file path="src/chronos.rs">
-use std::time::Duration;
-use sqlx::{PgPool, Row};
-use serde_json::{Value, json};
-use reqwest::Client;
-
-const PPS_RATE_PER_DIFFICULTY: f64 = 0.000005; 
-const NETWORK_FEE_PERCENTAGE: f64 = 0.01; 
-const MINIMUM_UTXO_SWEEP_THRESHOLD: f64 = 50.0;
-const OVERCLOCK_BASE_FEE: f64 = 0.0001;
-const OVERCLOCK_VAR_FEE: f64 = 0.005;
-const OVERCLOCK_PREMIUM_FEE: f64 = 0.005;
-
-pub async fn start_chronos_daemon(pool: PgPool) {
-    tracing::info!("⏳ Chronos Settlement Engine Online. Natively monitoring Omni-Chain Ledger via Postgres.");
-    
-    let redis_client = redis::Client::open("redis://127.0.0.1/").expect("Failed to connect to Redis for Chronos");
-    let http_client = Client::new();
-
-    let mut interval = tokio::time::interval(Duration::from_secs(10));
-
-    loop {
-        interval.tick().await;
-        if let Err(e) = execute_settlement_tick(&pool, &redis_client, &http_client).await {
-            tracing::error!("🚨 Chronos Execution Error: {}", e);
-        }
-    }
-}
-
-async fn execute_settlement_tick(
-    pool: &PgPool, 
-    redis_client: &redis::Client, 
-    http_client: &Client
-) -> anyhow::Result<()> {
-    let mut redis_conn = redis_client.get_multiplexed_async_connection().await?;
-
-    let rows = sqlx::query("SELECT wallet_address, layout_state FROM user_command_centers")
-        .fetch_all(pool)
-        .await?;
-
-    for row in rows {
-        let address: String = row.get("wallet_address");
-        let mut state: Value = row.get("layout_state");
-        
-        let workers_opt = state.get_mut("workers").and_then(|w| w.as_array_mut());
-        if workers_opt.is_none() {
-            continue;
-        }
-
-        let mut state_mutated = false;
-        let is_overclocked = state.get("systemMode").and_then(|v| v.as_str()) == Some("overclocked");
-
-        // 1. Process Workers
-        let mut earned_by_silo = std::collections::HashMap::new();
-
-        if let Some(workers) = state.get_mut("workers").and_then(|w| w.as_array_mut()) {
-            for worker in workers.iter_mut() {
-                // ⚡ Cast to owned Strings immediately to drop the immutable borrow on `worker`
-                let assigned_silo_id = worker.get("assignedSiloId").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                if assigned_silo_id.is_empty() {
-                    continue;
-                }
-                
-                let w_type = worker.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let mut earned_kaspa = 0.0;
-
-                if w_type == "capital" {
-                    let is_online = worker.get("isOnline").and_then(|v| v.as_bool()).unwrap_or(false);
-                    let hash_rate = worker.get("hashRate").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    
-                    if is_online && hash_rate > 0.0 {
-                        let virtual_shares = hash_rate * 50.0;
-                        earned_kaspa = virtual_shares * PPS_RATE_PER_DIFFICULTY;
-                        
-                        let current_shares = worker.get("sharesContributed").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                        // Safe to mutate here because the immutable borrow was dropped
-                        worker["sharesContributed"] = json!(current_shares + virtual_shares);
-                        state_mutated = true;
-                    }
-                } else if w_type == "physical" {
-                    let wallet_worker = worker.get("walletWorker").and_then(|v| v.as_str()).unwrap_or("");
-                    if !wallet_worker.is_empty() {
-                        let share_key = format!("worker:{}:shares", wallet_worker);
-                        let unprocessed_str: Option<String> = redis::cmd("GET").arg(&share_key).query_async(&mut redis_conn).await.unwrap_or(None);
-                        let unprocessed: f64 = unprocessed_str.unwrap_or_else(|| "0".to_string()).parse().unwrap_or(0.0);
-
-                        if unprocessed > 0.0 {
-                            earned_kaspa = unprocessed * PPS_RATE_PER_DIFFICULTY;
-                            let _: () = redis::cmd("SET").arg(&share_key).arg("0").query_async(&mut redis_conn).await.unwrap_or(());
-                        }
-                    }
-                }
-
-                if earned_kaspa > 0.0 {
-                    *earned_by_silo.entry(assigned_silo_id).or_insert(0.0) += earned_kaspa;
-                }
-            }
-        }
-
-        if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
-            for silo in silos.iter_mut() {
-                if let Some(id) = silo.get("id").and_then(|v| v.as_str()) {
-                    if let Some(inc) = earned_by_silo.get(id) {
-                        let current_pending = silo.get("pendingKaspa").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                        silo["pendingKaspa"] = json!(current_pending + inc);
-                        state_mutated = true;
-                    }
-                }
-            }
-        }
-
-        // 2. OVERCLOCK MODE & MICRO-FEES INTERCEPTOR
-        if is_overclocked {
-            let mut total_tick_fee = OVERCLOCK_BASE_FEE;
-            
-            if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
-                for silo in silos.iter_mut() {
-                    let pending = silo.get("pendingKaspa").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    if pending > 0.0 {
-                        let var_fee = pending * OVERCLOCK_VAR_FEE;
-                        let deduction = pending.min(total_tick_fee + var_fee);
-                        
-                        if deduction > 0.0 {
-                            silo["pendingKaspa"] = json!(pending - deduction);
-                            total_tick_fee = (total_tick_fee - deduction).max(0.0);
-                            state_mutated = true;
-                            
-                            let name = silo.get("name").and_then(|n| n.as_str()).unwrap_or("Unknown");
-                            tracing::info!("⚡ [OVERCLOCK] Deducted {:.6} KAS from Silo {} for predictive engine compute.", deduction, name);
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3. Plant LP Synthesis
-        let mut synthesis_actions = Vec::new();
-
-        if let Some(plants) = state.get("plants").and_then(|p| p.as_array()) {
-            for (p_idx, plant) in plants.iter().enumerate() {
-                let is_active = plant.pointer("/liquidityDeposit/isActive").and_then(|v| v.as_bool()).unwrap_or(false);
-                if !is_active { continue; }
-
-                let plant_id = plant.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                
-                let mut assigned_silos = Vec::new();
-                if let Some(silos) = state.get("silos").and_then(|s| s.as_array()) {
-                    for (s_idx, silo) in silos.iter().enumerate() {
-                        if silo.get("assignedPlantId").and_then(|v| v.as_str()).unwrap_or("") == plant_id {
-                            assigned_silos.push((s_idx, silo.clone()));
-                        }
-                    }
-                }
-
-                if assigned_silos.len() == 2 {
-                    let (s1_idx, silo1) = &assigned_silos[0];
-                    let (s2_idx, silo2) = &assigned_silos[1];
-
-                    let p1 = silo1.get("pendingKaspa").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let p2 = silo2.get("pendingKaspa").and_then(|v| v.as_f64()).unwrap_or(0.0);
-
-                    if p1 >= MINIMUM_UTXO_SWEEP_THRESHOLD && p2 >= MINIMUM_UTXO_SWEEP_THRESHOLD {
-                        let target1 = silo1.pointer("/settlementConfig/targetAsset/ticker").and_then(|t| t.as_str()).unwrap_or("USDC").to_string();
-                        let target2 = silo2.pointer("/settlementConfig/targetAsset/ticker").and_then(|t| t.as_str()).unwrap_or("USDC").to_string();
-                        let plant_name = plant.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
-                        
-                        synthesis_actions.push((p_idx, *s1_idx, *s2_idx, p1, p2, target1, target2, plant_name));
-                    }
-                }
-            }
-        }
-
-        for (p_idx, s1_idx, s2_idx, mut amt1, mut amt2, target1, target2, plant_name) in synthesis_actions {
-            if is_overclocked {
-                let fee1 = amt1 * OVERCLOCK_PREMIUM_FEE;
-                let fee2 = amt2 * OVERCLOCK_PREMIUM_FEE;
-                amt1 -= fee1;
-                amt2 -= fee2;
-                tracing::info!("⚡ [OVERCLOCK] Plant Synthesis Fee Deducted: {:.6} KAS", fee1 + fee2);
-            }
-
-            if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
-                silos[s1_idx]["pendingKaspa"] = json!(0.0);
-                silos[s2_idx]["pendingKaspa"] = json!(0.0);
-            }
-
-            tracing::info!("\n🌱 [CHRONOS SYNTHESIS] Auto-LP Intercept on Plant: {}", plant_name);
-            
-            let mut total_usd = 0.0;
-
-            for (amt, target) in [(amt1, &target1), (amt2, &target2)] {
-                let req_payload = json!({
-                    "wallet": address,
-                    "payAsset": "KAS",
-                    "receiveAsset": target,
-                    "amount": amt,
-                    "slippageTolerance": 0.05
-                });
-                
-                if let Ok(res) = http_client.post("http://127.0.0.1:8002/v1/sor/execute").json(&req_payload).send().await {
-                    if let Ok(data) = res.json::<Value>().await {
-                        if let Some(est) = data.get("estimatedOutput").and_then(|v| v.as_f64()) {
-                            total_usd += est;
-                            tracing::info!("   -> Routed {:.2} KAS through sorEngine.", amt);
-                        }
-                    }
-                }
-            }
-            
-            if let Some(plants) = state.get_mut("plants").and_then(|p| p.as_array_mut()) {
-                let current_usd = plants[p_idx].pointer("/liquidityDeposit/totalLiquidityUsd").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                if let Some(ld) = plants[p_idx].get_mut("liquidityDeposit").and_then(|v| v.as_object_mut()) {
-                    ld.insert("totalLiquidityUsd".to_string(), json!(current_usd + total_usd));
-                }
-                tracing::info!("   -> Executed swaps and deposited into Kasplex Liquidity Pool.");
-                tracing::info!("   -> New LP Position: ${:.2}", current_usd + total_usd);
-            }
-            
-            state_mutated = true;
-        }
-
-        // 4. Auto Payouts for Standalone Silos
-        if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
-            for silo in silos.iter_mut() {
-                if silo.get("assignedPlantId").map_or(false, |id| !id.is_null()) {
-                    continue;
-                }
-
-                let auto_payout = silo.pointer("/settlementConfig/autoPayout").and_then(|v| v.as_bool()).unwrap_or(false);
-                let pending = silo.get("pendingKaspa").and_then(|v| v.as_f64()).unwrap_or(0.0);
-
-                if auto_payout && pending >= MINIMUM_UTXO_SWEEP_THRESHOLD {
-                    let threshold = silo.pointer("/settlementConfig/threshold").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let mode = silo.pointer("/settlementConfig/mode").and_then(|v| v.as_str()).unwrap_or("");
-
-                    if mode == "stream" || (mode == "threshold" && pending >= threshold) {
-                        let dynamic_system_fee = if is_overclocked { NETWORK_FEE_PERCENTAGE + 0.005 } else { NETWORK_FEE_PERCENTAGE };
-                        let perennia_fee = pending * dynamic_system_fee;
-                        let net_payout = pending - perennia_fee;
-                        
-                        let target_addr = silo.pointer("/settlementConfig/payoutAddress").and_then(|v| v.as_str()).unwrap_or("");
-                        let target_addr = if target_addr.is_empty() { &address } else { target_addr };
-
-                        let silo_name = silo.get("name").and_then(|n| n.as_str()).unwrap_or("Unknown");
-
-                        tracing::info!("\n💸 [CHRONOS EXECUTION] Settling Silo: {}", silo_name);
-                        tracing::info!("   -> Gross Yield: {:.6} KAS", pending);
-                        tracing::info!("   -> Perennia Fee ({:.1}%): {:.6} KAS", dynamic_system_fee * 100.0, perennia_fee);
-                        tracing::info!("   -> Broadcasting {:.6} KAS to {}", net_payout, target_addr);
-
-                        silo["pendingKaspa"] = json!(0.0);
-                        state_mutated = true;
-                    }
-                }
-            }
-        }
-
-        // Save back to DB
-        if state_mutated {
-            sqlx::query("UPDATE user_command_centers SET layout_state = $1, last_updated = CURRENT_TIMESTAMP WHERE wallet_address = $2")
-                .bind(&state)
-                .bind(&address)
-                .execute(pool)
-                .await?;
-        }
-    }
-
-    Ok(())
-}
-</file>
-
-<file path="src/sor.rs">
-use axum::{Json, extract::State};
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use sqlx::PgPool;
-use std::env;
-use uuid::Uuid;
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[allow(non_snake_case)]
-pub struct UtxoInput {
-    pub transactionId: String,
-    pub index: u32,
-    pub amount: f64,
-    pub scriptPublicKey: String,
-}
-
-#[derive(Deserialize, Debug)]
-#[allow(non_snake_case)]
-pub struct SorExecuteRequest {
-    pub wallet: String,
-    pub payAsset: String,
-    pub receiveAsset: String,
-    pub amount: f64,
-    pub slippageTolerance: Option<f64>,
-    pub utxos: Option<Vec<UtxoInput>>,
-}
-
-#[derive(Serialize, Debug)]
-#[allow(non_snake_case)]
-pub struct WaterfallLeg {
-    pub tier: u32,
-    pub provider: String,
-    pub filledAmount: f64,
-    pub executionRate: f64,
-    pub marginCaptured: f64,
-}
-
-#[derive(Serialize, Debug)]
-#[allow(non_snake_case)]
-pub struct SorExecutionPlan {
-    pub totalAmount: f64,
-    pub unifiedRate: f64,
-    pub estimatedOutput: f64,
-    pub legs: Vec<WaterfallLeg>,
-    pub transaction_uuid: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub psbt: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub formattedUtxos: Option<Vec<UtxoInput>>,
-}
-
-#[derive(Serialize)]
-pub struct SorError {
-    pub error: String,
-}
-
-// ⚡ Zero-Dependency Kaspa Address to P2PKH/Schnorr Script Decoder
-fn decode_address_to_script(address: &str) -> Result<String, String> {
-    let parts: Vec<&str> = address.split(':').collect();
-    if parts.len() != 2 { return Err("Invalid address format".to_string()); }
-    
-    let base32 = parts[1];
-    if base32.len() < 8 { return Err("Address too short".to_string()); }
-    
-    let charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
-    let mut decoded = Vec::new();
-    for c in base32[..base32.len()-8].chars() {
-        if let Some(idx) = charset.find(c) {
-            decoded.push(idx as u8);
-        } else {
-            return Err("Invalid base32 char".to_string());
-        }
-    }
-    
-    let mut out = Vec::new();
-    let mut val = 0u32;
-    let mut bits = 0;
-    for &d in &decoded {
-        val = (val << 5) | (d as u32);
-        bits += 5;
-        while bits >= 8 {
-            bits -= 8;
-            out.push((val >> bits) as u8);
-        }
-    }
-    
-    if out.len() < 33 {
-        let clean = address.replace("kaspa:", "");
-        let hex_val = hex::encode(clean);
-        let truncated = if hex_val.len() > 64 { &hex_val[0..64] } else { &hex_val };
-        return Ok(format!("20{}ac", truncated));
-    }
-    
-    let pubkey = &out[1..33];
-    let mut hex_str = String::new();
-    for byte in pubkey {
-        use std::fmt::Write;
-        write!(&mut hex_str, "{:02x}", byte).unwrap();
-    }
-    Ok(format!("20{}ac", hex_str))
-}
-
-pub async fn handle_sor_execute(
-    State(_pool): State<PgPool>,
-    Json(payload): Json<SorExecuteRequest>,
-) -> Result<Json<SorExecutionPlan>, Json<SorError>> {
-    tracing::info!("🔒 SOR Executing Live API Swap for: {}", payload.wallet);
-
-    let client = Client::new();
-    let pair = format!("{}_{}", payload.payAsset, payload.receiveAsset).to_uppercase();
-    
-    let redis_client = redis::Client::open("redis://127.0.0.1/").unwrap();
-    let mut redis_conn = redis_client.get_multiplexed_async_connection().await.unwrap();
-
-    let spot_rate_str: Option<String> = redis::cmd("GET")
-        .arg(format!("oracle:spot:{}", pair))
-        .query_async(&mut redis_conn)
-        .await.unwrap_or(None);
-    let spot_rate: f64 = spot_rate_str.unwrap_or_else(|| "1.0".to_string()).parse().unwrap_or(1.0);
-
-    let mut remaining_amount = payload.amount;
-    let mut total_estimated_output = 0.0;
-    let mut legs = Vec::new();
-    
-    let min_chainge_tokens = 15.0 / spot_rate;
-    let min_changenow_tokens = 50.0 / spot_rate;
-
-    let corp_kas = env::var("PERENNIA_TREASURY_KAS_ADDRESS").unwrap_or_else(|_| "kaspa:qpd3r7z43r1x0pn3y26k2yp4r7z43r1x0pn3y26k2yp4r7z0q5qqp2".to_string());
-    let corp_eth = "0x71C7656EC7ab88b098defB751B7401B5f6d8976F".to_string();
-
-    // ==========================================================
-    // TIER 1: PERENNIA TREASURY (Internal Fast-Settlement)
-    // ==========================================================
-    let treasury_bal_str: Option<String> = redis::cmd("HGET")
-        .arg("dev:sor:treasury:balances:admin")
-        .arg(&payload.receiveAsset)
-        .query_async(&mut redis_conn)
-        .await.unwrap_or(None);
-    let treasury_bal: f64 = treasury_bal_str.unwrap_or_else(|| "0".to_string()).parse().unwrap_or(0.0);
-
-    if treasury_bal > 0.0 && remaining_amount > 0.0 {
-        let fillable = treasury_bal.min(remaining_amount);
-        let treasury_rate = spot_rate * 0.985;
-        let output = fillable * treasury_rate;
-
-        legs.push(WaterfallLeg {
-            tier: 1,
-            provider: "Perennia Treasury".to_string(),
-            filledAmount: fillable,
-            executionRate: treasury_rate,
-            marginCaptured: fillable * spot_rate * 0.015,
-        });
-
-        remaining_amount -= fillable;
-        total_estimated_output += output;
-    }
-
-    // ==========================================================
-    // TIER 2: KASPLEX KRC-20 (Decentralized Overflow AMM)
-    // ==========================================================
-    if remaining_amount > 0.0 {
-        let kasplex_res = client.get(&format!("https://api.kasplex.org/v1/krc20/token/{}", payload.receiveAsset))
-            .send().await;
-        
-        let mut kasplex_depth = 0.0;
-        if let Ok(res) = kasplex_res {
-            if let Ok(data) = res.json::<serde_json::Value>().await {
-                if let Some(minted) = data.get("result").and_then(|r| r.get(0)).and_then(|m| m.get("max")).and_then(|m| m.as_str()) {
-                    kasplex_depth = minted.parse::<f64>().unwrap_or(0.0) * 0.01; 
-                }
-            }
-        }
-
-        if kasplex_depth > 0.0 {
-            let fillable = kasplex_depth.min(remaining_amount);
-            if fillable > 0.0 {
-                let rate = spot_rate * 0.997; 
-                let output = fillable * rate;
-
-                legs.push(WaterfallLeg {
-                    tier: 2,
-                    provider: "Kasplex KRC-20".to_string(),
-                    filledAmount: fillable,
-                    executionRate: rate,
-                    marginCaptured: 0.0,
-                });
-
-                remaining_amount -= fillable;
-                total_estimated_output += output;
-            }
-        }
-    }
-
-    // ==========================================================
-    // TIER 3: CHAINGE FINANCE (Cross-Chain Bridging AMM)
-    // ==========================================================
-    if remaining_amount >= min_chainge_tokens {
-        let chainge_api_key = env::var("CHAINGE_API_KEY").unwrap_or_default();
-        let chainge_req = json!({
-            "fromChain": "KASPA", "toChain": "ETHEREUM",
-            "fromToken": "KAS", "toToken": "USDC",
-            "userAddress": payload.wallet,
-            "amount": remaining_amount * 0.5 
-        });
-        
-        let chainge_res = client.post("https://api.chainge.finance/v1/crosschain/address")
-            .header("Authorization", format!("Bearer {}", chainge_api_key))
-            .json(&chainge_req)
-            .send().await;
-
-        if let Ok(res) = chainge_res {
-            if let Ok(data) = res.json::<serde_json::Value>().await {
-                if let Some(_addr) = data.get("depositAddress").and_then(|a| a.as_str()) {
-                    let fillable = remaining_amount * 0.5;
-                    let rate = spot_rate * 0.995;
-                    let output = fillable * rate;
-
-                    legs.push(WaterfallLeg {
-                        tier: 3,
-                        provider: "Chainge AMM".to_string(),
-                        filledAmount: fillable,
-                        executionRate: rate,
-                        marginCaptured: 0.0,
-                    });
-
-                    remaining_amount -= fillable;
-                    total_estimated_output += output;
-                }
-            }
-        }
-    }
-
-    // ==========================================================
-    // TIER 4: CHANGENOW (Whale Router Fallback Live API)
-    // ==========================================================
-    if remaining_amount >= min_changenow_tokens {
-        let changenow_key = env::var("CHANGENOW_API_KEY").unwrap_or_default();
-        let cnow_req = json!({
-            "fromCurrency": "kas", "toCurrency": "usdc",
-            "fromNetwork": "kas", "toNetwork": "eth",
-            "fromAmount": remaining_amount,
-            "address": corp_eth,
-            "flow": "standard"
-        });
-
-        let cnow_res = client.post("https://api.changenow.io/v2/exchange")
-            .header("x-changenow-api-key", changenow_key)
-            .json(&cnow_req)
-            .send().await;
-
-        if let Ok(res) = cnow_res {
-            if let Ok(data) = res.json::<serde_json::Value>().await {
-                if let Some(_addr) = data.get("payinAddress").and_then(|a| a.as_str()) {
-                    let fillable = remaining_amount;
-                    let rate = spot_rate * 0.985;
-                    let output = fillable * rate;
-
-                    legs.push(WaterfallLeg {
-                        tier: 4,
-                        provider: "ChangeNOW Aggregator".to_string(),
-                        filledAmount: fillable,
-                        executionRate: rate,
-                        marginCaptured: 0.0,
-                    });
-
-                    remaining_amount = 0.0;
-                    total_estimated_output += output;
-                }
-            }
-        }
-    }
-
-    if legs.is_empty() && payload.amount > 0.0 {
-        return Err(Json(SorError { error: "Liquidity Exhausted. No hard-routing paths available on-chain.".to_string() }));
-    }
-
-    let filled_amount = payload.amount - remaining_amount;
-    let unified_rate = if filled_amount > 0.0 { total_estimated_output / filled_amount } else { 0.0 };
-    let tx_uuid = Uuid::new_v4().to_string();
-
-    let mut psbt = None;
-
-    // ==========================================================
-    // PSBT CONSTRUCTION FOR HARD ZERO-TRUST HONEYCOMB EXECUTION
-    // ==========================================================
-    if let Some(utxos) = &payload.utxos {
-        let target_amount_sompi = (filled_amount * 1e8).floor() as u64;
-        let fee_sompi = 10000;
-        let total_required = target_amount_sompi + fee_sompi;
-
-        let mut gathered_sompi = 0;
-        let mut tx_inputs = Vec::new();
-
-        for utxo in utxos {
-            tx_inputs.push(json!({
-                "previousOutpoint": {
-                    "transactionId": utxo.transactionId,
-                    "index": utxo.index
-                },
-                "signatureScript": "",
-                "sequence": 0,
-                "sigOpCount": 1
-            }));
-            gathered_sompi += utxo.amount as u64;
-            if gathered_sompi >= total_required {
-                break;
-            }
-        }
-
-        if gathered_sompi < total_required {
-            return Err(Json(SorError { error: format!("ERR_INSUFFICIENT_MASS: Required {}, Found {}", total_required, gathered_sompi) }));
-        }
-
-        let mut tx_outputs = Vec::new();
-
-        for leg in &legs {
-            let leg_sompi = (leg.filledAmount * 1e8).floor() as u64;
-            if leg_sompi == 0 { continue; }
-
-            let mut dest_address = String::new();
-            match leg.tier {
-                1 => dest_address = corp_kas.clone(),
-                2 => dest_address = "kaspa:kasplex_krc20_router_inbound".to_string(),
-                3 => dest_address = "kaspa:chainge_finance_bridge_fallback".to_string(), // In production we persist the response address here
-                4 => dest_address = "kaspa:changenow_whale_fallback".to_string(),
-                _ => {}
-            }
-
-            let script_pub_key = decode_address_to_script(&dest_address)
-                .unwrap_or_else(|_| "200000000000000000000000000000000000000000000000000000000000000000ac".to_string());
-
-            tx_outputs.push(json!({
-                "amount": leg_sompi as u64,
-                "scriptPublicKey": script_pub_key,
-                "_metadata": { "provider": leg.provider, "tier": leg.tier }
-            }));
-        }
-
-        let change_sompi = gathered_sompi - total_required;
-        if change_sompi > 0 {
-            tx_outputs.push(json!({
-                "amount": change_sompi as u64,
-                "scriptPublicKey": decode_address_to_script(&payload.wallet).unwrap_or_else(|_| "200000000000000000000000000000000000000000000000000000000000000000ac".to_string()),
-                "_metadata": { "type": "change" }
-            }));
-        }
-
-        psbt = Some(json!({
-            "version": 0,
-            "inputs": tx_inputs,
-            "outputs": tx_outputs,
-            "lockTime": 0,
-            "subnetworkId": "0000000000000000000000000000000000000000",
-            "gas": 0,
-            "payload": "",
-            "mass": 0,
-            "storageMass": 0
-        }));
-    }
-
-    Ok(Json(SorExecutionPlan {
-        totalAmount: filled_amount,
-        unifiedRate: unified_rate,
-        estimatedOutput: total_estimated_output,
-        legs,
-        transaction_uuid: tx_uuid,
-        psbt,
-        formattedUtxos: payload.utxos.clone(),
-    }))
-}
-</file>
-
-<file path="db/schema.sql">
--- ==============================================================================
--- PERENNIA LLC: SOVEREIGN WRITE-AHEAD LOG (WAL) & REAL-TIME LEDGER SCHEMA
--- Deployment Environment: Bare-Metal Ubuntu PostgreSQL 16+
--- Architecture: High-Velocity BRIN Indexing & L1 Block Ledger
--- ==============================================================================
-
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-
--- 1. Sovereign tracking of bare-metal hardware identities
-CREATE TABLE IF NOT EXISTS worker_profiles (
-    worker_id VARCHAR(255) PRIMARY KEY,
-    wallet_address VARCHAR(255) NOT NULL,
-    device_profile VARCHAR(100) NOT NULL DEFAULT 'unknown',
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
--- 2. Continuous Fluidity: Real-time balance streaming for active smart contract polling
-CREATE TABLE IF NOT EXISTS yield_reservoirs (
-    wallet_address VARCHAR(255) PRIMARY KEY,
-    streaming_balance_kas DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-    total_yield_kas DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-    last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
--- 3. UNLOGGED WAL: Millions of sub-second micro-shares map directly here from the Redis Oracle
-CREATE UNLOGGED TABLE IF NOT EXISTS micro_shares (
-    share_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    worker_id VARCHAR(255) NOT NULL,
-    difficulty_weight DOUBLE PRECISION NOT NULL,
-    kas_value_delta DOUBLE PRECISION NOT NULL,
-    network_diff DOUBLE PRECISION NOT NULL,
-    is_settled BOOLEAN NOT NULL DEFAULT false,
-    recorded_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
--- 4. The L1 Block Ledger: Persistent tracking of global Kaspa network discoveries
-CREATE TABLE IF NOT EXISTS network_blocks (
-    block_hash VARCHAR(64) PRIMARY KEY,
-    worker_id VARCHAR(255) NOT NULL,
-    nonce BIGINT NOT NULL,
-    network_diff DOUBLE PRECISION NOT NULL,
-    is_orphaned BOOLEAN DEFAULT false,
-    discovered_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
--- ==============================================================================
--- 5. SOVEREIGN COMMAND CENTER STATE (Phase 2 Upgrade)
--- ==============================================================================
-CREATE TABLE IF NOT EXISTS user_command_centers (
-    wallet_address VARCHAR(255) PRIMARY KEY,
-    layout_state JSONB NOT NULL DEFAULT '{}'::jsonb,
-    last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
--- ==============================================================================
--- HIGH-PERFORMANCE INDEXING MATRIX
--- ==============================================================================
-
--- B-Tree Indexes for exact-match lookups
-CREATE INDEX IF NOT EXISTS idx_micro_shares_worker ON micro_shares(worker_id);
-CREATE INDEX IF NOT EXISTS idx_micro_shares_settlement ON micro_shares(is_settled);
-CREATE INDEX IF NOT EXISTS idx_network_blocks_worker ON network_blocks(worker_id);
-CREATE INDEX IF NOT EXISTS idx_network_blocks_time ON network_blocks(discovered_at DESC);
-CREATE INDEX IF NOT EXISTS idx_user_command_centers_updated ON user_command_centers(last_updated DESC);
-
--- Drop legacy B-Tree for time-series if it exists from Phase 1
-DROP INDEX IF EXISTS idx_micro_shares_recorded;
-
--- BRIN (Block Range Index) for hyper-optimized append-only time-series data
-CREATE INDEX IF NOT EXISTS idx_micro_shares_recorded_brin 
-ON micro_shares USING brin (recorded_at) WITH (pages_per_range = 128);
-</file>
-
 <file path="kaspa-keygen/derive.js">
 require('dotenv').config();
 const bip39 = require('bip39');
@@ -2191,6 +1472,852 @@ pub fn verify_share(header: &Header, nonce: u64, min_share_diff: f64) -> (bool, 
 }
 </file>
 
+<file path="src/chronos.rs">
+use std::time::Duration;
+use sqlx::{PgPool, Row};
+use serde_json::{Value, json};
+use reqwest::Client;
+use redis::AsyncCommands;
+
+const PPS_RATE_PER_DIFFICULTY: f64 = 0.000005; 
+const NETWORK_FEE_PERCENTAGE: f64 = 0.01; 
+const MINIMUM_UTXO_SWEEP_THRESHOLD: f64 = 50.0;
+const OVERCLOCK_BASE_FEE: f64 = 0.0001;
+const OVERCLOCK_VAR_FEE: f64 = 0.005;
+const OVERCLOCK_PREMIUM_FEE: f64 = 0.005;
+
+// 🛡️ Cryptographically verify PER KRC-20 token balance on-chain
+async fn fetch_per_balance(http_client: &Client, redis_conn: &mut redis::aio::MultiplexedConnection, address: &str) -> f64 {
+    let clean_address = address.replace("kaspa:", "");
+    let cache_key = format!("krc20:PER:balance:{}", clean_address);
+    
+    // Check local redis cache to prevent Kasplex API rate-limiting
+    let cached: Option<String> = redis::cmd("GET").arg(&cache_key).query_async(redis_conn).await.unwrap_or(None);
+    if let Some(bal_str) = cached {
+        return bal_str.parse().unwrap_or(0.0);
+    }
+    
+    let url = format!("https://api.kasplex.org/v1/krc20/address/kaspa:{}/token/PER", clean_address);
+    let mut balance = 0.0;
+    
+    if let Ok(res) = http_client.get(&url).send().await {
+        if res.status().is_success() {
+            if let Ok(data) = res.json::<serde_json::Value>().await {
+                if let Some(result) = data.get("result").and_then(|r| r.as_array()) {
+                    if let Some(token) = result.first() {
+                        if let Some(bal_str) = token.get("balance").and_then(|b| b.as_str()) {
+                            // Kasplex KRC-20 Standard Decimals conversion (8 decimals)
+                            let raw_bal: f64 = bal_str.parse().unwrap_or(0.0);
+                            balance = raw_bal / 100_000_000.0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Cache for 60 seconds
+    let _: () = redis::cmd("SETEX").arg(&cache_key).arg(60).arg(balance.to_string()).query_async(redis_conn).await.unwrap_or(());
+    
+    balance
+}
+
+pub async fn start_chronos_daemon(pool: PgPool) {
+    tracing::info!("⏳ Chronos Settlement Engine Online. Natively monitoring Omni-Chain Ledger via Postgres.");
+    
+    let redis_client = redis::Client::open("redis://127.0.0.1/").expect("Failed to connect to Redis for Chronos");
+    let http_client = Client::new();
+
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+
+    loop {
+        interval.tick().await;
+        if let Err(e) = execute_settlement_tick(&pool, &redis_client, &http_client).await {
+            tracing::error!("🚨 Chronos Execution Error: {}", e);
+        }
+    }
+}
+
+async fn execute_settlement_tick(
+    pool: &PgPool, 
+    redis_client: &redis::Client, 
+    http_client: &Client
+) -> anyhow::Result<()> {
+    let mut redis_conn = redis_client.get_multiplexed_async_connection().await?;
+
+    let rows = sqlx::query("SELECT wallet_address, layout_state FROM user_command_centers")
+        .fetch_all(pool)
+        .await?;
+
+    for row in rows {
+        let address: String = row.get("wallet_address");
+        let mut state: Value = row.get("layout_state");
+        
+        let workers_opt = state.get_mut("workers").and_then(|w| w.as_array_mut());
+        if workers_opt.is_none() {
+            continue;
+        }
+
+        let mut state_mutated = false;
+        let is_overclocked = state.get("systemMode").and_then(|v| v.as_str()) == Some("overclocked");
+
+        // 🛡️ PER FLYWHEEL: Total required PER tokens validation map
+        let mut total_per_infused = 0.0;
+        if let Some(workers) = state.get("workers").and_then(|w| w.as_array()) {
+            for worker in workers {
+                if worker.get("type").and_then(|v| v.as_str()).unwrap_or("") == "capital" {
+                    total_per_infused += worker.get("capitalTokens").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                }
+            }
+        }
+
+        // Only reach out to the Kasplex network if they are attempting to run a Capital Worker
+        let mut remaining_valid_per = if total_per_infused > 0.0 {
+            fetch_per_balance(http_client, &mut redis_conn, &address).await
+        } else {
+            0.0
+        };
+
+        // 1. Process Workers
+        let mut earned_by_silo = std::collections::HashMap::new();
+
+        if let Some(workers) = state.get_mut("workers").and_then(|w| w.as_array_mut()) {
+            for worker in workers.iter_mut() {
+                // ⚡ Cast to owned Strings immediately to drop the immutable borrow on `worker`
+                let assigned_silo_id = worker.get("assignedSiloId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let w_type = worker.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let mut earned_kaspa = 0.0;
+
+                // 🛡️ ZERO-TRUST ENFORCEMENT FOR CAPITAL WORKERS
+                if w_type == "capital" {
+                    let requested_tokens = worker.get("capitalTokens").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    
+                    let valid_tokens = if requested_tokens <= remaining_valid_per {
+                        requested_tokens
+                    } else {
+                        remaining_valid_per
+                    };
+                    remaining_valid_per = (remaining_valid_per - valid_tokens).max(0.0);
+                    
+                    // Native injection: 1,000 PER = 0.05 TH/s
+                    let actual_hash_rate = (valid_tokens / 1000.0) * 0.05;
+                    let is_online = actual_hash_rate > 0.0;
+                    
+                    // Force state rectification if frontend drifted or user attempted to cheat
+                    let current_tokens = worker.get("capitalTokens").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let current_hr = worker.get("hashRate").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let current_online = worker.get("isOnline").and_then(|v| v.as_bool()).unwrap_or(false);
+
+                    if (current_tokens - valid_tokens).abs() > 0.0001 || 
+                       (current_hr - actual_hash_rate).abs() > 0.00001 || 
+                       current_online != is_online {
+                        worker["capitalTokens"] = json!(valid_tokens);
+                        worker["hashRate"] = json!(actual_hash_rate);
+                        worker["isOnline"] = json!(is_online);
+                        state_mutated = true;
+                        
+                        tracing::info!("🛡️ [ZERO-TRUST] Rectified Capital Worker for {}: Verified {:.2} PER ({:.4} TH/s)", address, valid_tokens, actual_hash_rate);
+                    }
+
+                    if is_online && !assigned_silo_id.is_empty() {
+                        let virtual_shares = actual_hash_rate * 50.0;
+                        earned_kaspa = virtual_shares * PPS_RATE_PER_DIFFICULTY;
+                        
+                        let current_shares = worker.get("sharesContributed").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        // Safe to mutate here because the immutable borrow was dropped
+                        worker["sharesContributed"] = json!(current_shares + virtual_shares);
+                        state_mutated = true;
+                    }
+                } else if w_type == "physical" && !assigned_silo_id.is_empty() {
+                    let wallet_worker = worker.get("walletWorker").and_then(|v| v.as_str()).unwrap_or("");
+                    if !wallet_worker.is_empty() {
+                        let share_key = format!("worker:{}:shares", wallet_worker);
+                        let unprocessed_str: Option<String> = redis::cmd("GET").arg(&share_key).query_async(&mut redis_conn).await.unwrap_or(None);
+                        let unprocessed: f64 = unprocessed_str.unwrap_or_else(|| "0".to_string()).parse().unwrap_or(0.0);
+
+                        if unprocessed > 0.0 {
+                            earned_kaspa = unprocessed * PPS_RATE_PER_DIFFICULTY;
+                            let _: () = redis::cmd("SET").arg(&share_key).arg("0").query_async(&mut redis_conn).await.unwrap_or(());
+                        }
+                    }
+                }
+
+                if earned_kaspa > 0.0 && !assigned_silo_id.is_empty() {
+                    *earned_by_silo.entry(assigned_silo_id).or_insert(0.0) += earned_kaspa;
+                }
+            }
+        }
+
+        if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
+            for silo in silos.iter_mut() {
+                if let Some(id) = silo.get("id").and_then(|v| v.as_str()) {
+                    if let Some(inc) = earned_by_silo.get(id) {
+                        let current_pending = silo.get("pendingKaspa").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        silo["pendingKaspa"] = json!(current_pending + inc);
+                        state_mutated = true;
+                    }
+                }
+            }
+        }
+
+        // 2. OVERCLOCK MODE & MICRO-FEES INTERCEPTOR
+        if is_overclocked {
+            let mut total_tick_fee = OVERCLOCK_BASE_FEE;
+            
+            if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
+                for silo in silos.iter_mut() {
+                    let pending = silo.get("pendingKaspa").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    if pending > 0.0 {
+                        let var_fee = pending * OVERCLOCK_VAR_FEE;
+                        let deduction = pending.min(total_tick_fee + var_fee);
+                        
+                        if deduction > 0.0 {
+                            silo["pendingKaspa"] = json!(pending - deduction);
+                            total_tick_fee = (total_tick_fee - deduction).max(0.0);
+                            state_mutated = true;
+                            
+                            let name = silo.get("name").and_then(|n| n.as_str()).unwrap_or("Unknown");
+                            tracing::info!("⚡ [OVERCLOCK] Deducted {:.6} KAS from Silo {} for predictive engine compute.", deduction, name);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Plant LP Synthesis
+        let mut synthesis_actions = Vec::new();
+
+        if let Some(plants) = state.get("plants").and_then(|p| p.as_array()) {
+            for (p_idx, plant) in plants.iter().enumerate() {
+                let is_active = plant.pointer("/liquidityDeposit/isActive").and_then(|v| v.as_bool()).unwrap_or(false);
+                if !is_active { continue; }
+
+                let plant_id = plant.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                
+                let mut assigned_silos = Vec::new();
+                if let Some(silos) = state.get("silos").and_then(|s| s.as_array()) {
+                    for (s_idx, silo) in silos.iter().enumerate() {
+                        if silo.get("assignedPlantId").and_then(|v| v.as_str()).unwrap_or("") == plant_id {
+                            assigned_silos.push((s_idx, silo.clone()));
+                        }
+                    }
+                }
+
+                if assigned_silos.len() == 2 {
+                    let (s1_idx, silo1) = &assigned_silos[0];
+                    let (s2_idx, silo2) = &assigned_silos[1];
+
+                    let p1 = silo1.get("pendingKaspa").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let p2 = silo2.get("pendingKaspa").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+                    if p1 >= MINIMUM_UTXO_SWEEP_THRESHOLD && p2 >= MINIMUM_UTXO_SWEEP_THRESHOLD {
+                        let target1 = silo1.pointer("/settlementConfig/targetAsset/ticker").and_then(|t| t.as_str()).unwrap_or("USDC").to_string();
+                        let target2 = silo2.pointer("/settlementConfig/targetAsset/ticker").and_then(|t| t.as_str()).unwrap_or("USDC").to_string();
+                        let plant_name = plant.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                        
+                        synthesis_actions.push((p_idx, *s1_idx, *s2_idx, p1, p2, target1, target2, plant_name));
+                    }
+                }
+            }
+        }
+
+        for (p_idx, s1_idx, s2_idx, mut amt1, mut amt2, target1, target2, plant_name) in synthesis_actions {
+            if is_overclocked {
+                let fee1 = amt1 * OVERCLOCK_PREMIUM_FEE;
+                let fee2 = amt2 * OVERCLOCK_PREMIUM_FEE;
+                amt1 -= fee1;
+                amt2 -= fee2;
+                tracing::info!("⚡ [OVERCLOCK] Plant Synthesis Fee Deducted: {:.6} KAS", fee1 + fee2);
+            }
+
+            if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
+                silos[s1_idx]["pendingKaspa"] = json!(0.0);
+                silos[s2_idx]["pendingKaspa"] = json!(0.0);
+            }
+
+            tracing::info!("\n🌱 [CHRONOS SYNTHESIS] Auto-LP Intercept on Plant: {}", plant_name);
+            
+            let mut total_usd = 0.0;
+
+            for (amt, target) in [(amt1, &target1), (amt2, &target2)] {
+                let req_payload = json!({
+                    "wallet": address,
+                    "payAsset": "KAS",
+                    "receiveAsset": target,
+                    "amount": amt,
+                    "slippageTolerance": 0.05
+                });
+                
+                if let Ok(res) = http_client.post("http://127.0.0.1:8002/v1/sor/execute").json(&req_payload).send().await {
+                    if let Ok(data) = res.json::<Value>().await {
+                        if let Some(est) = data.get("estimatedOutput").and_then(|v| v.as_f64()) {
+                            total_usd += est;
+                            tracing::info!("   -> Routed {:.2} KAS through sorEngine.", amt);
+                        }
+                    }
+                }
+            }
+            
+            if let Some(plants) = state.get_mut("plants").and_then(|p| p.as_array_mut()) {
+                let current_usd = plants[p_idx].pointer("/liquidityDeposit/totalLiquidityUsd").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                if let Some(ld) = plants[p_idx].get_mut("liquidityDeposit").and_then(|v| v.as_object_mut()) {
+                    ld.insert("totalLiquidityUsd".to_string(), json!(current_usd + total_usd));
+                }
+                tracing::info!("   -> Executed swaps and deposited into Kasplex Liquidity Pool.");
+                tracing::info!("   -> New LP Position: ${:.2}", current_usd + total_usd);
+            }
+            
+            state_mutated = true;
+        }
+
+        // 4. Auto Payouts for Standalone Silos
+        if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
+            for silo in silos.iter_mut() {
+                if silo.get("assignedPlantId").map_or(false, |id| !id.is_null()) {
+                    continue;
+                }
+
+                let auto_payout = silo.pointer("/settlementConfig/autoPayout").and_then(|v| v.as_bool()).unwrap_or(false);
+                let pending = silo.get("pendingKaspa").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+                if auto_payout && pending >= MINIMUM_UTXO_SWEEP_THRESHOLD {
+                    let threshold = silo.pointer("/settlementConfig/threshold").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let mode = silo.pointer("/settlementConfig/mode").and_then(|v| v.as_str()).unwrap_or("");
+
+                    if mode == "stream" || (mode == "threshold" && pending >= threshold) {
+                        let dynamic_system_fee = if is_overclocked { NETWORK_FEE_PERCENTAGE + 0.005 } else { NETWORK_FEE_PERCENTAGE };
+                        let perennia_fee = pending * dynamic_system_fee;
+                        let net_payout = pending - perennia_fee;
+                        
+                        let target_addr = silo.pointer("/settlementConfig/payoutAddress").and_then(|v| v.as_str()).unwrap_or("");
+                        let target_addr = if target_addr.is_empty() { &address } else { target_addr };
+
+                        let silo_name = silo.get("name").and_then(|n| n.as_str()).unwrap_or("Unknown");
+
+                        tracing::info!("\n💸 [CHRONOS EXECUTION] Settling Silo: {}", silo_name);
+                        tracing::info!("   -> Gross Yield: {:.6} KAS", pending);
+                        tracing::info!("   -> Perennia Fee ({:.1}%): {:.6} KAS", dynamic_system_fee * 100.0, perennia_fee);
+                        tracing::info!("   -> Broadcasting {:.6} KAS to {}", net_payout, target_addr);
+
+                        silo["pendingKaspa"] = json!(0.0);
+                        state_mutated = true;
+                    }
+                }
+            }
+        }
+
+        // Save back to DB
+        if state_mutated {
+            sqlx::query("UPDATE user_command_centers SET layout_state = $1, last_updated = CURRENT_TIMESTAMP WHERE wallet_address = $2")
+                .bind(&state)
+                .bind(&address)
+                .execute(pool)
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+</file>
+
+<file path="src/sor.rs">
+use axum::{Json, extract::State};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sqlx::PgPool;
+use std::env;
+use uuid::Uuid;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[allow(non_snake_case)]
+pub struct UtxoInput {
+    pub transactionId: String,
+    pub index: u32,
+    pub amount: f64,
+    pub scriptPublicKey: String,
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(non_snake_case)]
+pub struct SorExecuteRequest {
+    pub wallet: String,
+    pub payAsset: String,
+    pub receiveAsset: String,
+    pub amount: f64,
+    pub slippageTolerance: Option<f64>,
+    pub utxos: Option<Vec<UtxoInput>>,
+}
+
+#[derive(Serialize, Debug)]
+#[allow(non_snake_case)]
+pub struct WaterfallLeg {
+    pub tier: u32,
+    pub provider: String,
+    pub filledAmount: f64,
+    pub executionRate: f64,
+    pub marginCaptured: f64,
+}
+
+#[derive(Serialize, Debug)]
+#[allow(non_snake_case)]
+pub struct SorExecutionPlan {
+    pub totalAmount: f64,
+    pub unifiedRate: f64,
+    pub estimatedOutput: f64,
+    pub legs: Vec<WaterfallLeg>,
+    pub transaction_uuid: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub psbt: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub formattedUtxos: Option<Vec<UtxoInput>>,
+}
+
+#[derive(Serialize)]
+pub struct SorError {
+    pub error: String,
+}
+
+// ⚡ Zero-Dependency Kaspa Address to P2PKH/Schnorr Script Decoder
+fn decode_address_to_script(address: &str) -> Result<String, String> {
+    let parts: Vec<&str> = address.split(':').collect();
+    if parts.len() != 2 { return Err("Invalid address format".to_string()); }
+    
+    let base32 = parts[1];
+    if base32.len() < 8 { return Err("Address too short".to_string()); }
+    
+    let charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    let mut decoded = Vec::new();
+    for c in base32[..base32.len()-8].chars() {
+        if let Some(idx) = charset.find(c) {
+            decoded.push(idx as u8);
+        } else {
+            return Err("Invalid base32 char".to_string());
+        }
+    }
+    
+    let mut out = Vec::new();
+    let mut val = 0u32;
+    let mut bits = 0;
+    for &d in &decoded {
+        val = (val << 5) | (d as u32);
+        bits += 5;
+        while bits >= 8 {
+            bits -= 8;
+            out.push((val >> bits) as u8);
+        }
+    }
+    
+    if out.len() < 33 {
+        let clean = address.replace("kaspa:", "");
+        let hex_val = hex::encode(clean);
+        let truncated = if hex_val.len() > 64 { &hex_val[0..64] } else { &hex_val };
+        return Ok(format!("20{}ac", truncated));
+    }
+    
+    let pubkey = &out[1..33];
+    let mut hex_str = String::new();
+    for byte in pubkey {
+        use std::fmt::Write;
+        write!(&mut hex_str, "{:02x}", byte).unwrap();
+    }
+    Ok(format!("20{}ac", hex_str))
+}
+
+pub async fn handle_sor_execute(
+    State(_pool): State<PgPool>,
+    Json(payload): Json<SorExecuteRequest>,
+) -> Result<Json<SorExecutionPlan>, Json<SorError>> {
+    tracing::info!("🔒 SOR Executing Live API Swap for: {}", payload.wallet);
+
+    let client = Client::new();
+    let pair = format!("{}_{}", payload.payAsset, payload.receiveAsset).to_uppercase();
+    
+    let redis_client = redis::Client::open("redis://127.0.0.1/").unwrap();
+    let mut redis_conn = redis_client.get_multiplexed_async_connection().await.unwrap();
+
+    let spot_rate_str: Option<String> = redis::cmd("GET")
+        .arg(format!("oracle:spot:{}", pair))
+        .query_async(&mut redis_conn)
+        .await.unwrap_or(None);
+    let spot_rate: f64 = spot_rate_str.unwrap_or_else(|| "1.0".to_string()).parse().unwrap_or(1.0);
+
+    let mut remaining_amount = payload.amount;
+    let mut total_estimated_output = 0.0;
+    let mut legs = Vec::new();
+    
+    let min_chainge_tokens = 15.0 / spot_rate;
+    let min_changenow_tokens = 50.0 / spot_rate;
+
+    let corp_kas = env::var("PERENNIA_TREASURY_KAS_ADDRESS").unwrap_or_else(|_| "kaspa:qpd3r7z43r1x0pn3y26k2yp4r7z43r1x0pn3y26k2yp4r7z0q5qqp2".to_string());
+    let corp_eth = "0x71C7656EC7ab88b098defB751B7401B5f6d8976F".to_string();
+
+    // ==========================================================
+    // TIER 1: PERENNIA TREASURY (Internal Fast-Settlement)
+    // ==========================================================
+    let treasury_bal_str: Option<String> = redis::cmd("HGET")
+        .arg("dev:sor:treasury:balances:admin")
+        .arg(&payload.receiveAsset)
+        .query_async(&mut redis_conn)
+        .await.unwrap_or(None);
+    let treasury_bal: f64 = treasury_bal_str.unwrap_or_else(|| "0".to_string()).parse().unwrap_or(0.0);
+
+    if treasury_bal > 0.0 && remaining_amount > 0.0 {
+        let fillable = treasury_bal.min(remaining_amount);
+        let treasury_rate = spot_rate * 0.985;
+        let output = fillable * treasury_rate;
+
+        legs.push(WaterfallLeg {
+            tier: 1,
+            provider: "Perennia Treasury".to_string(),
+            filledAmount: fillable,
+            executionRate: treasury_rate,
+            marginCaptured: fillable * spot_rate * 0.015,
+        });
+
+        remaining_amount -= fillable;
+        total_estimated_output += output;
+    }
+
+    // ==========================================================
+    // TIER 2: KASPLEX KRC-20 (Decentralized Overflow AMM)
+    // ==========================================================
+    if remaining_amount > 0.0 {
+        let kasplex_res = client.get(&format!("https://api.kasplex.org/v1/krc20/token/{}", payload.receiveAsset))
+            .send().await;
+        
+        let mut kasplex_depth = 0.0;
+        if let Ok(res) = kasplex_res {
+            if let Ok(data) = res.json::<serde_json::Value>().await {
+                if let Some(minted) = data.get("result").and_then(|r| r.get(0)).and_then(|m| m.get("max")).and_then(|m| m.as_str()) {
+                    kasplex_depth = minted.parse::<f64>().unwrap_or(0.0) * 0.01; 
+                }
+            }
+        }
+
+        if kasplex_depth > 0.0 {
+            let fillable = kasplex_depth.min(remaining_amount);
+            if fillable > 0.0 {
+                let rate = spot_rate * 0.997; 
+                let output = fillable * rate;
+
+                legs.push(WaterfallLeg {
+                    tier: 2,
+                    provider: "Kasplex KRC-20".to_string(),
+                    filledAmount: fillable,
+                    executionRate: rate,
+                    marginCaptured: 0.0,
+                });
+
+                remaining_amount -= fillable;
+                total_estimated_output += output;
+            }
+        }
+    }
+
+    // ==========================================================
+    // TIER 3: CHAINGE FINANCE (Cross-Chain Bridging AMM)
+    // ==========================================================
+    if remaining_amount >= min_chainge_tokens {
+        let chainge_api_key = env::var("CHAINGE_API_KEY").unwrap_or_default();
+        let chainge_req = json!({
+            "fromChain": "KASPA", "toChain": "ETHEREUM",
+            "fromToken": "KAS", "toToken": "USDC",
+            "userAddress": payload.wallet,
+            "amount": remaining_amount * 0.5 
+        });
+        
+        let chainge_res = client.post("https://api.chainge.finance/v1/crosschain/address")
+            .header("Authorization", format!("Bearer {}", chainge_api_key))
+            .json(&chainge_req)
+            .send().await;
+
+        if let Ok(res) = chainge_res {
+            if let Ok(data) = res.json::<serde_json::Value>().await {
+                if let Some(_addr) = data.get("depositAddress").and_then(|a| a.as_str()) {
+                    let fillable = remaining_amount * 0.5;
+                    let rate = spot_rate * 0.995;
+                    let output = fillable * rate;
+
+                    legs.push(WaterfallLeg {
+                        tier: 3,
+                        provider: "Chainge AMM".to_string(),
+                        filledAmount: fillable,
+                        executionRate: rate,
+                        marginCaptured: 0.0,
+                    });
+
+                    remaining_amount -= fillable;
+                    total_estimated_output += output;
+                }
+            }
+        }
+    }
+
+    // ==========================================================
+    // TIER 4: CHANGENOW (Whale Router Fallback Live API)
+    // ==========================================================
+    if remaining_amount >= min_changenow_tokens {
+        let changenow_key = env::var("CHANGENOW_API_KEY").unwrap_or_default();
+        let cnow_req = json!({
+            "fromCurrency": "kas", "toCurrency": "usdc",
+            "fromNetwork": "kas", "toNetwork": "eth",
+            "fromAmount": remaining_amount,
+            "address": corp_eth,
+            "flow": "standard"
+        });
+
+        let cnow_res = client.post("https://api.changenow.io/v2/exchange")
+            .header("x-changenow-api-key", changenow_key)
+            .json(&cnow_req)
+            .send().await;
+
+        if let Ok(res) = cnow_res {
+            if let Ok(data) = res.json::<serde_json::Value>().await {
+                if let Some(_addr) = data.get("payinAddress").and_then(|a| a.as_str()) {
+                    let fillable = remaining_amount;
+                    let rate = spot_rate * 0.985;
+                    let output = fillable * rate;
+
+                    legs.push(WaterfallLeg {
+                        tier: 4,
+                        provider: "ChangeNOW Aggregator".to_string(),
+                        filledAmount: fillable,
+                        executionRate: rate,
+                        marginCaptured: 0.0,
+                    });
+
+                    remaining_amount = 0.0;
+                    total_estimated_output += output;
+                }
+            }
+        }
+    }
+
+    if legs.is_empty() && payload.amount > 0.0 {
+        return Err(Json(SorError { error: "Liquidity Exhausted. No hard-routing paths available on-chain.".to_string() }));
+    }
+
+    let filled_amount = payload.amount - remaining_amount;
+    let unified_rate = if filled_amount > 0.0 { total_estimated_output / filled_amount } else { 0.0 };
+    let tx_uuid = Uuid::new_v4().to_string();
+
+    let mut psbt = None;
+
+    // ==========================================================
+    // PSBT CONSTRUCTION FOR HARD ZERO-TRUST HONEYCOMB EXECUTION
+    // ==========================================================
+    if let Some(utxos) = &payload.utxos {
+        let target_amount_sompi = (filled_amount * 1e8).floor() as u64;
+        let fee_sompi = 10000;
+        let total_required = target_amount_sompi + fee_sompi;
+
+        let mut gathered_sompi = 0;
+        let mut tx_inputs = Vec::new();
+
+        for utxo in utxos {
+            tx_inputs.push(json!({
+                "previousOutpoint": {
+                    "transactionId": utxo.transactionId,
+                    "index": utxo.index
+                },
+                "signatureScript": "",
+                "sequence": 0,
+                "sigOpCount": 1
+            }));
+            gathered_sompi += utxo.amount as u64;
+            if gathered_sompi >= total_required {
+                break;
+            }
+        }
+
+        if gathered_sompi < total_required {
+            return Err(Json(SorError { error: format!("ERR_INSUFFICIENT_MASS: Required {}, Found {}", total_required, gathered_sompi) }));
+        }
+
+        let mut tx_outputs = Vec::new();
+
+        for leg in &legs {
+            let leg_sompi = (leg.filledAmount * 1e8).floor() as u64;
+            if leg_sompi == 0 { continue; }
+
+            let mut dest_address = String::new();
+            match leg.tier {
+                1 => dest_address = corp_kas.clone(),
+                2 => dest_address = "kaspa:kasplex_krc20_router_inbound".to_string(),
+                3 => dest_address = "kaspa:chainge_finance_bridge_fallback".to_string(), // In production we persist the response address here
+                4 => dest_address = "kaspa:changenow_whale_fallback".to_string(),
+                _ => {}
+            }
+
+            let script_pub_key = decode_address_to_script(&dest_address)
+                .unwrap_or_else(|_| "200000000000000000000000000000000000000000000000000000000000000000ac".to_string());
+
+            tx_outputs.push(json!({
+                "amount": leg_sompi as u64,
+                "scriptPublicKey": script_pub_key,
+                "_metadata": { "provider": leg.provider, "tier": leg.tier }
+            }));
+        }
+
+        let change_sompi = gathered_sompi - total_required;
+        if change_sompi > 0 {
+            tx_outputs.push(json!({
+                "amount": change_sompi as u64,
+                "scriptPublicKey": decode_address_to_script(&payload.wallet).unwrap_or_else(|_| "200000000000000000000000000000000000000000000000000000000000000000ac".to_string()),
+                "_metadata": { "type": "change" }
+            }));
+        }
+
+        psbt = Some(json!({
+            "version": 0,
+            "inputs": tx_inputs,
+            "outputs": tx_outputs,
+            "lockTime": 0,
+            "subnetworkId": "0000000000000000000000000000000000000000",
+            "gas": 0,
+            "payload": "",
+            "mass": 0,
+            "storageMass": 0
+        }));
+    }
+
+    Ok(Json(SorExecutionPlan {
+        totalAmount: filled_amount,
+        unifiedRate: unified_rate,
+        estimatedOutput: total_estimated_output,
+        legs,
+        transaction_uuid: tx_uuid,
+        psbt,
+        formattedUtxos: payload.utxos.clone(),
+    }))
+}
+</file>
+
+<file path=".envecho">
+
+</file>
+
+<file path="build.rs">
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Tell Cargo to re-run this script if the proto files change
+    println!("cargo:rerun-if-changed=proto/rpc.proto");
+    println!("cargo:rerun-if-changed=proto/messages.proto");
+
+    // Compile the Kaspa gRPC protobuf files into native Rust code
+    tonic_build::configure()
+        .build_server(false)
+        .compile(
+            &["proto/messages.proto", "proto/rpc.proto"],
+            &["proto/"],
+        )?;
+        
+    Ok(())
+}
+</file>
+
+<file path="package.json">
+{
+  "dependencies": {
+    "@kaspa/core-lib": "^1.6.5",
+    "@solana/web3.js": "^1.98.4",
+    "bitcoinjs-lib": "^7.0.1",
+    "buffer": "^6.0.3",
+    "ed25519-hd-key": "^2.0.0",
+    "ethers": "^6.17.0"
+  },
+  "devDependencies": {
+    "vite-plugin-node-polyfills": "^0.28.0"
+  }
+}
+</file>
+
+<file path="db/schema.sql">
+-- ==============================================================================
+-- PERENNIA LLC: SOVEREIGN WRITE-AHEAD LOG (WAL) & REAL-TIME LEDGER SCHEMA
+-- Deployment Environment: Bare-Metal Ubuntu PostgreSQL 16+
+-- Architecture: High-Velocity BRIN Indexing & L1 Block Ledger
+-- ==============================================================================
+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- 1. Sovereign tracking of bare-metal hardware identities
+CREATE TABLE IF NOT EXISTS worker_profiles (
+    worker_id VARCHAR(255) PRIMARY KEY,
+    wallet_address VARCHAR(255) NOT NULL,
+    device_profile VARCHAR(100) NOT NULL DEFAULT 'unknown',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 2. Continuous Fluidity: Real-time balance streaming for active smart contract polling
+CREATE TABLE IF NOT EXISTS yield_reservoirs (
+    wallet_address VARCHAR(255) PRIMARY KEY,
+    streaming_balance_kas DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    total_yield_kas DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 3. UNLOGGED WAL: Millions of sub-second micro-shares map directly here from the Redis Oracle
+CREATE UNLOGGED TABLE IF NOT EXISTS micro_shares (
+    share_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    worker_id VARCHAR(255) NOT NULL,
+    difficulty_weight DOUBLE PRECISION NOT NULL,
+    kas_value_delta DOUBLE PRECISION NOT NULL,
+    network_diff DOUBLE PRECISION NOT NULL,
+    is_settled BOOLEAN NOT NULL DEFAULT false,
+    recorded_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 4. The L1 Block Ledger: Persistent tracking of global Kaspa network discoveries
+CREATE TABLE IF NOT EXISTS network_blocks (
+    block_hash VARCHAR(64) PRIMARY KEY,
+    worker_id VARCHAR(255) NOT NULL,
+    nonce BIGINT NOT NULL,
+    network_diff DOUBLE PRECISION NOT NULL,
+    is_orphaned BOOLEAN DEFAULT false,
+    discovered_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ==============================================================================
+-- 5. SOVEREIGN COMMAND CENTER STATE (Phase 2 Upgrade)
+-- ==============================================================================
+CREATE TABLE IF NOT EXISTS user_command_centers (
+    wallet_address VARCHAR(255) PRIMARY KEY,
+    layout_state JSONB NOT NULL DEFAULT '{}'::jsonb,
+    last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ==============================================================================
+-- HIGH-PERFORMANCE INDEXING MATRIX
+-- ==============================================================================
+
+-- B-Tree Indexes for exact-match lookups
+CREATE INDEX IF NOT EXISTS idx_micro_shares_worker ON micro_shares(worker_id);
+CREATE INDEX IF NOT EXISTS idx_micro_shares_settlement ON micro_shares(is_settled);
+CREATE INDEX IF NOT EXISTS idx_network_blocks_worker ON network_blocks(worker_id);
+CREATE INDEX IF NOT EXISTS idx_network_blocks_time ON network_blocks(discovered_at DESC);
+CREATE INDEX IF NOT EXISTS idx_user_command_centers_updated ON user_command_centers(last_updated DESC);
+
+-- Drop legacy B-Tree for time-series if it exists from Phase 1
+DROP INDEX IF EXISTS idx_micro_shares_recorded;
+
+-- BRIN (Block Range Index) for hyper-optimized append-only time-series data
+CREATE INDEX IF NOT EXISTS idx_micro_shares_recorded_brin 
+ON micro_shares USING brin (recorded_at) WITH (pages_per_range = 128);
+
+-- RWA Oracle Telemetry (Unlogged for high-velocity ingest)
+CREATE UNLOGGED TABLE IF NOT EXISTS rwa_oracle_feeds (
+    ticker VARCHAR(16) NOT NULL,
+    asset_class VARCHAR(16) NOT NULL,
+    price_usd NUMERIC(18, 8) NOT NULL,
+    oracle_source VARCHAR(32) NOT NULL DEFAULT 'PYTH_HERMES',
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (ticker, updated_at)
+);
+
+CREATE INDEX idx_rwa_oracle_ticker_time ON rwa_oracle_feeds (ticker, updated_at DESC);
+</file>
+
 <file path="src/job_manager/mod.rs">
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
@@ -2537,62 +2664,13 @@ impl StratumConfig {
 }
 </file>
 
-<file path=".envecho">
-
-</file>
-
-<file path="build.rs">
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Tell Cargo to re-run this script if the proto files change
-    println!("cargo:rerun-if-changed=proto/rpc.proto");
-    println!("cargo:rerun-if-changed=proto/messages.proto");
-
-    // Compile the Kaspa gRPC protobuf files into native Rust code
-    tonic_build::configure()
-        .build_server(false)
-        .compile(
-            &["proto/messages.proto", "proto/rpc.proto"],
-            &["proto/"],
-        )?;
-        
-    Ok(())
-}
-</file>
-
-<file path="config.yaml">
-# Core Network Parameters (Pivoted to Local Node)
-stratum_port: ":5555"
-kaspad_address: "127.0.0.1:16110"
-
-# Central Pool Wallet
-mining_address: "kaspa:qql2vwejyye7rcp39fdr7n0jfk2vlpvrkt2ke49ztsxceduw4hyw6ld9ts5yv"
-
-# Public Pool Mechanics
-starting_diff: 64       # ⚡ Allows IceRiver and Goldshell miners to survive
-min_share_diff: 2.0      
-var_diff: true           
-shares_per_min: 20
-extranonce_size: 2
-
-# Telemetry System
-prom_port: ":8081"
-print_stats: true
-</file>
-
-<file path="package.json">
-{
-  "dependencies": {
-    "@kaspa/core-lib": "^1.6.5",
-    "@solana/web3.js": "^1.98.4",
-    "bitcoinjs-lib": "^7.0.1",
-    "buffer": "^6.0.3",
-    "ed25519-hd-key": "^2.0.0",
-    "ethers": "^6.17.0"
-  },
-  "devDependencies": {
-    "vite-plugin-node-polyfills": "^0.28.0"
-  }
-}
+<file path=".gitignore">
+/target/
+**/*.rs.bk
+.env
+Cargo.lock
+.DS_Store
+node_modules/
 </file>
 
 <file path="src/telemetry/mod.rs">
@@ -3213,15 +3291,6 @@ pub async fn start_oracle_daemon() {
 }
 </file>
 
-<file path=".gitignore">
-/target/
-**/*.rs.bk
-.env
-Cargo.lock
-.DS_Store
-node_modules/
-</file>
-
 <file path="Cargo.toml">
 [package]
 name = "perennia-stratum-rs"
@@ -3273,6 +3342,26 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+</file>
+
+<file path="config.yaml">
+# Core Network Parameters (Pivoted to Local Node)
+stratum_port: ":5555"
+kaspad_address: "127.0.0.1:16110"
+
+# Central Pool Wallet
+mining_address: "kaspa:qz2sehqzx8xetzkhz2ycqflwf8dhusyxhj0myv4ez72k0n6vdaj827jexnyzz"
+
+# Public Pool Mechanics
+starting_diff: 64       # ⚡ Allows IceRiver and Goldshell miners to survive
+min_share_diff: 2.0      
+var_diff: true           
+shares_per_min: 20
+extranonce_size: 2
+
+# Telemetry System
+prom_port: ":8081"
+print_stats: true
 </file>
 
 <file path="src/stratum_tcp/mod.rs">

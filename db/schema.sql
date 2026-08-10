@@ -69,3 +69,15 @@ DROP INDEX IF EXISTS idx_micro_shares_recorded;
 -- BRIN (Block Range Index) for hyper-optimized append-only time-series data
 CREATE INDEX IF NOT EXISTS idx_micro_shares_recorded_brin 
 ON micro_shares USING brin (recorded_at) WITH (pages_per_range = 128);
+
+-- RWA Oracle Telemetry (Unlogged for high-velocity ingest)
+CREATE UNLOGGED TABLE IF NOT EXISTS rwa_oracle_feeds (
+    ticker VARCHAR(16) NOT NULL,
+    asset_class VARCHAR(16) NOT NULL,
+    price_usd NUMERIC(18, 8) NOT NULL,
+    oracle_source VARCHAR(32) NOT NULL DEFAULT 'PYTH_HERMES',
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (ticker, updated_at)
+);
+
+CREATE INDEX idx_rwa_oracle_ticker_time ON rwa_oracle_feeds (ticker, updated_at DESC);
