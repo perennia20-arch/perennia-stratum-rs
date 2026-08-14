@@ -1,8 +1,6 @@
-use std::collections::HashMap;
 use std::time::Duration;
 use serde_json::Value;
 
-// ⚡ GLOBAL PRICING DAEMON - Isolates 3rd Party APIs internally into local Redis states
 pub async fn start_spot_pricing_daemon() {
     tracing::info!("🌐 Global Spot Price Oracle Daemon Booting...");
     
@@ -23,7 +21,6 @@ pub async fn start_spot_pricing_daemon() {
         }
     };
 
-    // Safe 15-second tick to prevent downstream rate-limiting from free-tier providers
     let mut interval = tokio::time::interval(Duration::from_secs(15));
 
     loop {
@@ -36,7 +33,6 @@ pub async fn start_spot_pricing_daemon() {
                 if let Ok(data) = res.json::<serde_json::Value>().await {
                     let mut pipeline = redis::pipe();
                     
-                    // Master payload for the SvelteKit frontend cache (Read natively via SvelteKit)
                     pipeline.cmd("SET").arg("oracle:spot:prices_json").arg(data.to_string()).ignore();
 
                     let assets = [
@@ -57,7 +53,6 @@ pub async fn start_spot_pricing_daemon() {
                         }
                     }
 
-                    // Execute the atomic Redis pipeline flush
                     if let Err(e) = pipeline.query_async::<_, ()>(&mut redis_conn).await {
                         tracing::error!("Spot Oracle Redis Pipeline Failed: {}", e);
                     }
@@ -105,120 +100,75 @@ pub async fn start_oracle_daemon() {
     loop {
         interval.tick().await;
 
-        let mut wallet_aggregates: HashMap<String, f64> = HashMap::new();
-        
-        // 1. Pop shares from the Redis buffer
+        // ⚡ PHASE 2 PURGE: Legacy share_buffer and double-accounting removed. 
+        // Yield routing is now strictly handled by chronos.rs for absolute Silo precision.
+
+        // ⚡ Process Network Block Buffer into PostgreSQL 
+        let mut block_events = Vec::new();
         loop {
             let result: redis::RedisResult<Option<String>> = redis::cmd("LPOP")
-                .arg("perennia:oracle:share_buffer")
+                .arg("perennia:oracle:block_buffer")
                 .query_async(&mut redis_conn)
                 .await;
 
             match result {
                 Ok(Some(event_str)) => {
                     if let Ok(parsed) = serde_json::from_str::<Value>(&event_str) {
-                        if let (Some(worker), Some(diff)) = (parsed["worker"].as_str(), parsed["difficulty"].as_f64()) {
-                            let parts: Vec<&str> = worker.split('.').collect();
-                            let wallet = if !parts.is_empty() { parts[0].to_string() } else { worker.to_string() };
-                            *wallet_aggregates.entry(wallet).or_insert(0.0) += diff;
-                        }
+                        block_events.push(parsed);
                     }
                 }
-                Ok(None) => break, // Buffer empty
-                Err(_) => break, // Redis error
+                Ok(None) => break,
+                Err(_) => break,
             }
         }
 
-        if wallet_aggregates.is_empty() {
-            continue;
-        }
+        if !block_events.is_empty() {
+            let mut tx_blocks = match pool.begin().await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!("Oracle failed to start DB transaction for blocks: {}", e);
+                    continue;
+                }
+            };
+            
+            let mut hashes = Vec::with_capacity(block_events.len());
+            let mut workers = Vec::with_capacity(block_events.len());
+            let mut nonces = Vec::with_capacity(block_events.len());
+            let mut diffs = Vec::with_capacity(block_events.len());
 
-        let mut tx = match pool.begin().await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!("Oracle failed to start DB transaction: {}", e);
-                continue;
-            }
-        };
-
-        let mut commit_success = true;
-
-        // 2. Bulk Aggregated Upsert into Yield Reservoirs
-        let mut agg_wallets = Vec::with_capacity(wallet_aggregates.len());
-        let mut agg_deltas = Vec::with_capacity(wallet_aggregates.len());
-        
-        for (w, d) in &wallet_aggregates {
-            agg_wallets.push(w.clone());
-            agg_deltas.push(*d);
-        }
-
-        if commit_success {
-            let upsert_res = sqlx::query(
-                r#"
-                INSERT INTO yield_reservoirs (wallet_address, streaming_balance_kas, total_yield_kas)
-                SELECT * FROM UNNEST($1::text[], $2::float8[], $2::float8[])
-                ON CONFLICT (wallet_address)
-                DO UPDATE SET
-                    streaming_balance_kas = yield_reservoirs.streaming_balance_kas + EXCLUDED.streaming_balance_kas,
-                    total_yield_kas = yield_reservoirs.total_yield_kas + EXCLUDED.total_yield_kas,
-                    last_updated = CURRENT_TIMESTAMP
-                "#
-            )
-            .bind(&agg_wallets).bind(&agg_deltas)
-            .execute(&mut *tx).await;
-
-            if let Err(e) = upsert_res {
-                tracing::error!("Upsert failed: {}", e);
-                commit_success = false; 
-            }
-        }
-
-        // 3. 1099-DA Compliance Stamping (Gross Proceeds Ledger)
-        if commit_success && !agg_wallets.is_empty() {
-            // Fetch live spot price from Redis to stamp the financial event
-            let kas_spot_price: f64 = redis::cmd("GET")
-                .arg("oracle:spot:KAS_USDC")
-                .query_async(&mut redis_conn)
-                .await
-                .unwrap_or(0.16); // Failsafe to static baseline if oracle desyncs
-
-            let mut event_types = Vec::with_capacity(agg_wallets.len());
-            let mut tickers = Vec::with_capacity(agg_wallets.len());
-            let mut gross_proceeds = Vec::with_capacity(agg_wallets.len());
-            let mut spot_prices = Vec::with_capacity(agg_wallets.len());
-
-            for delta in &agg_deltas {
-                event_types.push("YIELD");
-                tickers.push("KAS");
-                gross_proceeds.push(delta * kas_spot_price);
-                spot_prices.push(kas_spot_price);
+            for evt in &block_events {
+                if let (Some(hash), Some(worker), Some(nonce), Some(diff)) = (
+                    evt["block_hash"].as_str(),
+                    evt["worker"].as_str(),
+                    evt["nonce"].as_u64(),
+                    evt["network_diff"].as_f64()
+                ) {
+                    hashes.push(hash.to_string());
+                    workers.push(worker.to_string());
+                    nonces.push(nonce as i64); 
+                    diffs.push(diff);
+                }
             }
 
-            let tax_ledger_res = sqlx::query(
-                r#"
-                INSERT INTO tax_ledger_events 
-                (wallet_address, asset_ticker, event_type, gross_proceeds_usd, amount_tokens, spot_price_at_execution)
-                SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::float8[], $5::float8[], $6::float8[])
-                "#
-            )
-            .bind(&agg_wallets)
-            .bind(&tickers)
-            .bind(&event_types)
-            .bind(&gross_proceeds)
-            .bind(&agg_deltas)
-            .bind(&spot_prices)
-            .execute(&mut *tx).await;
+            if !hashes.is_empty() {
+                let insert_res = sqlx::query(
+                    r#"
+                    INSERT INTO network_blocks (block_hash, worker_id, nonce, network_diff)
+                    SELECT * FROM UNNEST($1::text[], $2::text[], $3::bigint[], $4::float8[])
+                    ON CONFLICT (block_hash) DO NOTHING
+                    "#
+                )
+                .bind(&hashes).bind(&workers).bind(&nonces).bind(&diffs)
+                .execute(&mut *tx_blocks).await;
 
-            if let Err(e) = tax_ledger_res {
-                tracing::error!("Tax ledger failed: {}", e);
-                commit_success = false; 
+                if let Err(e) = insert_res {
+                    tracing::error!("Failed to insert network blocks: {}", e);
+                    let _ = tx_blocks.rollback().await;
+                } else {
+                    let _ = tx_blocks.commit().await;
+                    tracing::info!("🧱 [ORACLE] Settled {} L1 network blocks into Postgres.", hashes.len());
+                }
             }
-        }
-
-        if commit_success {
-            let _ = tx.commit().await;
-        } else {
-            let _ = tx.rollback().await;
         }
     }
 }

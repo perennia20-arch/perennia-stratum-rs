@@ -63,6 +63,7 @@ src/
   main.rs
   oracle.rs
   sor.rs
+  state_api.rs
 .envecho
 .gitignore
 build.rs
@@ -73,6 +74,276 @@ package.json
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path="src/state_api.rs">
+use axum::{Json, extract::State};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sqlx::PgPool;
+
+#[derive(Deserialize, Debug)]
+pub struct StateActionReq {
+    pub wallet: String,
+    pub action: String,
+    pub payload: Value,
+}
+
+#[derive(Serialize)]
+pub struct ActionResponse {
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+pub async fn handle_state_action(
+    State(pool): State<PgPool>,
+    Json(req): Json<StateActionReq>,
+) -> Result<Json<ActionResponse>, Json<ActionResponse>> {
+    let redis_client = match redis::Client::open("redis://127.0.0.1/") {
+        Ok(c) => c,
+        Err(e) => return Err(Json(ActionResponse { success: false, error: Some(e.to_string()) })),
+    };
+    let mut redis_conn = match redis_client.get_multiplexed_async_connection().await {
+        Ok(c) => c,
+        Err(e) => return Err(Json(ActionResponse { success: false, error: Some(e.to_string()) })),
+    };
+
+    let mut tx = match pool.begin().await {
+        Ok(t) => t,
+        Err(e) => return Err(Json(ActionResponse { success: false, error: Some(e.to_string()) })),
+    };
+
+    let row = sqlx::query!(
+        "SELECT layout_state FROM user_command_centers WHERE wallet_address = $1 FOR UPDATE",
+        req.wallet
+    )
+    .fetch_optional(&mut *tx)
+    .await;
+
+    let mut state: Value = match row {
+        Ok(Some(r)) => r.layout_state,
+        _ => json!({"workers": [], "silos": [], "plants": [], "manualLps": [], "systemMode": "base"}),
+    };
+
+    match req.action.as_str() {
+        "ADD_WORKER" => {
+            if let Some(workers) = state.get_mut("workers").and_then(|w| w.as_array_mut()) {
+                workers.push(req.payload.clone());
+            } else {
+                state["workers"] = json!([req.payload.clone()]);
+            }
+        },
+        "DELETE_WORKER" => {
+            if let Some(id) = req.payload.get("id").and_then(|i| i.as_str()) {
+                if let Some(workers) = state.get_mut("workers").and_then(|w| w.as_array_mut()) {
+                    workers.retain(|w| w.get("id").and_then(|i| i.as_str()).unwrap_or("") != id);
+                }
+            }
+        },
+        "RENAME_WORKER" => {
+            if let (Some(id), Some(name), Some(wallet_worker)) = (
+                req.payload.get("id").and_then(|i| i.as_str()),
+                req.payload.get("name").and_then(|n| n.as_str()),
+                req.payload.get("walletWorker").and_then(|w| w.as_str())
+            ) {
+                if let Some(workers) = state.get_mut("workers").and_then(|w| w.as_array_mut()) {
+                    for w in workers.iter_mut() {
+                        if w.get("id").and_then(|i| i.as_str()).unwrap_or("") == id {
+                            w["name"] = json!(name);
+                            w["walletWorker"] = json!(wallet_worker);
+                        }
+                    }
+                }
+            }
+        },
+        "ASSIGN_WORKER_TO_SILO" => {
+            if let Some(worker_id) = req.payload.get("workerId").and_then(|i| i.as_str()) {
+                let silo_id = req.payload.get("siloId").unwrap_or(&Value::Null).clone();
+                if let Some(workers) = state.get_mut("workers").and_then(|w| w.as_array_mut()) {
+                    for w in workers.iter_mut() {
+                        if w.get("id").and_then(|i| i.as_str()).unwrap_or("") == worker_id {
+                            w["assignedSiloId"] = silo_id.clone();
+                        }
+                    }
+                }
+            }
+        },
+        "ADD_SILO" => {
+            if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
+                silos.push(req.payload.clone());
+            } else {
+                state["silos"] = json!([req.payload.clone()]);
+            }
+        },
+        "DELETE_SILO" => {
+            if let Some(id) = req.payload.get("id").and_then(|i| i.as_str()) {
+                if let Some(workers) = state.get_mut("workers").and_then(|w| w.as_array_mut()) {
+                    for w in workers.iter_mut() {
+                        if w.get("assignedSiloId").and_then(|i| i.as_str()).unwrap_or("") == id {
+                            w["assignedSiloId"] = Value::Null;
+                        }
+                    }
+                }
+                if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
+                    silos.retain(|s| s.get("id").and_then(|i| i.as_str()).unwrap_or("") != id);
+                }
+            }
+        },
+        "RENAME_SILO" => {
+            if let (Some(id), Some(name)) = (req.payload.get("id").and_then(|i| i.as_str()), req.payload.get("name").and_then(|n| n.as_str())) {
+                if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
+                    for s in silos.iter_mut() {
+                        if s.get("id").and_then(|i| i.as_str()).unwrap_or("") == id {
+                            s["name"] = json!(name);
+                        }
+                    }
+                }
+            }
+        },
+        "RESIZE_SILO" => {
+            if let (Some(id), Some(width)) = (req.payload.get("id").and_then(|i| i.as_str()), req.payload.get("width").and_then(|n| n.as_i64())) {
+                if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
+                    for s in silos.iter_mut() {
+                        if s.get("id").and_then(|i| i.as_str()).unwrap_or("") == id {
+                            s["width"] = json!(width);
+                        }
+                    }
+                }
+            }
+        },
+        "UPDATE_SETTLEMENT" => {
+            if let Some(id) = req.payload.get("id").and_then(|i| i.as_str()) {
+                if let Some(config) = req.payload.get("config") {
+                    if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
+                        for s in silos.iter_mut() {
+                            if s.get("id").and_then(|i| i.as_str()).unwrap_or("") == id {
+                                s["settlementConfig"] = config.clone();
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "ADD_PLANT" => {
+            if let Some(plants) = state.get_mut("plants").and_then(|p| p.as_array_mut()) {
+                plants.push(req.payload.clone());
+            } else {
+                state["plants"] = json!([req.payload.clone()]);
+            }
+        },
+        "DELETE_PLANT" => {
+            if let Some(id) = req.payload.get("id").and_then(|i| i.as_str()) {
+                if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
+                    for s in silos.iter_mut() {
+                        if s.get("assignedPlantId").and_then(|i| i.as_str()).unwrap_or("") == id {
+                            s["assignedPlantId"] = Value::Null;
+                        }
+                    }
+                }
+                if let Some(plants) = state.get_mut("plants").and_then(|p| p.as_array_mut()) {
+                    plants.retain(|p| p.get("id").and_then(|i| i.as_str()).unwrap_or("") != id);
+                }
+            }
+        },
+        "UPDATE_PLANT_PARAMS" => {
+            if let Some(id) = req.payload.get("id").and_then(|i| i.as_str()) {
+                if let Some(plants) = state.get_mut("plants").and_then(|p| p.as_array_mut()) {
+                    for p in plants.iter_mut() {
+                        if p.get("id").and_then(|i| i.as_str()).unwrap_or("") == id {
+                            if let Some(ac) = req.payload.get("autoCompound") { p["autoCompound"] = ac.clone(); }
+                            if let Some(ld) = req.payload.get("liquidityDeposit") { p["liquidityDeposit"] = ld.clone(); }
+                            if let Some(apr) = req.payload.get("currentApr") { p["currentApr"] = apr.clone(); }
+                        }
+                    }
+                }
+            }
+        },
+        "ASSIGN_SILO_TO_PLANT" => {
+            if let Some(silo_id) = req.payload.get("siloId").and_then(|i| i.as_str()) {
+                let plant_id = req.payload.get("plantId").unwrap_or(&Value::Null).clone();
+                
+                if !plant_id.is_null() {
+                    let mut current_silo_count = 0;
+                    if let Some(silos) = state.get("silos").and_then(|s| s.as_array()) {
+                        for s in silos {
+                            if s.get("assignedPlantId").unwrap_or(&Value::Null) == &plant_id {
+                                current_silo_count += 1;
+                            }
+                        }
+                    }
+                    if current_silo_count >= 2 {
+                        let _ = tx.rollback().await;
+                        return Err(Json(ActionResponse { success: false, error: Some("Synthesis Failed: A Plant can only hold exactly 2 Silos.".to_string()) }));
+                    }
+                }
+
+                if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
+                    for s in silos.iter_mut() {
+                        if s.get("id").and_then(|i| i.as_str()).unwrap_or("") == silo_id {
+                            s["assignedPlantId"] = plant_id.clone();
+                        }
+                    }
+                }
+            }
+        },
+        "ADD_MANUAL_LP" => {
+            if let Some(pos) = req.payload.get("position") {
+                if let Some(lps) = state.get_mut("manualLps").and_then(|l| l.as_array_mut()) {
+                    lps.push(pos.clone());
+                } else {
+                    state["manualLps"] = json!([pos.clone()]);
+                }
+            }
+        },
+        "SYSTEM_MODE" => {
+            if let Some(mode) = req.payload.get("mode").and_then(|m| m.as_str()) {
+                state["systemMode"] = json!(mode);
+            }
+        },
+        "UPDATE_TAX_FORTRESS" => {
+            if let Some(active) = req.payload.get("escrowActive").and_then(|a| a.as_bool()) {
+                if let Some(tf) = state.get_mut("taxFortress").and_then(|t| t.as_object_mut()) {
+                    tf.insert("escrowActive".to_string(), json!(active));
+                } else {
+                    state["taxFortress"] = json!({ "escrowActive": active });
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let save_res = sqlx::query!(
+        "INSERT INTO user_command_centers (wallet_address, layout_state, last_updated) 
+         VALUES ($1, $2, CURRENT_TIMESTAMP) 
+         ON CONFLICT (wallet_address) DO UPDATE SET layout_state = EXCLUDED.layout_state, last_updated = CURRENT_TIMESTAMP",
+        req.wallet,
+        state
+    )
+    .execute(&mut *tx)
+    .await;
+
+    if let Err(e) = save_res {
+        let _ = tx.rollback().await;
+        return Err(Json(ActionResponse { success: false, error: Some(e.to_string()) }));
+    }
+
+    let _ = tx.commit().await;
+
+    let update_payload = json!({
+        "layout_state_update": true,
+        "wallet": req.wallet,
+        "state": state
+    });
+    
+    let _: () = redis::cmd("PUBLISH")
+        .arg("telemetry:updates")
+        .arg(update_payload.to_string())
+        .query_async(&mut redis_conn)
+        .await
+        .unwrap_or(());
+
+    Ok(Json(ActionResponse { success: true, error: None }))
+}
+</file>
 
 <file path="kaspa-keygen/derive.js">
 require('dotenv').config();
@@ -1472,728 +1743,6 @@ pub fn verify_share(header: &Header, nonce: u64, min_share_diff: f64) -> (bool, 
 }
 </file>
 
-<file path="src/chronos.rs">
-use std::time::Duration;
-use sqlx::{PgPool, Row};
-use serde_json::{Value, json};
-use reqwest::Client;
-use redis::AsyncCommands;
-
-const PPS_RATE_PER_DIFFICULTY: f64 = 0.000005; 
-const NETWORK_FEE_PERCENTAGE: f64 = 0.01; 
-const MINIMUM_UTXO_SWEEP_THRESHOLD: f64 = 50.0;
-const OVERCLOCK_BASE_FEE: f64 = 0.0001;
-const OVERCLOCK_VAR_FEE: f64 = 0.005;
-const OVERCLOCK_PREMIUM_FEE: f64 = 0.005;
-
-// 🛡️ Cryptographically verify PER KRC-20 token balance on-chain
-async fn fetch_per_balance(http_client: &Client, redis_conn: &mut redis::aio::MultiplexedConnection, address: &str) -> f64 {
-    let clean_address = address.replace("kaspa:", "");
-    let cache_key = format!("krc20:PER:balance:{}", clean_address);
-    
-    // Check local redis cache to prevent Kasplex API rate-limiting
-    let cached: Option<String> = redis::cmd("GET").arg(&cache_key).query_async(redis_conn).await.unwrap_or(None);
-    if let Some(bal_str) = cached {
-        return bal_str.parse().unwrap_or(0.0);
-    }
-    
-    let url = format!("https://api.kasplex.org/v1/krc20/address/kaspa:{}/token/PER", clean_address);
-    let mut balance = 0.0;
-    
-    if let Ok(res) = http_client.get(&url).send().await {
-        if res.status().is_success() {
-            if let Ok(data) = res.json::<serde_json::Value>().await {
-                if let Some(result) = data.get("result").and_then(|r| r.as_array()) {
-                    if let Some(token) = result.first() {
-                        if let Some(bal_str) = token.get("balance").and_then(|b| b.as_str()) {
-                            // Kasplex KRC-20 Standard Decimals conversion (8 decimals)
-                            let raw_bal: f64 = bal_str.parse().unwrap_or(0.0);
-                            balance = raw_bal / 100_000_000.0;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    // Cache for 60 seconds
-    let _: () = redis::cmd("SETEX").arg(&cache_key).arg(60).arg(balance.to_string()).query_async(redis_conn).await.unwrap_or(());
-    
-    balance
-}
-
-pub async fn start_chronos_daemon(pool: PgPool) {
-    tracing::info!("⏳ Chronos Settlement Engine Online. Natively monitoring Omni-Chain Ledger via Postgres.");
-    
-    let redis_client = redis::Client::open("redis://127.0.0.1/").expect("Failed to connect to Redis for Chronos");
-    let http_client = Client::new();
-
-    let mut interval = tokio::time::interval(Duration::from_secs(10));
-
-    loop {
-        interval.tick().await;
-        if let Err(e) = execute_settlement_tick(&pool, &redis_client, &http_client).await {
-            tracing::error!("🚨 Chronos Execution Error: {}", e);
-        }
-    }
-}
-
-async fn execute_settlement_tick(
-    pool: &PgPool, 
-    redis_client: &redis::Client, 
-    http_client: &Client
-) -> anyhow::Result<()> {
-    let mut redis_conn = redis_client.get_multiplexed_async_connection().await?;
-
-    let rows = sqlx::query("SELECT wallet_address, layout_state FROM user_command_centers")
-        .fetch_all(pool)
-        .await?;
-
-    for row in rows {
-        let address: String = row.get("wallet_address");
-        let mut state: Value = row.get("layout_state");
-        
-        let workers_opt = state.get_mut("workers").and_then(|w| w.as_array_mut());
-        if workers_opt.is_none() {
-            continue;
-        }
-
-        let mut state_mutated = false;
-        let is_overclocked = state.get("systemMode").and_then(|v| v.as_str()) == Some("overclocked");
-
-        // 🛡️ PER FLYWHEEL: Total required PER tokens validation map
-        let mut total_per_infused = 0.0;
-        if let Some(workers) = state.get("workers").and_then(|w| w.as_array()) {
-            for worker in workers {
-                if worker.get("type").and_then(|v| v.as_str()).unwrap_or("") == "capital" {
-                    total_per_infused += worker.get("capitalTokens").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                }
-            }
-        }
-
-        // Only reach out to the Kasplex network if they are attempting to run a Capital Worker
-        let mut remaining_valid_per = if total_per_infused > 0.0 {
-            fetch_per_balance(http_client, &mut redis_conn, &address).await
-        } else {
-            0.0
-        };
-
-        // 1. Process Workers
-        let mut earned_by_silo = std::collections::HashMap::new();
-
-        if let Some(workers) = state.get_mut("workers").and_then(|w| w.as_array_mut()) {
-            for worker in workers.iter_mut() {
-                // ⚡ Cast to owned Strings immediately to drop the immutable borrow on `worker`
-                let assigned_silo_id = worker.get("assignedSiloId").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let w_type = worker.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let mut earned_kaspa = 0.0;
-
-                // 🛡️ ZERO-TRUST ENFORCEMENT FOR CAPITAL WORKERS
-                if w_type == "capital" {
-                    let requested_tokens = worker.get("capitalTokens").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    
-                    let valid_tokens = if requested_tokens <= remaining_valid_per {
-                        requested_tokens
-                    } else {
-                        remaining_valid_per
-                    };
-                    remaining_valid_per = (remaining_valid_per - valid_tokens).max(0.0);
-                    
-                    // Native injection: 1,000 PER = 0.05 TH/s
-                    let actual_hash_rate = (valid_tokens / 1000.0) * 0.05;
-                    let is_online = actual_hash_rate > 0.0;
-                    
-                    // Force state rectification if frontend drifted or user attempted to cheat
-                    let current_tokens = worker.get("capitalTokens").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let current_hr = worker.get("hashRate").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let current_online = worker.get("isOnline").and_then(|v| v.as_bool()).unwrap_or(false);
-
-                    if (current_tokens - valid_tokens).abs() > 0.0001 || 
-                       (current_hr - actual_hash_rate).abs() > 0.00001 || 
-                       current_online != is_online {
-                        worker["capitalTokens"] = json!(valid_tokens);
-                        worker["hashRate"] = json!(actual_hash_rate);
-                        worker["isOnline"] = json!(is_online);
-                        state_mutated = true;
-                        
-                        tracing::info!("🛡️ [ZERO-TRUST] Rectified Capital Worker for {}: Verified {:.2} PER ({:.4} TH/s)", address, valid_tokens, actual_hash_rate);
-                    }
-
-                    if is_online && !assigned_silo_id.is_empty() {
-                        let virtual_shares = actual_hash_rate * 50.0;
-                        earned_kaspa = virtual_shares * PPS_RATE_PER_DIFFICULTY;
-                        
-                        let current_shares = worker.get("sharesContributed").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                        // Safe to mutate here because the immutable borrow was dropped
-                        worker["sharesContributed"] = json!(current_shares + virtual_shares);
-                        state_mutated = true;
-                    }
-                } else if w_type == "physical" && !assigned_silo_id.is_empty() {
-                    let wallet_worker = worker.get("walletWorker").and_then(|v| v.as_str()).unwrap_or("");
-                    if !wallet_worker.is_empty() {
-                        let share_key = format!("worker:{}:shares", wallet_worker);
-                        let unprocessed_str: Option<String> = redis::cmd("GET").arg(&share_key).query_async(&mut redis_conn).await.unwrap_or(None);
-                        let unprocessed: f64 = unprocessed_str.unwrap_or_else(|| "0".to_string()).parse().unwrap_or(0.0);
-
-                        if unprocessed > 0.0 {
-                            earned_kaspa = unprocessed * PPS_RATE_PER_DIFFICULTY;
-                            let _: () = redis::cmd("SET").arg(&share_key).arg("0").query_async(&mut redis_conn).await.unwrap_or(());
-                        }
-                    }
-                }
-
-                if earned_kaspa > 0.0 && !assigned_silo_id.is_empty() {
-                    *earned_by_silo.entry(assigned_silo_id).or_insert(0.0) += earned_kaspa;
-                }
-            }
-        }
-
-        if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
-            for silo in silos.iter_mut() {
-                if let Some(id) = silo.get("id").and_then(|v| v.as_str()) {
-                    if let Some(inc) = earned_by_silo.get(id) {
-                        let current_pending = silo.get("pendingKaspa").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                        silo["pendingKaspa"] = json!(current_pending + inc);
-                        state_mutated = true;
-                    }
-                }
-            }
-        }
-
-        // 2. OVERCLOCK MODE & MICRO-FEES INTERCEPTOR
-        if is_overclocked {
-            let mut total_tick_fee = OVERCLOCK_BASE_FEE;
-            
-            if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
-                for silo in silos.iter_mut() {
-                    let pending = silo.get("pendingKaspa").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    if pending > 0.0 {
-                        let var_fee = pending * OVERCLOCK_VAR_FEE;
-                        let deduction = pending.min(total_tick_fee + var_fee);
-                        
-                        if deduction > 0.0 {
-                            silo["pendingKaspa"] = json!(pending - deduction);
-                            total_tick_fee = (total_tick_fee - deduction).max(0.0);
-                            state_mutated = true;
-                            
-                            let name = silo.get("name").and_then(|n| n.as_str()).unwrap_or("Unknown");
-                            tracing::info!("⚡ [OVERCLOCK] Deducted {:.6} KAS from Silo {} for predictive engine compute.", deduction, name);
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3. Plant LP Synthesis
-        let mut synthesis_actions = Vec::new();
-
-        if let Some(plants) = state.get("plants").and_then(|p| p.as_array()) {
-            for (p_idx, plant) in plants.iter().enumerate() {
-                let is_active = plant.pointer("/liquidityDeposit/isActive").and_then(|v| v.as_bool()).unwrap_or(false);
-                if !is_active { continue; }
-
-                let plant_id = plant.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                
-                let mut assigned_silos = Vec::new();
-                if let Some(silos) = state.get("silos").and_then(|s| s.as_array()) {
-                    for (s_idx, silo) in silos.iter().enumerate() {
-                        if silo.get("assignedPlantId").and_then(|v| v.as_str()).unwrap_or("") == plant_id {
-                            assigned_silos.push((s_idx, silo.clone()));
-                        }
-                    }
-                }
-
-                if assigned_silos.len() == 2 {
-                    let (s1_idx, silo1) = &assigned_silos[0];
-                    let (s2_idx, silo2) = &assigned_silos[1];
-
-                    let p1 = silo1.get("pendingKaspa").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let p2 = silo2.get("pendingKaspa").and_then(|v| v.as_f64()).unwrap_or(0.0);
-
-                    if p1 >= MINIMUM_UTXO_SWEEP_THRESHOLD && p2 >= MINIMUM_UTXO_SWEEP_THRESHOLD {
-                        let target1 = silo1.pointer("/settlementConfig/targetAsset/ticker").and_then(|t| t.as_str()).unwrap_or("USDC").to_string();
-                        let target2 = silo2.pointer("/settlementConfig/targetAsset/ticker").and_then(|t| t.as_str()).unwrap_or("USDC").to_string();
-                        let plant_name = plant.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
-                        
-                        synthesis_actions.push((p_idx, *s1_idx, *s2_idx, p1, p2, target1, target2, plant_name));
-                    }
-                }
-            }
-        }
-
-        for (p_idx, s1_idx, s2_idx, mut amt1, mut amt2, target1, target2, plant_name) in synthesis_actions {
-            if is_overclocked {
-                let fee1 = amt1 * OVERCLOCK_PREMIUM_FEE;
-                let fee2 = amt2 * OVERCLOCK_PREMIUM_FEE;
-                amt1 -= fee1;
-                amt2 -= fee2;
-                tracing::info!("⚡ [OVERCLOCK] Plant Synthesis Fee Deducted: {:.6} KAS", fee1 + fee2);
-            }
-
-            if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
-                silos[s1_idx]["pendingKaspa"] = json!(0.0);
-                silos[s2_idx]["pendingKaspa"] = json!(0.0);
-            }
-
-            tracing::info!("\n🌱 [CHRONOS SYNTHESIS] Auto-LP Intercept on Plant: {}", plant_name);
-            
-            let mut total_usd = 0.0;
-
-            for (amt, target) in [(amt1, &target1), (amt2, &target2)] {
-                let req_payload = json!({
-                    "wallet": address,
-                    "payAsset": "KAS",
-                    "receiveAsset": target,
-                    "amount": amt,
-                    "slippageTolerance": 0.05
-                });
-                
-                if let Ok(res) = http_client.post("http://127.0.0.1:8002/v1/sor/execute").json(&req_payload).send().await {
-                    if let Ok(data) = res.json::<Value>().await {
-                        if let Some(est) = data.get("estimatedOutput").and_then(|v| v.as_f64()) {
-                            total_usd += est;
-                            tracing::info!("   -> Routed {:.2} KAS through sorEngine.", amt);
-                        }
-                    }
-                }
-            }
-            
-            if let Some(plants) = state.get_mut("plants").and_then(|p| p.as_array_mut()) {
-                let current_usd = plants[p_idx].pointer("/liquidityDeposit/totalLiquidityUsd").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                if let Some(ld) = plants[p_idx].get_mut("liquidityDeposit").and_then(|v| v.as_object_mut()) {
-                    ld.insert("totalLiquidityUsd".to_string(), json!(current_usd + total_usd));
-                }
-                tracing::info!("   -> Executed swaps and deposited into Kasplex Liquidity Pool.");
-                tracing::info!("   -> New LP Position: ${:.2}", current_usd + total_usd);
-            }
-            
-            state_mutated = true;
-        }
-
-        // 4. Auto Payouts for Standalone Silos
-        if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
-            for silo in silos.iter_mut() {
-                if silo.get("assignedPlantId").map_or(false, |id| !id.is_null()) {
-                    continue;
-                }
-
-                let auto_payout = silo.pointer("/settlementConfig/autoPayout").and_then(|v| v.as_bool()).unwrap_or(false);
-                let pending = silo.get("pendingKaspa").and_then(|v| v.as_f64()).unwrap_or(0.0);
-
-                if auto_payout && pending >= MINIMUM_UTXO_SWEEP_THRESHOLD {
-                    let threshold = silo.pointer("/settlementConfig/threshold").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let mode = silo.pointer("/settlementConfig/mode").and_then(|v| v.as_str()).unwrap_or("");
-
-                    if mode == "stream" || (mode == "threshold" && pending >= threshold) {
-                        let dynamic_system_fee = if is_overclocked { NETWORK_FEE_PERCENTAGE + 0.005 } else { NETWORK_FEE_PERCENTAGE };
-                        let perennia_fee = pending * dynamic_system_fee;
-                        let net_payout = pending - perennia_fee;
-                        
-                        let target_addr = silo.pointer("/settlementConfig/payoutAddress").and_then(|v| v.as_str()).unwrap_or("");
-                        let target_addr = if target_addr.is_empty() { &address } else { target_addr };
-
-                        let silo_name = silo.get("name").and_then(|n| n.as_str()).unwrap_or("Unknown");
-
-                        tracing::info!("\n💸 [CHRONOS EXECUTION] Settling Silo: {}", silo_name);
-                        tracing::info!("   -> Gross Yield: {:.6} KAS", pending);
-                        tracing::info!("   -> Perennia Fee ({:.1}%): {:.6} KAS", dynamic_system_fee * 100.0, perennia_fee);
-                        tracing::info!("   -> Broadcasting {:.6} KAS to {}", net_payout, target_addr);
-
-                        silo["pendingKaspa"] = json!(0.0);
-                        state_mutated = true;
-                    }
-                }
-            }
-        }
-
-        // Save back to DB
-        if state_mutated {
-            sqlx::query("UPDATE user_command_centers SET layout_state = $1, last_updated = CURRENT_TIMESTAMP WHERE wallet_address = $2")
-                .bind(&state)
-                .bind(&address)
-                .execute(pool)
-                .await?;
-        }
-    }
-
-    Ok(())
-}
-</file>
-
-<file path="src/sor.rs">
-use axum::{Json, extract::State};
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use sqlx::PgPool;
-use std::env;
-use uuid::Uuid;
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[allow(non_snake_case)]
-pub struct UtxoInput {
-    pub transactionId: String,
-    pub index: u32,
-    pub amount: f64,
-    pub scriptPublicKey: String,
-}
-
-#[derive(Deserialize, Debug)]
-#[allow(non_snake_case)]
-pub struct SorExecuteRequest {
-    pub wallet: String,
-    pub payAsset: String,
-    pub receiveAsset: String,
-    pub amount: f64,
-    pub slippageTolerance: Option<f64>,
-    pub utxos: Option<Vec<UtxoInput>>,
-}
-
-#[derive(Serialize, Debug)]
-#[allow(non_snake_case)]
-pub struct WaterfallLeg {
-    pub tier: u32,
-    pub provider: String,
-    pub filledAmount: f64,
-    pub executionRate: f64,
-    pub marginCaptured: f64,
-}
-
-#[derive(Serialize, Debug)]
-#[allow(non_snake_case)]
-pub struct SorExecutionPlan {
-    pub totalAmount: f64,
-    pub unifiedRate: f64,
-    pub estimatedOutput: f64,
-    pub legs: Vec<WaterfallLeg>,
-    pub transaction_uuid: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub psbt: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub formattedUtxos: Option<Vec<UtxoInput>>,
-}
-
-#[derive(Serialize)]
-pub struct SorError {
-    pub error: String,
-}
-
-// ⚡ Zero-Dependency Kaspa Address to P2PKH/Schnorr Script Decoder
-fn decode_address_to_script(address: &str) -> Result<String, String> {
-    let parts: Vec<&str> = address.split(':').collect();
-    if parts.len() != 2 { return Err("Invalid address format".to_string()); }
-    
-    let base32 = parts[1];
-    if base32.len() < 8 { return Err("Address too short".to_string()); }
-    
-    let charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
-    let mut decoded = Vec::new();
-    for c in base32[..base32.len()-8].chars() {
-        if let Some(idx) = charset.find(c) {
-            decoded.push(idx as u8);
-        } else {
-            return Err("Invalid base32 char".to_string());
-        }
-    }
-    
-    let mut out = Vec::new();
-    let mut val = 0u32;
-    let mut bits = 0;
-    for &d in &decoded {
-        val = (val << 5) | (d as u32);
-        bits += 5;
-        while bits >= 8 {
-            bits -= 8;
-            out.push((val >> bits) as u8);
-        }
-    }
-    
-    if out.len() < 33 {
-        let clean = address.replace("kaspa:", "");
-        let hex_val = hex::encode(clean);
-        let truncated = if hex_val.len() > 64 { &hex_val[0..64] } else { &hex_val };
-        return Ok(format!("20{}ac", truncated));
-    }
-    
-    let pubkey = &out[1..33];
-    let mut hex_str = String::new();
-    for byte in pubkey {
-        use std::fmt::Write;
-        write!(&mut hex_str, "{:02x}", byte).unwrap();
-    }
-    Ok(format!("20{}ac", hex_str))
-}
-
-pub async fn handle_sor_execute(
-    State(_pool): State<PgPool>,
-    Json(payload): Json<SorExecuteRequest>,
-) -> Result<Json<SorExecutionPlan>, Json<SorError>> {
-    tracing::info!("🔒 SOR Executing Live API Swap for: {}", payload.wallet);
-
-    let client = Client::new();
-    let pair = format!("{}_{}", payload.payAsset, payload.receiveAsset).to_uppercase();
-    
-    let redis_client = redis::Client::open("redis://127.0.0.1/").unwrap();
-    let mut redis_conn = redis_client.get_multiplexed_async_connection().await.unwrap();
-
-    let spot_rate_str: Option<String> = redis::cmd("GET")
-        .arg(format!("oracle:spot:{}", pair))
-        .query_async(&mut redis_conn)
-        .await.unwrap_or(None);
-    let spot_rate: f64 = spot_rate_str.unwrap_or_else(|| "1.0".to_string()).parse().unwrap_or(1.0);
-
-    let mut remaining_amount = payload.amount;
-    let mut total_estimated_output = 0.0;
-    let mut legs = Vec::new();
-    
-    let min_chainge_tokens = 15.0 / spot_rate;
-    let min_changenow_tokens = 50.0 / spot_rate;
-
-    let corp_kas = env::var("PERENNIA_TREASURY_KAS_ADDRESS").unwrap_or_else(|_| "kaspa:qpd3r7z43r1x0pn3y26k2yp4r7z43r1x0pn3y26k2yp4r7z0q5qqp2".to_string());
-    let corp_eth = "0x71C7656EC7ab88b098defB751B7401B5f6d8976F".to_string();
-
-    // ==========================================================
-    // TIER 1: PERENNIA TREASURY (Internal Fast-Settlement)
-    // ==========================================================
-    let treasury_bal_str: Option<String> = redis::cmd("HGET")
-        .arg("dev:sor:treasury:balances:admin")
-        .arg(&payload.receiveAsset)
-        .query_async(&mut redis_conn)
-        .await.unwrap_or(None);
-    let treasury_bal: f64 = treasury_bal_str.unwrap_or_else(|| "0".to_string()).parse().unwrap_or(0.0);
-
-    if treasury_bal > 0.0 && remaining_amount > 0.0 {
-        let fillable = treasury_bal.min(remaining_amount);
-        let treasury_rate = spot_rate * 0.985;
-        let output = fillable * treasury_rate;
-
-        legs.push(WaterfallLeg {
-            tier: 1,
-            provider: "Perennia Treasury".to_string(),
-            filledAmount: fillable,
-            executionRate: treasury_rate,
-            marginCaptured: fillable * spot_rate * 0.015,
-        });
-
-        remaining_amount -= fillable;
-        total_estimated_output += output;
-    }
-
-    // ==========================================================
-    // TIER 2: KASPLEX KRC-20 (Decentralized Overflow AMM)
-    // ==========================================================
-    if remaining_amount > 0.0 {
-        let kasplex_res = client.get(&format!("https://api.kasplex.org/v1/krc20/token/{}", payload.receiveAsset))
-            .send().await;
-        
-        let mut kasplex_depth = 0.0;
-        if let Ok(res) = kasplex_res {
-            if let Ok(data) = res.json::<serde_json::Value>().await {
-                if let Some(minted) = data.get("result").and_then(|r| r.get(0)).and_then(|m| m.get("max")).and_then(|m| m.as_str()) {
-                    kasplex_depth = minted.parse::<f64>().unwrap_or(0.0) * 0.01; 
-                }
-            }
-        }
-
-        if kasplex_depth > 0.0 {
-            let fillable = kasplex_depth.min(remaining_amount);
-            if fillable > 0.0 {
-                let rate = spot_rate * 0.997; 
-                let output = fillable * rate;
-
-                legs.push(WaterfallLeg {
-                    tier: 2,
-                    provider: "Kasplex KRC-20".to_string(),
-                    filledAmount: fillable,
-                    executionRate: rate,
-                    marginCaptured: 0.0,
-                });
-
-                remaining_amount -= fillable;
-                total_estimated_output += output;
-            }
-        }
-    }
-
-    // ==========================================================
-    // TIER 3: CHAINGE FINANCE (Cross-Chain Bridging AMM)
-    // ==========================================================
-    if remaining_amount >= min_chainge_tokens {
-        let chainge_api_key = env::var("CHAINGE_API_KEY").unwrap_or_default();
-        let chainge_req = json!({
-            "fromChain": "KASPA", "toChain": "ETHEREUM",
-            "fromToken": "KAS", "toToken": "USDC",
-            "userAddress": payload.wallet,
-            "amount": remaining_amount * 0.5 
-        });
-        
-        let chainge_res = client.post("https://api.chainge.finance/v1/crosschain/address")
-            .header("Authorization", format!("Bearer {}", chainge_api_key))
-            .json(&chainge_req)
-            .send().await;
-
-        if let Ok(res) = chainge_res {
-            if let Ok(data) = res.json::<serde_json::Value>().await {
-                if let Some(_addr) = data.get("depositAddress").and_then(|a| a.as_str()) {
-                    let fillable = remaining_amount * 0.5;
-                    let rate = spot_rate * 0.995;
-                    let output = fillable * rate;
-
-                    legs.push(WaterfallLeg {
-                        tier: 3,
-                        provider: "Chainge AMM".to_string(),
-                        filledAmount: fillable,
-                        executionRate: rate,
-                        marginCaptured: 0.0,
-                    });
-
-                    remaining_amount -= fillable;
-                    total_estimated_output += output;
-                }
-            }
-        }
-    }
-
-    // ==========================================================
-    // TIER 4: CHANGENOW (Whale Router Fallback Live API)
-    // ==========================================================
-    if remaining_amount >= min_changenow_tokens {
-        let changenow_key = env::var("CHANGENOW_API_KEY").unwrap_or_default();
-        let cnow_req = json!({
-            "fromCurrency": "kas", "toCurrency": "usdc",
-            "fromNetwork": "kas", "toNetwork": "eth",
-            "fromAmount": remaining_amount,
-            "address": corp_eth,
-            "flow": "standard"
-        });
-
-        let cnow_res = client.post("https://api.changenow.io/v2/exchange")
-            .header("x-changenow-api-key", changenow_key)
-            .json(&cnow_req)
-            .send().await;
-
-        if let Ok(res) = cnow_res {
-            if let Ok(data) = res.json::<serde_json::Value>().await {
-                if let Some(_addr) = data.get("payinAddress").and_then(|a| a.as_str()) {
-                    let fillable = remaining_amount;
-                    let rate = spot_rate * 0.985;
-                    let output = fillable * rate;
-
-                    legs.push(WaterfallLeg {
-                        tier: 4,
-                        provider: "ChangeNOW Aggregator".to_string(),
-                        filledAmount: fillable,
-                        executionRate: rate,
-                        marginCaptured: 0.0,
-                    });
-
-                    remaining_amount = 0.0;
-                    total_estimated_output += output;
-                }
-            }
-        }
-    }
-
-    if legs.is_empty() && payload.amount > 0.0 {
-        return Err(Json(SorError { error: "Liquidity Exhausted. No hard-routing paths available on-chain.".to_string() }));
-    }
-
-    let filled_amount = payload.amount - remaining_amount;
-    let unified_rate = if filled_amount > 0.0 { total_estimated_output / filled_amount } else { 0.0 };
-    let tx_uuid = Uuid::new_v4().to_string();
-
-    let mut psbt = None;
-
-    // ==========================================================
-    // PSBT CONSTRUCTION FOR HARD ZERO-TRUST HONEYCOMB EXECUTION
-    // ==========================================================
-    if let Some(utxos) = &payload.utxos {
-        let target_amount_sompi = (filled_amount * 1e8).floor() as u64;
-        let fee_sompi = 10000;
-        let total_required = target_amount_sompi + fee_sompi;
-
-        let mut gathered_sompi = 0;
-        let mut tx_inputs = Vec::new();
-
-        for utxo in utxos {
-            tx_inputs.push(json!({
-                "previousOutpoint": {
-                    "transactionId": utxo.transactionId,
-                    "index": utxo.index
-                },
-                "signatureScript": "",
-                "sequence": 0,
-                "sigOpCount": 1
-            }));
-            gathered_sompi += utxo.amount as u64;
-            if gathered_sompi >= total_required {
-                break;
-            }
-        }
-
-        if gathered_sompi < total_required {
-            return Err(Json(SorError { error: format!("ERR_INSUFFICIENT_MASS: Required {}, Found {}", total_required, gathered_sompi) }));
-        }
-
-        let mut tx_outputs = Vec::new();
-
-        for leg in &legs {
-            let leg_sompi = (leg.filledAmount * 1e8).floor() as u64;
-            if leg_sompi == 0 { continue; }
-
-            let mut dest_address = String::new();
-            match leg.tier {
-                1 => dest_address = corp_kas.clone(),
-                2 => dest_address = "kaspa:kasplex_krc20_router_inbound".to_string(),
-                3 => dest_address = "kaspa:chainge_finance_bridge_fallback".to_string(), // In production we persist the response address here
-                4 => dest_address = "kaspa:changenow_whale_fallback".to_string(),
-                _ => {}
-            }
-
-            let script_pub_key = decode_address_to_script(&dest_address)
-                .unwrap_or_else(|_| "200000000000000000000000000000000000000000000000000000000000000000ac".to_string());
-
-            tx_outputs.push(json!({
-                "amount": leg_sompi as u64,
-                "scriptPublicKey": script_pub_key,
-                "_metadata": { "provider": leg.provider, "tier": leg.tier }
-            }));
-        }
-
-        let change_sompi = gathered_sompi - total_required;
-        if change_sompi > 0 {
-            tx_outputs.push(json!({
-                "amount": change_sompi as u64,
-                "scriptPublicKey": decode_address_to_script(&payload.wallet).unwrap_or_else(|_| "200000000000000000000000000000000000000000000000000000000000000000ac".to_string()),
-                "_metadata": { "type": "change" }
-            }));
-        }
-
-        psbt = Some(json!({
-            "version": 0,
-            "inputs": tx_inputs,
-            "outputs": tx_outputs,
-            "lockTime": 0,
-            "subnetworkId": "0000000000000000000000000000000000000000",
-            "gas": 0,
-            "payload": "",
-            "mass": 0,
-            "storageMass": 0
-        }));
-    }
-
-    Ok(Json(SorExecutionPlan {
-        totalAmount: filled_amount,
-        unifiedRate: unified_rate,
-        estimatedOutput: total_estimated_output,
-        legs,
-        transaction_uuid: tx_uuid,
-        psbt,
-        formattedUtxos: payload.utxos.clone(),
-    }))
-}
-</file>
-
 <file path=".envecho">
 
 </file>
@@ -2394,6 +1943,1200 @@ impl JobManager {
 }
 </file>
 
+<file path="src/chronos.rs">
+use std::time::Duration;
+use sqlx::{PgPool, Row};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use reqwest::Client;
+
+const NETWORK_FEE_PERCENTAGE: f64 = 0.015; 
+const MINIMUM_UTXO_SWEEP_THRESHOLD: f64 = 0.0005; 
+const OVERCLOCK_BASE_FEE: f64 = 0.0001;
+const OVERCLOCK_VAR_FEE: f64 = 0.005;
+const OVERCLOCK_PREMIUM_FEE: f64 = 0.005;
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct NettingOrder {
+    pub wallet: String,
+    pub direction: String, 
+    pub amount_kas: f64,
+    pub spot_price: f64,
+    pub fee_captured_usd: f64,
+}
+
+async fn get_spot_price(redis_conn: &mut redis::aio::MultiplexedConnection, ticker: &str) -> f64 {
+    if ticker == "USDC" || ticker == "USDT" || ticker == "USD" { return 1.0; }
+    let key = format!("oracle:spot:{}_USDC", ticker);
+    let val_str: Option<String> = redis::cmd("GET").arg(&key).query_async(redis_conn).await.unwrap_or(None);
+    if let Some(v) = val_str {
+        v.parse().unwrap_or(0.0)
+    } else {
+        0.0
+    }
+}
+
+pub async fn start_delta_netting_engine(redis_client: redis::Client) {
+    tracing::info!("🕸️ Dark Pool Netting Engine Online. Batching internal liquidity every 10 seconds.");
+
+    let mut redis_conn = match redis_client.get_multiplexed_async_connection().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Netting Engine Redis failure: {}", e);
+            return;
+        }
+    };
+
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+
+    loop {
+        interval.tick().await;
+
+        let mut current_batch = Vec::new();
+
+        loop {
+            let result: redis::RedisResult<Option<String>> = redis::cmd("LPOP")
+                .arg("perennia:sor:netting_queue")
+                .query_async(&mut redis_conn)
+                .await;
+
+            match result {
+                Ok(Some(order_json)) => {
+                    if let Ok(order) = serde_json::from_str::<NettingOrder>(&order_json) {
+                        current_batch.push(order);
+                    }
+                }
+                Ok(None) => break, 
+                Err(_) => break,
+            }
+        }
+
+        if current_batch.is_empty() {
+            continue;
+        }
+
+        let mut total_buy_kas = 0.0;
+        let mut total_sell_kas = 0.0;
+        let mut gross_volume_kas = 0.0;
+        let mut total_fees_usd = 0.0;
+
+        for order in &current_batch {
+            gross_volume_kas += order.amount_kas;
+            total_fees_usd += order.fee_captured_usd;
+
+            if order.direction == "BUY_KAS" {
+                total_buy_kas += order.amount_kas;
+            } else if order.direction == "SELL_KAS" {
+                total_sell_kas += order.amount_kas;
+            }
+        }
+
+        let net_delta = (total_buy_kas - total_sell_kas).abs();
+        let dominant_direction = if total_buy_kas > total_sell_kas { "BUY_HEAVY" } else { "SELL_HEAVY" };
+
+        tracing::info!(
+            "🦇 [DARK POOL BATCH CLEARED] Gross: {:.2} KAS | Net Delta: {:.2} KAS ({}) | Spread Profit: ${:.2}",
+            gross_volume_kas, net_delta, dominant_direction, total_fees_usd
+        );
+
+        if total_fees_usd > 0.0 {
+            let _: () = redis::cmd("INCRBYFLOAT")
+                .arg("perennia:treasury:netting_profit_usd")
+                .arg(total_fees_usd)
+                .query_async(&mut redis_conn)
+                .await
+                .unwrap_or(());
+        }
+
+        if net_delta > 0.0 {
+            tracing::info!("   -> L1 Physical Settlement Required: Moving {:.2} KAS to balance treasury.", net_delta);
+        } else {
+            tracing::info!("   -> Perfect Equilibrium. Zero L1 settlement required. 100% margin retained.");
+        }
+    }
+}
+
+pub async fn start_chronos_daemon(pool: PgPool) {
+    tracing::info!("⏳ Chronos Settlement Engine Online. Natively monitoring Omni-Chain Ledger via Postgres.");
+    
+    let _ = sqlx::query("ALTER TABLE yield_reservoirs ADD COLUMN IF NOT EXISTS lp_tokens JSONB DEFAULT '{}'::jsonb")
+        .execute(&pool)
+        .await;
+
+    let redis_client = redis::Client::open("redis://127.0.0.1/").expect("Failed to connect to Redis for Chronos");
+    let http_client = Client::new();
+
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+
+    loop {
+        interval.tick().await;
+        if let Err(e) = execute_settlement_tick(&pool, &redis_client, &http_client).await {
+            tracing::error!("🚨 Chronos Execution Error: {}", e);
+        }
+    }
+}
+
+async fn execute_settlement_tick(
+    pool: &PgPool, 
+    redis_client: &redis::Client, 
+    http_client: &Client
+) -> anyhow::Result<()> {
+    let mut redis_conn = redis_client.get_multiplexed_async_connection().await?;
+
+    // Pull dynamic variables from the node's telemetry
+    let network_diff_str: Option<String> = redis::cmd("GET").arg("pool:network_diff").query_async(&mut redis_conn).await.unwrap_or(None);
+    let block_reward_str: Option<String> = redis::cmd("GET").arg("pool:block_reward").query_async(&mut redis_conn).await.unwrap_or(None);
+    
+    // ⚡ STRICT PPS LOCKDOWN: If the node drops and we lose our live metrics, abort the settlement tick entirely.
+    // Do not guess the block reward or difficulty. Wait for the node to reconnect.
+    if network_diff_str.is_none() || block_reward_str.is_none() {
+        tracing::warn!("⚠️ L1 Node Metrics Unreachable. Pausing Chronos Yield Settlement to protect PPS integrity.");
+        return Ok(());
+    }
+
+    let network_diff: f64 = network_diff_str.unwrap().parse::<f64>().unwrap_or(1.0).max(1.0);
+    let mut block_reward: f64 = block_reward_str.unwrap().parse().unwrap_or(2.31);
+    
+    // Fail-safe: A block reward of 0 means the network has completed its emission schedule (Year 2057+).
+    if block_reward <= 0.0 {
+        tracing::warn!("⚠️ Block reward is 0. Yield emissions have concluded.");
+        return Ok(());
+    }
+    
+    let hashes_per_share_diff = 4_294_967_296.0;
+    let reward_per_diff_unit = (hashes_per_share_diff / network_diff) * block_reward;
+
+    let addresses: Vec<String> = sqlx::query("SELECT wallet_address FROM user_command_centers")
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|row| row.get("wallet_address"))
+        .collect();
+
+    for address in addresses {
+        // ⚡ PHASE 1: ASYNC PRE-CALCULATION (No DB Locks Held Here)
+        let state_row = sqlx::query("SELECT layout_state FROM user_command_centers WHERE wallet_address = $1")
+            .bind(&address)
+            .fetch_optional(pool)
+            .await?;
+
+        let mut state: Value = match state_row {
+            Some(row) => row.get("layout_state"),
+            None => continue,
+        };
+        
+        let workers_opt = state.get_mut("workers").and_then(|w| w.as_array_mut());
+        if workers_opt.is_none() {
+            continue;
+        }
+
+        let is_overclocked = state.get("systemMode").and_then(|v| v.as_str()) == Some("overclocked");
+        let escrow_active = state.pointer("/taxFortress/escrowActive").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        // Map out existing balances before calculation
+        let mut silo_pending_map: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        if let Some(silos) = state.get("silos").and_then(|s| s.as_array()) {
+            for silo in silos {
+                if let (Some(id), Some(p)) = (silo.get("id").and_then(|v| v.as_str()), silo.get("pendingKaspa").and_then(|v| v.as_f64())) {
+                    silo_pending_map.insert(id.to_string(), p);
+                }
+            }
+        }
+
+        let mut unassigned_yield = 0.0;
+
+        // Process hardware shares and block payouts
+        if let Some(workers) = state.get_mut("workers").and_then(|w| w.as_array_mut()) {
+            for worker in workers.iter_mut() {
+                let assigned_silo_id = worker.get("assignedSiloId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let w_type = worker.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let mut earned_kaspa = 0.0;
+
+                if w_type == "physical" {
+                    let wallet_worker = worker.get("walletWorker").and_then(|v| v.as_str()).unwrap_or("");
+                    if !wallet_worker.is_empty() {
+                        let share_key = format!("worker:{}:shares", wallet_worker);
+                        let block_key = format!("worker:{}:blocks_unpaid", wallet_worker); 
+                        
+                        let unprocessed_str: Option<String> = redis::cmd("GET").arg(&share_key).query_async(&mut redis_conn).await.unwrap_or(None);
+                        let unprocessed: f64 = unprocessed_str.unwrap_or_else(|| "0".to_string()).parse().unwrap_or(0.0);
+
+                        let unpaid_blocks_str: Option<String> = redis::cmd("GET").arg(&block_key).query_async(&mut redis_conn).await.unwrap_or(None);
+                        let unpaid_blocks: f64 = unpaid_blocks_str.unwrap_or_else(|| "0".to_string()).parse().unwrap_or(0.0);
+
+                        // ⚡ Pay Per Share (PPS) execution
+                        if unprocessed > 0.0 {
+                            earned_kaspa += unprocessed * reward_per_diff_unit;
+                            let _: () = redis::cmd("SET").arg(&share_key).arg("0").query_async(&mut redis_conn).await.unwrap_or(());
+                        }
+
+                        // ⚡ Eradicate the Double-Dip: Do NOT award duplicate synthetic Kaspa
+                        if unpaid_blocks > 0.0 {
+                            let _: () = redis::cmd("SET").arg(&block_key).arg("0").query_async(&mut redis_conn).await.unwrap_or(());
+                            tracing::info!("💎 [BLOCK FOUND] {} found {} blocks for the pool!", wallet_worker, unpaid_blocks);
+                        }
+                    }
+                }
+
+                if earned_kaspa > 0.0 {
+                    if !assigned_silo_id.is_empty() {
+                        if let Some(p) = silo_pending_map.get_mut(&assigned_silo_id) {
+                            *p += earned_kaspa;
+                        }
+                    } else {
+                        unassigned_yield += earned_kaspa;
+                    }
+                }
+            }
+        }
+
+        if unassigned_yield > 0.0 {
+            let _ = sqlx::query!(
+                "INSERT INTO yield_reservoirs (wallet_address, streaming_balance_kas, total_yield_kas) 
+                 VALUES ($1, $2::FLOAT8, $2::FLOAT8) 
+                 ON CONFLICT (wallet_address) DO UPDATE SET 
+                 streaming_balance_kas = yield_reservoirs.streaming_balance_kas + EXCLUDED.streaming_balance_kas, 
+                 total_yield_kas = yield_reservoirs.total_yield_kas + EXCLUDED.total_yield_kas, 
+                 last_updated = CURRENT_TIMESTAMP",
+                address, unassigned_yield
+            ).execute(pool).await;
+
+            let kas_spot_price = get_spot_price(&mut redis_conn, "KAS").await;
+            let _ = sqlx::query!(
+                "INSERT INTO tax_ledger_events (wallet_address, asset_ticker, event_type, gross_proceeds_usd, amount_tokens, spot_price_at_execution)
+                 VALUES ($1, 'KAS', 'YIELD', $2::FLOAT8, $3::FLOAT8, $4::FLOAT8)",
+                address, unassigned_yield * kas_spot_price, unassigned_yield, kas_spot_price
+            ).execute(pool).await;
+            
+            tracing::info!("🚜 [THE FIELD] Directly credited {:.8} KAS to {}", unassigned_yield, address);
+        }
+
+        // Apply Overclock Micro-Fee Interceptor
+        if is_overclocked {
+            let mut total_tick_fee = OVERCLOCK_BASE_FEE;
+            for pending in silo_pending_map.values_mut() {
+                if *pending > 0.0 {
+                    let var_fee = *pending * OVERCLOCK_VAR_FEE;
+                    let deduction = pending.min(total_tick_fee + var_fee);
+                    
+                    if deduction > 0.0 {
+                        *pending -= deduction;
+                        total_tick_fee = (total_tick_fee - deduction).max(0.0);
+                        
+                        let _: () = redis::cmd("INCRBYFLOAT")
+                            .arg("perennia:fees:batch_accumulated:KAS")
+                            .arg(deduction)
+                            .query_async(&mut redis_conn)
+                            .await
+                            .unwrap_or(());
+                    }
+                }
+            }
+        }
+
+        let mut plant_liquidity_updates = std::collections::HashMap::new();
+
+        // Perform Plant LP Synthesis via sorEngine API
+        if let Some(plants) = state.get("plants").and_then(|p| p.as_array()) {
+            for plant in plants {
+                let plant_id = plant.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let plant_name = plant.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                
+                let mut assigned_silos = Vec::new();
+                if let Some(silos) = state.get("silos").and_then(|s| s.as_array()) {
+                    for silo in silos {
+                        if silo.get("assignedPlantId").and_then(|v| v.as_str()).unwrap_or("") == plant_id {
+                            assigned_silos.push(silo.clone());
+                        }
+                    }
+                }
+
+                if assigned_silos.len() == 2 {
+                    let id1 = assigned_silos[0].get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let id2 = assigned_silos[1].get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+                    let p1 = *silo_pending_map.get(&id1).unwrap_or(&0.0);
+                    let p2 = *silo_pending_map.get(&id2).unwrap_or(&0.0);
+
+                    if p1 >= MINIMUM_UTXO_SWEEP_THRESHOLD && p2 >= MINIMUM_UTXO_SWEEP_THRESHOLD {
+                        let t1 = assigned_silos[0].pointer("/settlementConfig/targetAsset/ticker").and_then(|t| t.as_str()).unwrap_or("USDC").to_string();
+                        let t2 = assigned_silos[1].pointer("/settlementConfig/targetAsset/ticker").and_then(|t| t.as_str()).unwrap_or("USDC").to_string();
+                        
+                        silo_pending_map.insert(id1.clone(), 0.0);
+                        silo_pending_map.insert(id2.clone(), 0.0);
+
+                        let mut executed_assets = Vec::new();
+                        let mut total_lp_usd_value = 0.0;
+
+                        let amt1 = if is_overclocked { p1 - (p1 * OVERCLOCK_PREMIUM_FEE) } else { p1 };
+                        let amt2 = if is_overclocked { p2 - (p2 * OVERCLOCK_PREMIUM_FEE) } else { p2 };
+
+                        tracing::info!("\n🌱 [CHRONOS SYNTHESIS] Auto-LP Intercept on Plant: {}", plant_name);
+
+                        for (amt, target) in [(amt1, &t1), (amt2, &t2)] {
+                            let req_payload = json!({ "wallet": address, "payAsset": "KAS", "receiveAsset": target, "amount": amt, "slippageTolerance": 0.05 });
+                            if let Ok(res) = http_client.post("http://127.0.0.1:8002/v1/sor/execute").json(&req_payload).send().await {
+                                if let Ok(data) = res.json::<Value>().await {
+                                    if let Some(est) = data.get("estimatedOutput").and_then(|v| v.as_f64()) {
+                                        let final_settled = est * (1.0 - NETWORK_FEE_PERCENTAGE);
+                                        let fee = est * NETWORK_FEE_PERCENTAGE;
+                                        executed_assets.push((target.clone(), final_settled, fee));
+                                        let spot_price = get_spot_price(&mut redis_conn, target).await;
+                                        total_lp_usd_value += final_settled * spot_price;
+                                    }
+                                }
+                            }
+                        }
+
+                        let clean_address = address.replace("kaspa:", "");
+                        let user_ledger_key = format!("dev:sor:treasury:balances:{}", clean_address);
+                        let lp_pair_name = format!("{}/{} LP", t1, t2);
+
+                        for (target, _settled, fee) in executed_assets {
+                            let batch_fee_key = format!("perennia:fees:batch_accumulated:{}", target);
+                            let _: () = redis::cmd("INCRBYFLOAT").arg(&batch_fee_key).arg(fee).query_async(&mut redis_conn).await.unwrap_or(());
+                        }
+
+                        let _: () = redis::cmd("HINCRBYFLOAT").arg(&user_ledger_key).arg(&lp_pair_name).arg(total_lp_usd_value).query_async(&mut redis_conn).await.unwrap_or(());
+
+                        let _ = sqlx::query(
+                            r#"INSERT INTO yield_reservoirs (wallet_address, streaming_balance_kas, total_yield_kas, lp_tokens) 
+                               VALUES ($1, 0.0, 0.0, jsonb_build_object($2::text, $3::float8))
+                               ON CONFLICT (wallet_address) DO UPDATE SET 
+                               lp_tokens = jsonb_set(COALESCE(yield_reservoirs.lp_tokens, '{}'::jsonb), ARRAY[$2::text], to_jsonb(COALESCE((yield_reservoirs.lp_tokens->>$2::text)::numeric, 0.0) + $3::numeric)), last_updated = CURRENT_TIMESTAMP"#
+                        ).bind(&address).bind(&lp_pair_name).bind(total_lp_usd_value).execute(pool).await;
+
+                        tracing::info!("   -> 💧 Liquidity Provision Physics Executed: Minted {:.2} {} LP tokens.", total_lp_usd_value, lp_pair_name);
+
+                        let current_usd = plant.pointer("/liquidityDeposit/totalLiquidityUsd").and_then(|v| v.as_f64()).unwrap_or(0.0) + total_lp_usd_value;
+                        let multiplier = plant.pointer("/liquidityDeposit/multiplier").and_then(|v| v.as_f64()).unwrap_or(1.0);
+                        let apr = 14.2 * multiplier;
+                        
+                        plant_liquidity_updates.insert(plant_id.to_string(), (current_usd, true, lp_pair_name, apr));
+                    }
+                }
+            }
+        }
+
+        // Perform Standalone Silo Auto Payouts via sorEngine API
+        if let Some(silos) = state.get("silos").and_then(|s| s.as_array()) {
+            for silo in silos {
+                if silo.get("assignedPlantId").map_or(false, |id| !id.is_null()) {
+                    continue;
+                }
+
+                if let Some(id) = silo.get("id").and_then(|v| v.as_str()) {
+                    let auto_payout = silo.pointer("/settlementConfig/autoPayout").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let pending = *silo_pending_map.get(id).unwrap_or(&0.0);
+
+                    if auto_payout && pending >= MINIMUM_UTXO_SWEEP_THRESHOLD {
+                        let threshold = silo.pointer("/settlementConfig/threshold").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let mode = silo.pointer("/settlementConfig/mode").and_then(|v| v.as_str()).unwrap_or("");
+
+                        if mode == "stream" || (mode == "threshold" && pending >= threshold) {
+                            let target_ticker = silo.pointer("/settlementConfig/targetAsset/ticker").and_then(|t| t.as_str()).unwrap_or("KAS").to_string();
+                            let silo_name = silo.get("name").and_then(|n| n.as_str()).unwrap_or("Unknown").to_string();
+                            
+                            tracing::info!("\n💸 [CHRONOS EXECUTION] Settling Standalone Silo: {}", silo_name);
+
+                            let mut amount_to_route = pending;
+                            if escrow_active {
+                                let tax_withholding = pending * 0.15;
+                                amount_to_route = pending - tax_withholding;
+                                
+                                let tax_req = json!({ "wallet": address, "payAsset": "KAS", "receiveAsset": "USDC", "amount": tax_withholding, "slippageTolerance": 0.05 });
+                                if let Ok(res) = http_client.post("http://127.0.0.1:8002/v1/sor/execute").json(&tax_req).send().await {
+                                    if let Ok(data) = res.json::<Value>().await {
+                                        if let Some(est) = data.get("estimatedOutput").and_then(|v| v.as_f64()) {
+                                            let final_settled = est * (1.0 - NETWORK_FEE_PERCENTAGE);
+                                            let clean_address = address.replace("kaspa:", "");
+                                            let escrow_ledger_key = format!("dev:escrow:locked_balances:{}", clean_address);
+                                            let _: () = redis::cmd("HINCRBYFLOAT").arg(&escrow_ledger_key).arg("USDC").arg(final_settled).query_async(&mut redis_conn).await.unwrap_or(());
+                                            tracing::info!("🔒 [TAX FORTRESS] Intercepted {:.8} KAS into Escrow LP ({:.2} USDC). Locked until April 15.", tax_withholding, final_settled);
+                                        }
+                                    }
+                                }
+                            }
+
+                            let req_payload = json!({ "wallet": address, "payAsset": "KAS", "receiveAsset": target_ticker, "amount": amount_to_route, "slippageTolerance": 0.05 });
+                            let host_api = if target_ticker == "USD" { "http://127.0.0.1:3000/api/sor/yield_settle" } else { "http://127.0.0.1:8002/v1/sor/execute" };
+
+                            if let Ok(res) = http_client.post(host_api).json(&req_payload).send().await {
+                                if let Ok(data) = res.json::<Value>().await {
+                                    if let Some(est) = data.get("estimatedOutput").and_then(|v| v.as_f64()) {
+                                        let dynamic_system_fee = if is_overclocked { NETWORK_FEE_PERCENTAGE + 0.005 } else { NETWORK_FEE_PERCENTAGE };
+                                        let final_settled = est * (1.0 - dynamic_system_fee);
+                                        let fee = est * dynamic_system_fee;
+                                        
+                                        let clean_address = address.replace("kaspa:", "");
+                                        let user_ledger_key = format!("dev:sor:treasury:balances:{}", clean_address);
+                                        
+                                        if target_ticker != "USD" {
+                                            let _: () = redis::cmd("HINCRBYFLOAT").arg(&user_ledger_key).arg(&target_ticker).arg(final_settled).query_async(&mut redis_conn).await.unwrap_or(());
+                                            let batch_fee_key = format!("perennia:fees:batch_accumulated:{}", target_ticker);
+                                            let _: () = redis::cmd("INCRBYFLOAT").arg(&batch_fee_key).arg(fee).query_async(&mut redis_conn).await.unwrap_or(());
+                                        }
+                                        
+                                        tracing::info!("   -> Routed {:.8} KAS into {:.6} {} via sorEngine.", amount_to_route, final_settled, target_ticker);
+                                        silo_pending_map.insert(id.to_string(), 0.0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+
+        // ====================================================================
+        // ⚡ PHASE 2: SURGICAL DB MERGE (Sub-Millisecond Row Lock)
+        // ====================================================================
+        // Instead of saving our old 'state' back, we pull the absolute latest 
+        // structural state from the UI to ensure we never overwrite Svelte deletes.
+        
+        let mut tx = pool.begin().await?;
+
+        let latest_row = sqlx::query("SELECT layout_state FROM user_command_centers WHERE wallet_address = $1 FOR UPDATE")
+            .bind(&address)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+        if let Some(row) = latest_row {
+            let mut final_state: Value = row.get("layout_state");
+            let mut state_mutated = false;
+
+            // Surgically inject Silo Yields
+            if let Some(silos) = final_state.get_mut("silos").and_then(|s| s.as_array_mut()) {
+                for silo in silos.iter_mut() {
+                    if let Some(id) = silo.get("id").and_then(|v| v.as_str()) {
+                        if let Some(new_pending) = silo_pending_map.get(id) {
+                            if silo.get("pendingKaspa").and_then(|v| v.as_f64()) != Some(*new_pending) {
+                                silo["pendingKaspa"] = json!(*new_pending);
+                                state_mutated = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Surgically inject Plant Liquidity Data
+            if let Some(plants) = final_state.get_mut("plants").and_then(|p| p.as_array_mut()) {
+                for plant in plants.iter_mut() {
+                    if let Some(id) = plant.get("id").and_then(|v| v.as_str()) {
+                        if let Some((usd, active, pair, apr)) = plant_liquidity_updates.get(id) {
+                            if let Some(ld) = plant.get_mut("liquidityDeposit").and_then(|v| v.as_object_mut()) {
+                                ld.insert("totalLiquidityUsd".to_string(), json!(*usd));
+                                ld.insert("isActive".to_string(), json!(*active));
+                                ld.insert("pairName".to_string(), json!(pair));
+                            }
+                            plant["currentApr"] = json!(*apr);
+                            state_mutated = true;
+                        }
+                    }
+                }
+            }
+
+            if state_mutated {
+                sqlx::query("UPDATE user_command_centers SET layout_state = $1, last_updated = CURRENT_TIMESTAMP WHERE wallet_address = $2")
+                    .bind(&final_state)
+                    .bind(&address)
+                    .execute(&mut *tx)
+                    .await?;
+
+                let mut silo_yields = Vec::new();
+                if let Some(silos) = final_state.get("silos").and_then(|s| s.as_array()) {
+                    for silo in silos {
+                        if let (Some(id), Some(pending)) = (silo.get("id").and_then(|v| v.as_str()), silo.get("pendingKaspa").and_then(|v| v.as_f64())) {
+                            silo_yields.push(json!({"id": id, "pendingKaspa": pending}));
+                        }
+                    }
+                }
+
+                let update_payload = json!({
+                    "yield_update": true,
+                    "wallet": address,
+                    "silos": silo_yields
+                });
+                
+                let _: () = redis::cmd("PUBLISH")
+                    .arg("telemetry:updates")
+                    .arg(update_payload.to_string())
+                    .query_async(&mut redis_conn)
+                    .await
+                    .unwrap_or(());
+            }
+        }
+        let _ = tx.commit().await;
+    }
+
+    Ok(())
+}
+</file>
+
+<file path="src/config.rs">
+use serde::Deserialize;
+use std::fs;
+use anyhow::{Context, Result};
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, Clone)]
+pub struct StratumConfig {
+    pub stratum_port: String,
+    pub kaspad_address: String,
+    pub mining_address: String,
+    pub starting_diff: f64,
+    pub min_share_diff: f64,
+    pub var_diff: bool,
+    pub shares_per_min: u32,
+    pub extranonce_size: usize,
+    pub prom_port: String,
+    pub print_stats: bool,
+}
+
+impl StratumConfig {
+    pub fn load(path: &str) -> Result<Self> {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file at {}", path))?;
+        
+        let config: StratumConfig = serde_yaml::from_str(&content)
+            .context("Failed to parse YAML configuration")?;
+            
+        if config.extranonce_size != 2 {
+            anyhow::bail!("FATAL ARCHITECTURE RULE: extranonce_size MUST be exactly 2.");
+        }
+            
+        Ok(config)
+    }
+}
+</file>
+
+<file path="src/sor.rs">
+use axum::{Json, extract::State};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sqlx::PgPool;
+use std::env;
+use uuid::Uuid;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[allow(non_snake_case)]
+pub struct UtxoInput {
+    pub transactionId: String,
+    pub index: u32,
+    pub amount: f64,
+    pub scriptPublicKey: String,
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(non_snake_case)]
+pub struct SorExecuteRequest {
+    pub wallet: String,
+    pub payAsset: String,
+    pub receiveAsset: String,
+    pub amount: f64,
+    pub slippageTolerance: Option<f64>,
+    pub utxos: Option<Vec<UtxoInput>>,
+    pub systemMode: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+#[allow(non_snake_case)]
+pub struct WaterfallLeg {
+    pub tier: u32,
+    pub provider: String,
+    pub filledAmount: f64,
+    pub executionRate: f64,
+    pub marginCaptured: f64,
+}
+
+#[derive(Serialize, Debug)]
+#[allow(non_snake_case)]
+pub struct SorExecutionPlan {
+    pub totalAmount: f64,
+    pub unifiedRate: f64,
+    pub estimatedOutput: f64,
+    pub legs: Vec<WaterfallLeg>,
+    pub transaction_uuid: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub psbt: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub formattedUtxos: Option<Vec<UtxoInput>>,
+}
+
+#[derive(Serialize)]
+pub struct SorError {
+    pub error: String,
+}
+
+fn decode_address_to_script(address: &str) -> Result<String, String> {
+    let parts: Vec<&str> = address.split(':').collect();
+    if parts.len() != 2 {
+        return Err("Invalid address format".to_string());
+    }
+    
+    let base32 = parts[1];
+    if base32.len() < 8 {
+        return Err("Address too short".to_string());
+    }
+    
+    let charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    let mut decoded = Vec::new();
+    for c in base32[..base32.len() - 8].chars() {
+        if let Some(idx) = charset.find(c) {
+            decoded.push(idx as u8);
+        } else {
+            return Err("Invalid base32 character".to_string());
+        }
+    }
+    
+    let mut out = Vec::new();
+    let mut val = 0u32;
+    let mut bits = 0;
+    for &d in &decoded {
+        val = (val << 5) | (d as u32);
+        bits += 5;
+        while bits >= 8 {
+            bits -= 8;
+            out.push((val >> bits) as u8);
+        }
+    }
+    
+    if out.len() < 33 {
+        let clean = address.replace("kaspa:", "");
+        let hex_val = hex::encode(clean);
+        let truncated = if hex_val.len() > 64 { &hex_val[0..64] } else { &hex_val };
+        return Ok(format!("20{}ac", truncated));
+    }
+    
+    let pubkey = &out[1..33];
+    let mut hex_str = String::new();
+    for byte in pubkey {
+        use std::fmt::Write;
+        write!(&mut hex_str, "{:02x}", byte).unwrap();
+    }
+    Ok(format!("20{}ac", hex_str))
+}
+
+async fn get_usd_price(redis_conn: &mut redis::aio::MultiplexedConnection, asset: &str) -> f64 {
+    if asset == "USDC" || asset == "USDT" || asset == "USD" {
+        return 1.0;
+    }
+    let key = format!("oracle:spot:{}_USDC", asset);
+    let val_str: Option<String> = redis::cmd("GET")
+        .arg(&key)
+        .query_async(redis_conn)
+        .await
+        .unwrap_or(None);
+        
+    if let Some(v) = val_str {
+        v.parse().unwrap_or(0.0)
+    } else {
+        0.0
+    }
+}
+
+pub async fn handle_sor_execute(
+    State(_pool): State<PgPool>,
+    Json(payload): Json<SorExecuteRequest>,
+) -> Result<Json<SorExecutionPlan>, Json<SorError>> {
+    let client = Client::new();
+    let redis_client = match redis::Client::open("redis://127.0.0.1/") {
+        Ok(c) => c,
+        Err(e) => return Err(Json(SorError { error: format!("Redis Error: {}", e) })),
+    };
+    let mut redis_conn = match redis_client.get_multiplexed_async_connection().await {
+        Ok(c) => c,
+        Err(e) => return Err(Json(SorError { error: format!("Redis Connection Error: {}", e) })),
+    };
+
+    let pay_usd = get_usd_price(&mut redis_conn, &payload.payAsset).await;
+    let rec_usd = get_usd_price(&mut redis_conn, &payload.receiveAsset).await;
+    
+    if pay_usd <= 0.0 || rec_usd <= 0.0 {
+        return Err(Json(SorError {
+            error: format!("Live Oracle feed unavailable for pair {}/{}", payload.payAsset, payload.receiveAsset)
+        }));
+    }
+
+    let spot_rate = pay_usd / rec_usd;
+    let is_overclocked = payload.systemMode.as_deref() == Some("overclocked");
+    let tx_uuid = Uuid::new_v4().to_string();
+
+    // ROUTE A: STANDARD DARK POOL NETTING
+    if !is_overclocked {
+        tracing::info!("🕸️ [STANDARD MODE] Routing to Dark Pool: {}", payload.wallet);
+        
+        let protocol_fee_rate = 0.015; // 1.5% Standard Spread
+        let execution_rate = spot_rate * (1.0 - protocol_fee_rate);
+        let estimated_output = payload.amount * execution_rate;
+        let fee_captured_usd = payload.amount * pay_usd * protocol_fee_rate;
+
+        let direction = if payload.payAsset == "KAS" { "SELL_KAS" } else { "BUY_KAS" };
+        let netting_order = json!({
+            "wallet": payload.wallet,
+            "direction": direction,
+            "amount_kas": if payload.payAsset == "KAS" { payload.amount } else { estimated_output },
+            "spot_price": spot_rate,
+            "fee_captured_usd": fee_captured_usd
+        });
+
+        let _: () = redis::cmd("RPUSH")
+            .arg("perennia:sor:netting_queue")
+            .arg(netting_order.to_string())
+            .query_async(&mut redis_conn)
+            .await
+            .unwrap_or(());
+
+        return Ok(Json(SorExecutionPlan {
+            totalAmount: payload.amount,
+            unifiedRate: execution_rate,
+            estimatedOutput: estimated_output,
+            legs: vec![WaterfallLeg {
+                tier: 0,
+                provider: "Perennia Dark Pool (Batched)".to_string(),
+                filledAmount: payload.amount,
+                executionRate: execution_rate,
+                marginCaptured: fee_captured_usd,
+            }],
+            transaction_uuid: tx_uuid,
+            psbt: None,
+            formattedUtxos: payload.utxos.clone(),
+        }));
+    }
+
+    // ROUTE B: OVERCLOCKED AUCTION (Instant L1 Waterfall)
+    tracing::info!("🚀 [OVERCLOCKED] High-Velocity Mode Triggered for {}", payload.wallet);
+
+    let mut remaining_amount = payload.amount;
+    let mut total_estimated_output = 0.0;
+    let mut legs = Vec::new();
+    
+    let overclock_fee_rate = 0.025; 
+    let min_chainge_usd = 15.0;
+    let min_changenow_usd = 50.0;
+
+    let corp_kas = env::var("PERENNIA_TREASURY_KAS_ADDRESS")
+        .unwrap_or_else(|_| "kaspa:qrc3ezl770p2cjlfc3tjp6vqlldt6lgh3e80d6rm4rchtt0yrrpgzqave8579".to_string());
+    let corp_btc = env::var("PERENNIA_TREASURY_BTC_ADDRESS")
+        .unwrap_or_else(|_| "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfJH754GL".to_string());
+    let corp_eth = env::var("PERENNIA_TREASURY_ETH_ADDRESS")
+        .unwrap_or_else(|_| "0x71C7656EC7ab88b098defB751B7401B5f6d8976F".to_string());
+    let corp_sol = env::var("PERENNIA_TREASURY_SOL_ADDRESS")
+        .unwrap_or_else(|_| "HN7cAB1wJe3D1v6K18u1nC9Wvy98aV3X45kv5FgvV61a".to_string());
+
+    // TIER 1: PERENNIA TREASURY (Instant L1 Fill)
+    let mut treasury_bal = 0.0;
+
+    if payload.receiveAsset == "BTC" {
+        if let Ok(res) = client.get(&format!("https://mempool.space/api/address/{}", corp_btc)).send().await {
+            if let Ok(data) = res.json::<serde_json::Value>().await {
+                let funded = data["chain_stats"]["funded_txo_sum"].as_f64().unwrap_or(0.0);
+                let spent = data["chain_stats"]["spent_txo_sum"].as_f64().unwrap_or(0.0);
+                treasury_bal = (funded - spent) / 100_000_000.0;
+            }
+        }
+    } else if payload.receiveAsset == "ETH" {
+        let req_body = json!({ "jsonrpc": "2.0", "method": "eth_getBalance", "params": [&corp_eth, "latest"], "id": 1 });
+        if let Ok(res) = client.post("https://ethereum-rpc.publicnode.com").json(&req_body).send().await {
+            if let Ok(data) = res.json::<serde_json::Value>().await {
+                if let Some(hex_val) = data["result"].as_str() {
+                    let clean_hex = hex_val.trim_start_matches("0x");
+                    if let Ok(wei) = u64::from_str_radix(clean_hex, 16) {
+                        treasury_bal = wei as f64 / 1e18;
+                    }
+                }
+            }
+        }
+    } else if payload.receiveAsset == "SOL" {
+        let req_body = json!({ "jsonrpc": "2.0", "method": "getBalance", "params": [&corp_sol], "id": 1 });
+        if let Ok(res) = client.post("https://api.mainnet-beta.solana.com").json(&req_body).send().await {
+            if let Ok(data) = res.json::<serde_json::Value>().await {
+                treasury_bal = data["result"]["value"].as_f64().unwrap_or(0.0) / 1e9;
+            }
+        }
+    } else if payload.receiveAsset == "KAS" {
+        if let Ok(res) = client.get(&format!("https://api.kaspa.org/addresses/{}/balance", corp_kas)).send().await {
+            if let Ok(data) = res.json::<serde_json::Value>().await {
+                treasury_bal = data["balance"].as_f64().unwrap_or(0.0) / 100_000_000.0;
+            }
+        }
+    } else {
+        let clean_kas = corp_kas.replace("kaspa:", "");
+        if let Ok(res) = client.get(&format!("https://api.kasplex.org/v1/krc20/address/kaspa:{}/token/{}", clean_kas, payload.receiveAsset)).send().await {
+            if let Ok(data) = res.json::<serde_json::Value>().await {
+                if let Some(token) = data["result"].as_array().and_then(|arr| arr.first()) {
+                    let bal_str = token["balance"].as_str().unwrap_or("0");
+                    treasury_bal = bal_str.parse::<f64>().unwrap_or(0.0) / 100_000_000.0;
+                }
+            }
+        }
+    }
+
+    if treasury_bal > 0.0 && remaining_amount > 0.0 {
+        let treasury_bal_in_pay_asset = if spot_rate > 0.0 { treasury_bal / spot_rate } else { 0.0 };
+        let fillable_in_pay_asset = remaining_amount.min(treasury_bal_in_pay_asset);
+        
+        if fillable_in_pay_asset > 0.0 {
+            let execution_rate = spot_rate * (1.0 - overclock_fee_rate);
+            let output = fillable_in_pay_asset * execution_rate;
+            
+            let standard_margin = fillable_in_pay_asset * spot_rate * 0.015;
+            let _: () = redis::cmd("INCRBYFLOAT")
+                .arg(format!("perennia:fees:batch_accumulated:{}", payload.payAsset))
+                .arg(standard_margin)
+                .query_async(&mut redis_conn)
+                .await
+                .unwrap_or(());
+
+            let express_margin = fillable_in_pay_asset * spot_rate * 0.01;
+            let _: () = redis::cmd("INCRBYFLOAT")
+                .arg("perennia:treasury:express_premiums_usd")
+                .arg(express_margin * pay_usd)
+                .query_async(&mut redis_conn)
+                .await
+                .unwrap_or(());
+
+            legs.push(WaterfallLeg {
+                tier: 1,
+                provider: "Perennia Express L1".to_string(),
+                filledAmount: fillable_in_pay_asset,
+                executionRate: execution_rate,
+                marginCaptured: standard_margin + express_margin,
+            });
+
+            remaining_amount -= fillable_in_pay_asset;
+            total_estimated_output += output;
+        }
+    }
+
+    // TIER 2: KASPLEX KRC-20
+    if remaining_amount > 0.0 {
+        let kasplex_res = client.get(&format!("https://api.kasplex.org/v1/krc20/token/{}", payload.receiveAsset))
+            .send().await;
+        
+        let mut kasplex_depth = 0.0;
+        if let Ok(res) = kasplex_res {
+            if let Ok(data) = res.json::<serde_json::Value>().await {
+                if let Some(minted) = data.get("result").and_then(|r| r.get(0)).and_then(|m| m.get("max")).and_then(|m| m.as_str()) {
+                    kasplex_depth = minted.parse::<f64>().unwrap_or(0.0) * 0.01; 
+                }
+            }
+        }
+
+        if kasplex_depth > 0.0 {
+            let kasplex_depth_in_pay_asset = if spot_rate > 0.0 { kasplex_depth / spot_rate } else { 0.0 };
+            let fillable = kasplex_depth_in_pay_asset.min(remaining_amount);
+            
+            if fillable > 0.0 {
+                let rate = spot_rate * 0.997; 
+                let output = fillable * rate;
+
+                legs.push(WaterfallLeg {
+                    tier: 2,
+                    provider: "Kasplex KRC-20".to_string(),
+                    filledAmount: fillable,
+                    executionRate: rate,
+                    marginCaptured: 0.0,
+                });
+
+                remaining_amount -= fillable;
+                total_estimated_output += output;
+            }
+        }
+    }
+
+    // TIER 3: CHAINGE FINANCE
+    if remaining_amount * pay_usd >= min_chainge_usd {
+        let chainge_api_key = env::var("CHAINGE_API_KEY").unwrap_or_default();
+        let chainge_req = json!({
+            "fromChain": "KASPA", "toChain": "ETHEREUM",
+            "fromToken": "KAS", "toToken": "USDC",
+            "userAddress": payload.wallet,
+            "amount": remaining_amount * 0.5 
+        });
+        
+        let chainge_res = client.post("https://api.chainge.finance/v1/crosschain/address")
+            .header("Authorization", format!("Bearer {}", chainge_api_key))
+            .json(&chainge_req)
+            .send().await;
+
+        if let Ok(res) = chainge_res {
+            if let Ok(data) = res.json::<serde_json::Value>().await {
+                if let Some(_addr) = data.get("depositAddress").and_then(|a| a.as_str()) {
+                    let fillable = remaining_amount * 0.5;
+                    let rate = spot_rate * 0.995;
+                    let output = fillable * rate;
+
+                    legs.push(WaterfallLeg {
+                        tier: 3,
+                        provider: "Chainge AMM".to_string(),
+                        filledAmount: fillable,
+                        executionRate: rate,
+                        marginCaptured: 0.0,
+                    });
+
+                    remaining_amount -= fillable;
+                    total_estimated_output += output;
+                }
+            }
+        }
+    }
+
+    // TIER 4: CHANGENOW
+    if remaining_amount * pay_usd >= min_changenow_usd {
+        let changenow_key = env::var("CHANGENOW_API_KEY").unwrap_or_default();
+        let cnow_req = json!({
+            "fromCurrency": "kas", "toCurrency": "usdc",
+            "fromNetwork": "kas", "toNetwork": "eth",
+            "fromAmount": remaining_amount,
+            "address": corp_eth,
+            "flow": "standard"
+        });
+
+        let cnow_res = client.post("https://api.changenow.io/v2/exchange")
+            .header("x-changenow-api-key", changenow_key)
+            .json(&cnow_req)
+            .send().await;
+
+        if let Ok(res) = cnow_res {
+            if let Ok(data) = res.json::<serde_json::Value>().await {
+                if let Some(_addr) = data.get("payinAddress").and_then(|a| a.as_str()) {
+                    let fillable = remaining_amount;
+                    let rate = spot_rate * 0.985;
+                    let output = fillable * rate;
+
+                    legs.push(WaterfallLeg {
+                        tier: 4,
+                        provider: "ChangeNOW Aggregator".to_string(),
+                        filledAmount: fillable,
+                        executionRate: rate,
+                        marginCaptured: 0.0,
+                    });
+
+                    remaining_amount = 0.0;
+                    total_estimated_output += output;
+                }
+            }
+        }
+    }
+
+    if legs.is_empty() && payload.amount > 0.0 {
+        return Err(Json(SorError {
+            error: "Express Liquidity Exhausted. Turn off Overclock to access the batched Dark Pool.".to_string()
+        }));
+    }
+
+    let filled_amount = payload.amount - remaining_amount;
+    let unified_rate = if filled_amount > 0.0 { total_estimated_output / filled_amount } else { 0.0 };
+    
+    let mut psbt = None;
+
+    if let Some(utxos) = &payload.utxos {
+        let target_amount_sompi = (filled_amount * 1e8).floor() as u64;
+        let fee_sompi = 10000;
+        let total_required = target_amount_sompi + fee_sompi;
+
+        let mut gathered_sompi = 0;
+        let mut tx_inputs = Vec::new();
+
+        for utxo in utxos {
+            tx_inputs.push(json!({
+                "previousOutpoint": {
+                    "transactionId": utxo.transactionId,
+                    "index": utxo.index
+                },
+                "signatureScript": "",
+                "sequence": 0,
+                "sigOpCount": 1
+            }));
+            gathered_sompi += utxo.amount as u64;
+            if gathered_sompi >= total_required { break; }
+        }
+
+        if gathered_sompi < total_required {
+            return Err(Json(SorError {
+                error: format!("ERR_INSUFFICIENT_MASS: Required {}, Found {}", total_required, gathered_sompi)
+            }));
+        }
+
+        let mut tx_outputs = Vec::new();
+
+        for leg in &legs {
+            let leg_sompi = (leg.filledAmount * 1e8).floor() as u64;
+            if leg_sompi == 0 { continue; }
+
+            let mut dest_address = String::new();
+            match leg.tier {
+                1 => dest_address = corp_kas.clone(),
+                2 => dest_address = "kaspa:kasplex_krc20_router_inbound".to_string(),
+                3 => dest_address = "kaspa:chainge_finance_bridge_fallback".to_string(),
+                4 => dest_address = "kaspa:changenow_whale_fallback".to_string(),
+                _ => {}
+            }
+
+            let script_pub_key = decode_address_to_script(&dest_address)
+                .unwrap_or_else(|_| "200000000000000000000000000000000000000000000000000000000000000000ac".to_string());
+
+            tx_outputs.push(json!({
+                "amount": leg_sompi as u64,
+                "scriptPublicKey": script_pub_key,
+                "_metadata": { "provider": leg.provider, "tier": leg.tier }
+            }));
+        }
+
+        let change_sompi = gathered_sompi - total_required;
+        if change_sompi > 0 {
+            tx_outputs.push(json!({
+                "amount": change_sompi as u64,
+                "scriptPublicKey": decode_address_to_script(&payload.wallet).unwrap_or_else(|_| "200000000000000000000000000000000000000000000000000000000000000000ac".to_string()),
+                "_metadata": { "type": "change" }
+            }));
+        }
+
+        psbt = Some(json!({
+            "version": 0,
+            "inputs": tx_inputs,
+            "outputs": tx_outputs,
+            "lockTime": 0,
+            "subnetworkId": "0000000000000000000000000000000000000000",
+            "gas": 0,
+            "payload": "",
+            "mass": 0,
+            "storageMass": 0
+        }));
+    }
+
+    Ok(Json(SorExecutionPlan {
+        totalAmount: filled_amount,
+        unifiedRate: unified_rate,
+        estimatedOutput: total_estimated_output,
+        legs,
+        transaction_uuid: tx_uuid,
+        psbt,
+        formattedUtxos: payload.utxos.clone(),
+    }))
+}
+</file>
+
+<file path=".gitignore">
+/target/
+**/*.rs.bk
+.env
+Cargo.lock
+.DS_Store
+node_modules/
+</file>
+
+<file path="db/schema.sql">
+-- ==============================================================================
+-- PERENNIA LLC: SOVEREIGN WRITE-AHEAD LOG (WAL) & REAL-TIME LEDGER SCHEMA
+-- Deployment Environment: Bare-Metal Ubuntu PostgreSQL 16+
+-- Architecture: High-Velocity BRIN Indexing & L1 Block Ledger
+-- ==============================================================================
+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- 1. Sovereign tracking of bare-metal hardware identities
+CREATE TABLE IF NOT EXISTS worker_profiles (
+    worker_id VARCHAR(255) PRIMARY KEY,
+    wallet_address VARCHAR(255) NOT NULL,
+    device_profile VARCHAR(100) NOT NULL DEFAULT 'unknown',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 2. Continuous Fluidity: Real-time balance streaming for active smart contract polling
+CREATE TABLE IF NOT EXISTS yield_reservoirs (
+    wallet_address VARCHAR(255) PRIMARY KEY,
+    streaming_balance_kas DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    total_yield_kas DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 3. UNLOGGED WAL: Millions of sub-second micro-shares map directly here from the Redis Oracle
+CREATE UNLOGGED TABLE IF NOT EXISTS micro_shares (
+    share_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    worker_id VARCHAR(255) NOT NULL,
+    difficulty_weight DOUBLE PRECISION NOT NULL,
+    kas_value_delta DOUBLE PRECISION NOT NULL,
+    network_diff DOUBLE PRECISION NOT NULL,
+    is_settled BOOLEAN NOT NULL DEFAULT false,
+    recorded_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 4. The L1 Block Ledger: Persistent tracking of global Kaspa network discoveries
+CREATE TABLE IF NOT EXISTS network_blocks (
+    block_hash VARCHAR(64) PRIMARY KEY,
+    worker_id VARCHAR(255) NOT NULL,
+    nonce BIGINT NOT NULL,
+    network_diff DOUBLE PRECISION NOT NULL,
+    is_orphaned BOOLEAN DEFAULT false,
+    discovered_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ==============================================================================
+-- 5. SOVEREIGN COMMAND CENTER STATE 
+-- ==============================================================================
+CREATE TABLE IF NOT EXISTS user_command_centers (
+    wallet_address VARCHAR(255) PRIMARY KEY,
+    layout_state JSONB NOT NULL DEFAULT '{}'::jsonb,
+    last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ==============================================================================
+-- 6. COMPLIANCE & TAX FORTRESS LEDGER
+-- ==============================================================================
+CREATE TABLE IF NOT EXISTS entity_kyc (
+    wallet_address VARCHAR(255) PRIMARY KEY,
+    legal_name VARCHAR(255) NOT NULL,
+    entity_type VARCHAR(50) NOT NULL,
+    tax_id_hash TEXT NOT NULL,
+    business_address TEXT NOT NULL,
+    verification_status VARCHAR(50) DEFAULT 'pending',
+    verified_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE TABLE IF NOT EXISTS tax_ledger_events (
+    event_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    wallet_address VARCHAR(255) NOT NULL,
+    asset_ticker VARCHAR(20) NOT NULL,
+    event_type VARCHAR(50) NOT NULL,
+    gross_proceeds_usd DOUBLE PRECISION NOT NULL,
+    amount_tokens DOUBLE PRECISION NOT NULL,
+    spot_price_at_execution DOUBLE PRECISION NOT NULL,
+    recorded_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ==============================================================================
+-- HIGH-PERFORMANCE INDEXING MATRIX
+-- ==============================================================================
+
+-- B-Tree Indexes for exact-match lookups
+CREATE INDEX IF NOT EXISTS idx_micro_shares_worker ON micro_shares(worker_id);
+CREATE INDEX IF NOT EXISTS idx_micro_shares_settlement ON micro_shares(is_settled);
+CREATE INDEX IF NOT EXISTS idx_network_blocks_worker ON network_blocks(worker_id);
+CREATE INDEX IF NOT EXISTS idx_network_blocks_time ON network_blocks(discovered_at DESC);
+CREATE INDEX IF NOT EXISTS idx_user_command_centers_updated ON user_command_centers(last_updated DESC);
+CREATE INDEX IF NOT EXISTS idx_tax_ledger_wallet ON tax_ledger_events(wallet_address, recorded_at DESC);
+
+-- BRIN (Block Range Index) for hyper-optimized append-only time-series data
+CREATE INDEX IF NOT EXISTS idx_micro_shares_recorded_brin 
+ON micro_shares USING brin (recorded_at) WITH (pages_per_range = 128);
+
+-- RWA Oracle Telemetry (Unlogged for high-velocity ingest)
+CREATE UNLOGGED TABLE IF NOT EXISTS rwa_oracle_feeds (
+    ticker VARCHAR(16) NOT NULL,
+    asset_class VARCHAR(16) NOT NULL,
+    price_usd NUMERIC(18, 8) NOT NULL,
+    oracle_source VARCHAR(32) NOT NULL DEFAULT 'PYTH_HERMES',
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (ticker, updated_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rwa_oracle_ticker_time ON rwa_oracle_feeds (ticker, updated_at DESC);
+</file>
+
 <file path="src/kaspad_client/mod.rs">
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -2407,7 +3150,7 @@ pub mod protowire {
 }
 
 use protowire::rpc_client::RpcClient;
-use protowire::{KaspadRequest, GetBlockTemplateRequestMessage, NotifyBlockAddedRequestMessage, SubmitBlockRequestMessage, NotifyNewBlockTemplateRequestMessage};
+use protowire::{KaspadRequest, GetBlockTemplateRequestMessage, NotifyBlockAddedRequestMessage, SubmitBlockRequestMessage, NotifyNewBlockTemplateRequestMessage, GetBlockDagInfoRequestMessage};
 use protowire::kaspad_request::Payload as RequestPayload;
 use protowire::kaspad_response::Payload as ResponsePayload;
 use protowire::RpcBlock;
@@ -2474,15 +3217,25 @@ pub async fn start_kaspad_client(
         let mut req_id = 50000;
         loop {
             interval.tick().await;
+            
             req_id += 1;
-            let req = KaspadRequest {
+            let req_template = KaspadRequest {
                 id: req_id,
                 payload: Some(RequestPayload::GetBlockTemplateRequest(GetBlockTemplateRequestMessage {
                     pay_address: mining_address_poll.clone(),
                     extra_data: "Perennia-Zero-Allocation".to_string(),
                 })),
             };
-            if tx_poll.send(req).await.is_err() {
+            if tx_poll.send(req_template).await.is_err() {
+                break;
+            }
+            
+            req_id += 1;
+            let req_dag = KaspadRequest {
+                id: req_id,
+                payload: Some(RequestPayload::GetBlockDagInfoRequest(GetBlockDagInfoRequestMessage {})),
+            };
+            if tx_poll.send(req_dag).await.is_err() {
                 break;
             }
         }
@@ -2499,8 +3252,19 @@ pub async fn start_kaspad_client(
                     if let Some(err) = res.error {
                         tracing::error!("❌ GET_BLOCK_TEMPLATE REJECTED BY NODE: {}", err.message);
                     } else if let Some(block) = res.block {
+                        
+                        // ⚡ Mainnet Math: Ensures block reward is securely captured so Chronos doesn't fault out
+                        let mut block_reward = 50.0;
+                        if let Some(coinbase_tx) = block.transactions.first() {
+                            let total_sompi: u64 = coinbase_tx.outputs.iter().map(|o| o.amount).sum();
+                            if total_sompi > 0 {
+                                block_reward = total_sompi as f64 / 100_000_000.0;
+                            }
+                        }
+                        let _: redis::RedisResult<()> = redis_conn.set("pool:block_reward", block_reward).await;
+
                         if let Some(header) = &block.header {
-                            tracing::debug!("🧊 Toccata Block Template Acquired! Blue Score: {}", header.blue_score);
+                            tracing::debug!("🧊 Toccata Block Template Acquired! Blue Score: {} | Reward: {} KAS", header.blue_score, block_reward);
                             let set_res: redis::RedisResult<()> = redis_conn.set("perennia:node:sync_status", "Online (Toccata Core)").await;
                             if set_res.is_err() {
                                 if let Ok(new_conn) = redis_client.get_multiplexed_async_connection().await {
@@ -2509,6 +3273,14 @@ pub async fn start_kaspad_client(
                             }
                             job_manager.process_new_block(block.clone());
                         }
+                    }
+                }
+                Some(ResponsePayload::GetBlockDagInfoResponse(res)) => {
+                    if let Some(err) = res.error {
+                        tracing::error!("❌ GET_BLOCK_DAG_INFO REJECTED BY NODE: {}", err.message);
+                    } else {
+                        // ⚡ Pushes real-time network expected hashes (Difficulty) into Redis
+                        let _: redis::RedisResult<()> = redis_conn.set("pool:network_diff", res.difficulty).await;
                     }
                 }
                 Some(ResponsePayload::BlockAddedNotification(_)) |
@@ -2541,398 +3313,6 @@ pub async fn start_kaspad_client(
 }
 </file>
 
-<file path="src/config.rs">
-use serde::Deserialize;
-use std::fs;
-use anyhow::{Context, Result};
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize, Clone)]
-pub struct StratumConfig {
-    pub stratum_port: String,
-    pub kaspad_address: String,
-    pub mining_address: String,
-    pub starting_diff: f64,
-    pub min_share_diff: f64,
-    pub var_diff: bool,
-    pub shares_per_min: u32,
-    pub extranonce_size: usize,
-    pub prom_port: String,
-    pub print_stats: bool,
-}
-
-impl StratumConfig {
-    pub fn load(path: &str) -> Result<Self> {
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("Failed to read config file at {}", path))?;
-        
-        let config: StratumConfig = serde_yaml::from_str(&content)
-            .context("Failed to parse YAML configuration")?;
-            
-        if config.extranonce_size != 2 {
-            anyhow::bail!("FATAL ARCHITECTURE RULE: extranonce_size MUST be exactly 2.");
-        }
-            
-        Ok(config)
-    }
-}
-</file>
-
-<file path=".gitignore">
-/target/
-**/*.rs.bk
-.env
-Cargo.lock
-.DS_Store
-node_modules/
-</file>
-
-<file path="db/schema.sql">
--- ==============================================================================
--- PERENNIA LLC: SOVEREIGN WRITE-AHEAD LOG (WAL) & REAL-TIME LEDGER SCHEMA
--- Deployment Environment: Bare-Metal Ubuntu PostgreSQL 16+
--- Architecture: High-Velocity BRIN Indexing & L1 Block Ledger
--- ==============================================================================
-
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-
--- 1. Sovereign tracking of bare-metal hardware identities
-CREATE TABLE IF NOT EXISTS worker_profiles (
-    worker_id VARCHAR(255) PRIMARY KEY,
-    wallet_address VARCHAR(255) NOT NULL,
-    device_profile VARCHAR(100) NOT NULL DEFAULT 'unknown',
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
--- 2. Continuous Fluidity: Real-time balance streaming for active smart contract polling
-CREATE TABLE IF NOT EXISTS yield_reservoirs (
-    wallet_address VARCHAR(255) PRIMARY KEY,
-    streaming_balance_kas DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-    total_yield_kas DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-    last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
--- 3. UNLOGGED WAL: Millions of sub-second micro-shares map directly here from the Redis Oracle
-CREATE UNLOGGED TABLE IF NOT EXISTS micro_shares (
-    share_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    worker_id VARCHAR(255) NOT NULL,
-    difficulty_weight DOUBLE PRECISION NOT NULL,
-    kas_value_delta DOUBLE PRECISION NOT NULL,
-    network_diff DOUBLE PRECISION NOT NULL,
-    is_settled BOOLEAN NOT NULL DEFAULT false,
-    recorded_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
--- 4. The L1 Block Ledger: Persistent tracking of global Kaspa network discoveries
-CREATE TABLE IF NOT EXISTS network_blocks (
-    block_hash VARCHAR(64) PRIMARY KEY,
-    worker_id VARCHAR(255) NOT NULL,
-    nonce BIGINT NOT NULL,
-    network_diff DOUBLE PRECISION NOT NULL,
-    is_orphaned BOOLEAN DEFAULT false,
-    discovered_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
--- ==============================================================================
--- 5. SOVEREIGN COMMAND CENTER STATE (Phase 2 Upgrade)
--- ==============================================================================
-CREATE TABLE IF NOT EXISTS user_command_centers (
-    wallet_address VARCHAR(255) PRIMARY KEY,
-    layout_state JSONB NOT NULL DEFAULT '{}'::jsonb,
-    last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
--- ==============================================================================
--- HIGH-PERFORMANCE INDEXING MATRIX
--- ==============================================================================
-
--- B-Tree Indexes for exact-match lookups
-CREATE INDEX IF NOT EXISTS idx_micro_shares_worker ON micro_shares(worker_id);
-CREATE INDEX IF NOT EXISTS idx_micro_shares_settlement ON micro_shares(is_settled);
-CREATE INDEX IF NOT EXISTS idx_network_blocks_worker ON network_blocks(worker_id);
-CREATE INDEX IF NOT EXISTS idx_network_blocks_time ON network_blocks(discovered_at DESC);
-CREATE INDEX IF NOT EXISTS idx_user_command_centers_updated ON user_command_centers(last_updated DESC);
-
--- Drop legacy B-Tree for time-series if it exists from Phase 1
-DROP INDEX IF EXISTS idx_micro_shares_recorded;
-
--- BRIN (Block Range Index) for hyper-optimized append-only time-series data
-CREATE INDEX IF NOT EXISTS idx_micro_shares_recorded_brin 
-ON micro_shares USING brin (recorded_at) WITH (pages_per_range = 128);
-
--- RWA Oracle Telemetry (Unlogged for high-velocity ingest)
-CREATE UNLOGGED TABLE IF NOT EXISTS rwa_oracle_feeds (
-    ticker VARCHAR(16) NOT NULL,
-    asset_class VARCHAR(16) NOT NULL,
-    price_usd NUMERIC(18, 8) NOT NULL,
-    oracle_source VARCHAR(32) NOT NULL DEFAULT 'PYTH_HERMES',
-    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (ticker, updated_at)
-);
-
-CREATE INDEX idx_rwa_oracle_ticker_time ON rwa_oracle_feeds (ticker, updated_at DESC);
-</file>
-
-<file path="src/telemetry/mod.rs">
-use prometheus::{GaugeVec, IntCounterVec, Opts, Registry, TextEncoder, Encoder};
-use lazy_static::lazy_static;
-use tokio::net::TcpListener;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
-use std::collections::HashMap;
-use serde_json::json;
-use std::time::{SystemTime, UNIX_EPOCH};
-use redis::AsyncCommands;
-
-/// ⚡ 7-Tier Harmonic Cascade Time Constants (in Seconds)
-/// Tier 0 (1s) -> Tier 6 (377s Fibonacci Anchor)
-const EMA_WINDOWS: [f64; 7] = [1.0, 3.0, 8.0, 21.0, 55.0, 144.0, 377.0];
-
-/// Kaspa Fixed Difficulty Multiplier Constant (2^32 hashes per unit difficulty)
-const KASPA_DIFF_CONSTANT: f64 = 4_294_967_296.0;
-
-lazy_static! {
-    pub static ref REGISTRY: Registry = Registry::new();
-
-    pub static ref WORKER_HASHRATE: GaugeVec = GaugeVec::new(
-        Opts::new("ks_worker_hashrate", "Strictly verified unsimulated hashrate per worker in TH/s"),
-        &["worker"]
-    ).expect("Metric setup failed");
-
-    pub static ref WORKER_SHARES: IntCounterVec = IntCounterVec::new(
-        Opts::new("ks_worker_shares", "Cryptographically validated shares per worker"),
-        &["worker", "type"]
-    ).expect("Metric setup failed");
-}
-
-pub fn init_telemetry() {
-    REGISTRY.register(Box::new(WORKER_HASHRATE.clone())).unwrap();
-    REGISTRY.register(Box::new(WORKER_SHARES.clone())).unwrap();
-}
-
-pub async fn start_prometheus_exporter(_bind_addr: String) {
-    let addr = "0.0.0.0:8081";
-    let listener = TcpListener::bind(addr).await.expect("Failed to bind Prometheus port");
-    
-    tracing::info!("📊 Zero-Simulation Telemetry exporter natively active on http://{}/metrics", addr);
-
-    loop {
-        if let Ok((mut socket, _)) = listener.accept().await {
-            tokio::spawn(async move {
-                let mut buf = [0; 1024];
-                let _ = socket.read(&mut buf).await; 
-
-                let mut buffer = vec![];
-                let encoder = TextEncoder::new();
-                let metric_families = REGISTRY.gather();
-                encoder.encode(&metric_families, &mut buffer).unwrap();
-
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\n\r\n{}",
-                    buffer.len(),
-                    String::from_utf8_lossy(&buffer)
-                );
-                
-                let _ = socket.write_all(response.as_bytes()).await;
-            });
-        }
-    }
-}
-
-/// Internal struct tracking 64-byte harmonic state per worker
-struct WorkerState {
-    last_share_ts: u64,
-    emas: [f64; 7],
-    shares_contributed: f64,
-    unflushed_difficulty: f64,
-    unflushed_oracle_shares: Vec<(f64, u64)>, // (difficulty, timestamp)
-}
-
-pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String, f64)>) {
-    tracing::info!("🏦 Institutional Accounting & Telemetry Engine Booted. Awaiting verified shares...");
-
-    let redis_client = redis::Client::open("redis://127.0.0.1/").expect("Redis connection failed");
-    let mut redis_conn = match redis_client.get_multiplexed_async_connection().await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("❌ CRITICAL: Could not connect to Redis for Accounting! {}", e);
-            return;
-        }
-    };
-
-    // ⚡ 1000ms METRONOME TICK: High-frequency telemetry broadcast
-    let mut flush_interval = tokio::time::interval(tokio::time::Duration::from_millis(1000));
-    let mut worker_states: HashMap<String, WorkerState> = HashMap::new();
-
-    loop {
-        tokio::select! {
-            // ⚡ REAL-TIME SHARE INGESTION: Microsecond Continuous-Time EMA Cascade
-            Some((full_worker_name, difficulty)) = valid_share_rx.recv() => {
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-                let work = difficulty * KASPA_DIFF_CONSTANT;
-
-                let state = worker_states.entry(full_worker_name.clone()).or_insert_with(|| WorkerState {
-                    last_share_ts: now,
-                    emas: [0.0; 7],
-                    shares_contributed: 0.0,
-                    unflushed_difficulty: 0.0,
-                    unflushed_oracle_shares: Vec::new(),
-                });
-
-                let dt_sec = (now.saturating_sub(state.last_share_ts)) as f64 / 1000.0;
-
-                // Execute Continuous-Time EMA Decay Across 7 Harmonic Tiers
-                for (i, &tau) in EMA_WINDOWS.iter().enumerate() {
-                    let alpha = 1.0 - f64::exp(-dt_sec / tau);
-                    
-                    // L'Hôpital Limit Guard against instant burst shares
-                    let contribution = if dt_sec > 0.001 {
-                        (work / dt_sec) * alpha
-                    } else {
-                        work / tau
-                    };
-
-                    state.emas[i] = (state.emas[i] * (1.0 - alpha)) + contribution;
-                }
-
-                state.last_share_ts = now;
-                state.shares_contributed += difficulty;
-                state.unflushed_difficulty += difficulty;
-                state.unflushed_oracle_shares.push((difficulty, now));
-
-                // ⚡ COMPILER FIX: IntCounterVec target WORKER_SHARES selected over GaugeVec WORKER_HASHRATE
-                WORKER_SHARES.with_label_values(&[&full_worker_name, "valid"]).inc_by(difficulty as u64);
-            }
-
-            // ⚡ 1000ms BROADCAST METRONOME: Read-Time Decay Projection & Stream Pipeline
-            _ = flush_interval.tick() => {
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-                let mut pipeline = redis::pipe();
-                let mut total_hashrate = 0.0;
-                let mut workers_array = Vec::new();
-                let mut keys_to_remove = Vec::new();
-
-                if !worker_states.is_empty() {
-                    for (full_worker, state) in worker_states.iter_mut() {
-                        let dt_idle = (now.saturating_sub(state.last_share_ts)) as f64 / 1000.0;
-                        let mut projected_emas = [0.0; 7];
-
-                        // Read-Time Projection Decay (projects drain without touching base state)
-                        for (i, &tau) in EMA_WINDOWS.iter().enumerate() {
-                            let alpha = 1.0 - f64::exp(-dt_idle / tau);
-                            projected_emas[i] = state.emas[i] * (1.0 - alpha);
-                        }
-
-                        // Tier 2 (8-second window) serves as the primary UI Hashes/sec rate
-                        let current_hashrate = projected_emas[2];
-
-                        // Drop offline if tracking rate falls below 5 GH/s and idle > 30s
-                        let is_online = current_hashrate > 5_000_000_000.0 || dt_idle < 30.0;
-
-                        if !is_online {
-                            keys_to_remove.push(full_worker.clone());
-                            pipeline.cmd("SET").arg(format!("worker:{}:hashrate", full_worker)).arg(0.0).ignore();
-                            pipeline.cmd("SREM").arg("pool:workers").arg(full_worker.clone()).ignore();
-                        } else {
-                            total_hashrate += current_hashrate;
-
-                            // Update Prometheus Gauge (in TH/s)
-                            WORKER_HASHRATE.with_label_values(&[full_worker]).set(current_hashrate / 1e12);
-
-                            pipeline.cmd("SET").arg(format!("worker:{}:hashrate", full_worker)).arg(current_hashrate).ignore();
-
-                            // Execute Ledger & Oracle Buffer Flushes if new shares were ingested
-                            if state.unflushed_difficulty > 0.0 {
-                                let parts: Vec<&str> = full_worker.split('.').collect();
-                                let wallet = parts[0];
-                                let wallet_key = format!("perennia:ledger:wallet:{}", wallet);
-
-                                pipeline.cmd("INCRBYFLOAT").arg(&wallet_key).arg(state.unflushed_difficulty).ignore();
-                                pipeline.cmd("SADD").arg("pool:workers").arg(full_worker.clone()).ignore();
-                                pipeline.cmd("INCRBYFLOAT").arg(format!("worker:{}:shares", full_worker)).arg(state.unflushed_difficulty).ignore();
-
-                                for (diff, ts) in state.unflushed_oracle_shares.drain(..) {
-                                    let oracle_event = json!({
-                                        "worker": full_worker,
-                                        "difficulty": diff,
-                                        "timestamp": ts
-                                    });
-                                    pipeline.cmd("RPUSH").arg("perennia:oracle:share_buffer").arg(oracle_event.to_string()).ignore();
-                                }
-
-                                state.unflushed_difficulty = 0.0;
-                            }
-
-                            let parts: Vec<&str> = full_worker.split('.').collect();
-                            let wallet_address = if !parts.is_empty() { parts[0] } else { full_worker.as_str() };
-                            let worker_name = if parts.len() > 1 { parts[1..].join(".") } else { full_worker.to_string() };
-
-                            workers_array.push(json!({
-                                "fullIdentity": full_worker,
-                                "walletAddress": wallet_address,
-                                "name": worker_name,
-                                "trackingRate": current_hashrate,
-                                "sharesContributed": state.shares_contributed,
-                                "blocksFound": 0,
-                                "status": "online",
-                                "harmonicMesh": projected_emas
-                            }));
-                        }
-                    }
-
-                    // Evict completely drained offline workers
-                    for key in keys_to_remove {
-                        worker_states.remove(&key);
-                    }
-                }
-
-                pipeline.cmd("SET").arg("pool:hashrate").arg(total_hashrate).ignore();
-
-                let telemetry_payload = json!({
-                    "totalHashrate": total_hashrate,
-                    "workers": workers_array
-                });
-
-                let payload_str = telemetry_payload.to_string();
-
-                // 1. Snapshot Cache for HTTP Polling endpoints
-                pipeline.cmd("SET")
-                    .arg("perennia:telemetry")
-                    .arg(&payload_str)
-                    .ignore();
-
-                // 2. ⚡ REAL-TIME REDIS STREAM: XADD for WebSocket Event Pipelines
-                pipeline.cmd("XADD")
-                    .arg("telemetry:stream")
-                    .arg("MAXLEN").arg("~").arg(100)
-                    .arg("*")
-                    .arg("payload").arg(&payload_str)
-                    .ignore();
-                    
-                // 3. ⚡ SVELTEKIT SSE: Pub/Sub Broadcast
-                pipeline.cmd("PUBLISH")
-                    .arg("telemetry:updates")
-                    .arg(&payload_str)
-                    .ignore();
-
-                // Execute Atomic Pipeline
-                if let Err(e) = pipeline.query_async::<_, ()>(&mut redis_conn).await {
-                    tracing::error!("🚨 CRITICAL LEDGER FAILURE: {}", e);
-                    tracing::warn!("🔄 Attempting to re-establish broken Redis multiplexer pipeline...");
-                    
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                    
-                    if let Ok(new_conn) = redis_client.get_multiplexed_async_connection().await {
-                        tracing::info!("✅ Redis connection successfully restored.");
-                        redis_conn = new_conn;
-                    }
-                }
-            }
-        }
-    }
-}
-</file>
-
 <file path="src/main.rs">
 mod config;
 mod stratum_tcp;
@@ -2941,8 +3321,9 @@ mod kaspad_client;
 mod job_manager; 
 mod diff_engine; 
 mod oracle;
-mod sor; // ⚡ Inject the new Live SOR Engine
-mod chronos; // ⚡ Inject the Chronos Engine
+mod sor; 
+mod chronos; 
+mod state_api; // ⚡ INJECTED: Backend-Authoritative State Router
 
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -2976,11 +3357,16 @@ async fn main() -> anyhow::Result<()> {
             panic!("Database connection required for routing dependencies: {}", e);
         });
 
-    // ⚡ Ignite Chronos Backend Daemon
     let pool_chronos = pool.clone();
     tokio::spawn(async move {
         chronos::start_chronos_daemon(pool_chronos).await;
     });
+
+    if let Ok(redis_client_netting) = redis::Client::open("redis://127.0.0.1/") {
+        tokio::spawn(async move {
+            chronos::start_delta_netting_engine(redis_client_netting).await;
+        });
+    }
 
     telemetry::init_telemetry();
     let prom_port = config.prom_port.clone();
@@ -2988,7 +3374,7 @@ async fn main() -> anyhow::Result<()> {
         telemetry::start_prometheus_exporter(prom_port).await;
     });
 
-    let (valid_share_tx, valid_share_rx) = mpsc::channel(10000);
+    let (valid_share_tx, valid_share_rx) = mpsc::channel::<(String, f64, bool)>(10000);
 
     tokio::spawn(async move {
         telemetry::start_accounting_engine(valid_share_rx).await;
@@ -2998,15 +3384,12 @@ async fn main() -> anyhow::Result<()> {
         oracle::start_oracle_daemon().await;
     });
 
-    // ⚡ Ignite the Global Spot Pricing Oracle Daemon
     tokio::spawn(async move {
         oracle::start_spot_pricing_daemon().await;
     });
 
-    // Restore Job Manager
     let (job_manager_arc, _job_rx, block_submit_rx) = JobManager::new();
 
-    // Restore Kaspad Client
     let config_clone = config.clone();
     let jm_clone = job_manager_arc.clone();
     
@@ -3016,22 +3399,20 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // ⚡ API Isolation: The Smart Order Router execution engine binds cleanly to port 8002
+    // ⚡ API Isolation: The Command Center Action Endpoint is now armed on port 8002
     let app = Router::new()
         .route("/v1/sor/execute", post(sor::handle_sor_execute))
+        .route("/v1/state/action", post(state_api::handle_state_action))
         .with_state(pool);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8002").await?;
     tokio::spawn(async move {
-        tracing::info!("🚀 Axum HTTP Server bound instantly on port 8002 (SOR Protocol Armed)");
+        tracing::info!("🚀 Axum HTTP Server bound instantly on port 8002 (SOR & State API Armed)");
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!("Axum Server Error: {}", e);
         }
     });
 
-    // ⚡ Restore 3-Tier Tokio Listeners for Physical Hash Power
-
-    // Tier 1: GPU/Mobile | Bind: 0.0.0.0:5551 | Diff: 1.0 | Throttle: 0ms
     let cfg_t1 = config.clone();
     let jm_t1 = job_manager_arc.clone();
     let tx_t1 = valid_share_tx.clone();
@@ -3041,7 +3422,6 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Tier 2: Home ASICs | Bind: 0.0.0.0:5552 | Diff: 256.0 | Throttle: 2500ms
     let cfg_t2 = config.clone();
     let jm_t2 = job_manager_arc.clone();
     let tx_t2 = valid_share_tx.clone();
@@ -3051,243 +3431,13 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Tier 3: Industrial ASICs | Bind: 0.0.0.0:5553 | Diff: 1024.0 | Throttle: 3000ms
     let cfg_t3 = config.clone();
     let jm_t3 = job_manager_arc.clone();
     let tx_t3 = valid_share_tx.clone();
     
-    // Blocking call on the final tier to keep the main thread alive
     stratum_tcp::start_stratum_server(cfg_t3, jm_t3, tx_t3, 5553, 1024.0, 3000).await?;
 
     Ok(())
-}
-</file>
-
-<file path="src/oracle.rs">
-use std::collections::HashMap;
-use std::time::Duration;
-use redis::AsyncCommands;
-use serde_json::Value;
-
-// ⚡ GLOBAL PRICING DAEMON - Isolates 3rd Party APIs internally into local Redis states
-pub async fn start_spot_pricing_daemon() {
-    tracing::info!("🌐 Global Spot Price Oracle Daemon Booting...");
-    
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
-    let redis_client = match redis::Client::open("redis://127.0.0.1/") {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("Spot Oracle Redis connection failed: {}", e);
-            return;
-        }
-    };
-
-    let mut redis_conn = match redis_client.get_multiplexed_async_connection().await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("Spot Oracle Redis multiplexer failed: {}", e);
-            return;
-        }
-    };
-
-    // Safe 15-second tick to prevent downstream rate-limiting from free-tier providers
-    let mut interval = tokio::time::interval(Duration::from_secs(15));
-
-    loop {
-        interval.tick().await;
-
-        let url = "https://api.coingecko.com/api/v3/simple/price?ids=kaspa,bitcoin,ethereum,solana&vs_currencies=usd&include_24hr_change=true";
-        
-        match client.get(url).header("User-Agent", "Perennia-Core-Backend/1.0").send().await {
-            Ok(res) => {
-                if let Ok(data) = res.json::<serde_json::Value>().await {
-                    let mut pipeline = redis::pipe();
-                    
-                    // Master payload for the SvelteKit frontend cache (Read natively via SvelteKit)
-                    pipeline.cmd("SET").arg("oracle:spot:prices_json").arg(data.to_string()).ignore();
-
-                    let assets = [
-                        ("kaspa", "KAS_USDC"),
-                        ("bitcoin", "BTC_USDC"),
-                        ("ethereum", "ETH_USDC"),
-                        ("solana", "SOL_USDC")
-                    ];
-
-                    for (cg_id, pair_id) in assets.iter() {
-                        if let Some(asset_data) = data.get(*cg_id) {
-                            if let Some(usd) = asset_data.get("usd").and_then(|v| v.as_f64()) {
-                                pipeline.cmd("SET").arg(format!("oracle:spot:{}", pair_id)).arg(usd.to_string()).ignore();
-                            }
-                            if let Some(change) = asset_data.get("usd_24h_change").and_then(|v| v.as_f64()) {
-                                pipeline.cmd("SET").arg(format!("oracle:change:{}", pair_id)).arg(change.to_string()).ignore();
-                            }
-                        }
-                    }
-
-                    // Execute the atomic Redis pipeline flush
-                    if let Err(e) = pipeline.query_async::<_, ()>(&mut redis_conn).await {
-                        tracing::error!("Spot Oracle Redis Pipeline Failed: {}", e);
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Spot Oracle Upstream Fetch Failed: {}", e);
-            }
-        }
-    }
-}
-
-pub async fn start_oracle_daemon() {
-    tracing::info!("🔮 Yield Oracle Daemon Booting...");
-
-    let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:password@127.0.0.1:5432/perennia".to_string());
-    
-    let pool = match sqlx::PgPool::connect(&db_url).await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!("Oracle DB connection failed: {}", e);
-            return;
-        }
-    };
-
-    let redis_client = match redis::Client::open("redis://127.0.0.1/") {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("Oracle Redis connection failed: {}", e);
-            return;
-        }
-    };
-
-    let mut redis_conn = match redis_client.get_multiplexed_async_connection().await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("Oracle Redis multiplexer failed: {}", e);
-            return;
-        }
-    };
-
-    let mut interval = tokio::time::interval(Duration::from_secs(5));
-
-    loop {
-        interval.tick().await;
-
-        let mut wallet_aggregates: HashMap<String, f64> = HashMap::new();
-        
-        // 1. Pop shares from the Redis buffer
-        loop {
-            let result: redis::RedisResult<Option<String>> = redis::cmd("LPOP")
-                .arg("perennia:oracle:share_buffer")
-                .query_async(&mut redis_conn)
-                .await;
-
-            match result {
-                Ok(Some(event_str)) => {
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&event_str) {
-                        if let (Some(worker), Some(diff)) = (parsed["worker"].as_str(), parsed["difficulty"].as_f64()) {
-                            let parts: Vec<&str> = worker.split('.').collect();
-                            let wallet = if !parts.is_empty() { parts[0].to_string() } else { worker.to_string() };
-                            *wallet_aggregates.entry(wallet).or_insert(0.0) += diff;
-                        }
-                    }
-                }
-                Ok(None) => break, // Buffer empty
-                Err(_) => break, // Redis error
-            }
-        }
-
-        if wallet_aggregates.is_empty() {
-            continue;
-        }
-
-        let mut tx = match pool.begin().await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!("Oracle failed to start DB transaction: {}", e);
-                continue;
-            }
-        };
-
-        let mut commit_success = true;
-
-        // 2. Bulk Aggregated Upsert into Yield Reservoirs
-        let mut agg_wallets = Vec::with_capacity(wallet_aggregates.len());
-        let mut agg_deltas = Vec::with_capacity(wallet_aggregates.len());
-        
-        for (w, d) in &wallet_aggregates {
-            agg_wallets.push(w.clone());
-            agg_deltas.push(*d);
-        }
-
-        if commit_success {
-            let upsert_res = sqlx::query(
-                r#"
-                INSERT INTO yield_reservoirs (wallet_address, streaming_balance_kas, total_yield_kas)
-                SELECT * FROM UNNEST($1::text[], $2::float8[], $2::float8[])
-                ON CONFLICT (wallet_address)
-                DO UPDATE SET
-                    streaming_balance_kas = yield_reservoirs.streaming_balance_kas + EXCLUDED.streaming_balance_kas,
-                    total_yield_kas = yield_reservoirs.total_yield_kas + EXCLUDED.total_yield_kas,
-                    last_updated = CURRENT_TIMESTAMP
-                "#
-            )
-            .bind(&agg_wallets).bind(&agg_deltas)
-            .execute(&mut *tx).await;
-
-            if let Err(e) = upsert_res {
-                tracing::error!("Upsert failed: {}", e);
-                commit_success = false; 
-            }
-        }
-
-        // 3. 1099-DA Compliance Stamping (Gross Proceeds Ledger)
-        if commit_success && !agg_wallets.is_empty() {
-            // Fetch live spot price from Redis to stamp the financial event
-            let kas_spot_price: f64 = redis::cmd("GET")
-                .arg("oracle:spot:KAS_USDC")
-                .query_async(&mut redis_conn)
-                .await
-                .unwrap_or(0.16); // Failsafe to static baseline if oracle desyncs
-
-            let mut event_types = Vec::with_capacity(agg_wallets.len());
-            let mut tickers = Vec::with_capacity(agg_wallets.len());
-            let mut gross_proceeds = Vec::with_capacity(agg_wallets.len());
-            let mut spot_prices = Vec::with_capacity(agg_wallets.len());
-
-            for delta in &agg_deltas {
-                event_types.push("YIELD");
-                tickers.push("KAS");
-                gross_proceeds.push(delta * kas_spot_price);
-                spot_prices.push(kas_spot_price);
-            }
-
-            let tax_ledger_res = sqlx::query(
-                r#"
-                INSERT INTO tax_ledger_events 
-                (wallet_address, asset_ticker, event_type, gross_proceeds_usd, amount_tokens, spot_price_at_execution)
-                SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::float8[], $5::float8[], $6::float8[])
-                "#
-            )
-            .bind(&agg_wallets)
-            .bind(&tickers)
-            .bind(&event_types)
-            .bind(&gross_proceeds)
-            .bind(&agg_deltas)
-            .bind(&spot_prices)
-            .execute(&mut *tx).await;
-
-            if let Err(e) = tax_ledger_res {
-                tracing::error!("Tax ledger failed: {}", e);
-                commit_success = false; 
-            }
-        }
-
-        if commit_success {
-            let _ = tx.commit().await;
-        } else {
-            let _ = tx.rollback().await;
-        }
-    }
 }
 </file>
 
@@ -3349,8 +3499,8 @@ panic = "abort"
 stratum_port: ":5555"
 kaspad_address: "127.0.0.1:16110"
 
-# Central Pool Wallet
-mining_address: "kaspa:qz2sehqzx8xetzkhz2ycqflwf8dhusyxhj0myv4ez72k0n6vdaj827jexnyzz"
+# Central Pool Wallet (Matched to Master Admin Treasury)
+mining_address: "kaspa:qrc3ezl770p2cjlfc3tjp6vqlldt6lgh3e80d6rm4rchtt0yrrpgzqave8579"
 
 # Public Pool Mechanics
 starting_diff: 64       # ⚡ Allows IceRiver and Goldshell miners to survive
@@ -3362,6 +3512,421 @@ extranonce_size: 2
 # Telemetry System
 prom_port: ":8081"
 print_stats: true
+</file>
+
+<file path="src/telemetry/mod.rs">
+use prometheus::{GaugeVec, IntCounterVec, Opts, Registry, TextEncoder, Encoder};
+use lazy_static::lazy_static;
+use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
+use std::collections::{HashMap, VecDeque};
+use serde_json::json;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const KASPA_DIFF_CONSTANT: f64 = 4_294_967_296.0;
+
+lazy_static! {
+    pub static ref REGISTRY: Registry = Registry::new();
+
+    pub static ref WORKER_HASHRATE: GaugeVec = GaugeVec::new(
+        Opts::new("ks_worker_hashrate", "Strictly verified unsimulated hashrate per worker in TH/s"),
+        &["worker"]
+    ).expect("Metric setup failed");
+
+    pub static ref WORKER_SHARES: IntCounterVec = IntCounterVec::new(
+        Opts::new("ks_worker_shares", "Cryptographically validated shares per worker"),
+        &["worker", "type"]
+    ).expect("Metric setup failed");
+}
+
+pub fn init_telemetry() {
+    REGISTRY.register(Box::new(WORKER_HASHRATE.clone())).unwrap();
+    REGISTRY.register(Box::new(WORKER_SHARES.clone())).unwrap();
+}
+
+pub async fn start_prometheus_exporter(_bind_addr: String) {
+    let addr = "0.0.0.0:8081";
+    let listener = TcpListener::bind(addr).await.expect("Failed to bind Prometheus port");
+    
+    tracing::info!("📊 Zero-Simulation Telemetry exporter natively active on http://{}/metrics", addr);
+
+    loop {
+        if let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0; 1024];
+                let _ = socket.read(&mut buf).await; 
+
+                let mut buffer = vec![];
+                let encoder = TextEncoder::new();
+                let metric_families = REGISTRY.gather();
+                encoder.encode(&metric_families, &mut buffer).unwrap();
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\n\r\n{}",
+                    buffer.len(),
+                    String::from_utf8_lossy(&buffer)
+                );
+                
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    }
+}
+
+// ⚡ The Block-Finder Bonus Update
+struct WorkerState {
+    last_share_ts: u64,
+    share_history: VecDeque<(u64, f64)>,
+    shares_contributed: f64,
+    blocks_found: u64,
+    unflushed_difficulty: f64,
+    unflushed_blocks: u64, // Ensures Chronos picks up newly found blocks
+}
+
+pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String, f64, bool)>) {
+    tracing::info!("🏦 Institutional Accounting & Telemetry Engine Booted. Awaiting verified shares...");
+
+    let redis_client = redis::Client::open("redis://127.0.0.1/").expect("Redis connection failed");
+    let mut redis_conn = match redis_client.get_multiplexed_async_connection().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("❌ CRITICAL: Could not connect to Redis for Accounting! {}", e);
+            return;
+        }
+    };
+
+    let mut flush_interval = tokio::time::interval(tokio::time::Duration::from_millis(1000));
+    let mut worker_states: HashMap<String, WorkerState> = HashMap::new();
+
+    loop {
+        tokio::select! {
+            Some((full_worker_name, difficulty, is_network_block)) = valid_share_rx.recv() => {
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+
+                let state = worker_states.entry(full_worker_name.clone()).or_insert_with(|| WorkerState {
+                    last_share_ts: now,
+                    share_history: VecDeque::new(),
+                    shares_contributed: 0.0,
+                    blocks_found: 0,
+                    unflushed_difficulty: 0.0,
+                    unflushed_blocks: 0,
+                });
+
+                state.share_history.push_back((now, difficulty));
+                state.last_share_ts = now;
+                state.shares_contributed += difficulty;
+                state.unflushed_difficulty += difficulty;
+
+                if is_network_block {
+                    state.blocks_found += 1;
+                    state.unflushed_blocks += 1;
+                }
+
+                WORKER_SHARES.with_label_values(&[&full_worker_name, "valid"]).inc_by(difficulty as u64);
+            }
+
+            _ = flush_interval.tick() => {
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+                let mut pipeline = redis::pipe();
+                let mut total_hashrate = 0.0;
+                let mut workers_array = Vec::new();
+                let mut keys_to_remove = Vec::new();
+
+                let cutoff_300s = now.saturating_sub(300_000);
+                let cutoff_60s = now.saturating_sub(60_000); 
+
+                if !worker_states.is_empty() {
+                    for (full_worker, state) in worker_states.iter_mut() {
+                        let dt_idle = (now.saturating_sub(state.last_share_ts)) as f64 / 1000.0;
+
+                        while let Some(&(ts, _)) = state.share_history.front() {
+                            if ts < cutoff_300s {
+                                state.share_history.pop_front();
+                            } else {
+                                break;
+                            }
+                        }
+
+                        let mut work_60s = 0.0;
+                        let mut work_300s = 0.0;
+                        let mut oldest_ts = now;
+
+                        for &(ts, diff) in state.share_history.iter() {
+                            let work = diff * KASPA_DIFF_CONSTANT;
+                            work_300s += work;
+                            if ts >= cutoff_60s {
+                                work_60s += work;
+                            }
+                            if ts < oldest_ts {
+                                oldest_ts = ts;
+                            }
+                        }
+
+                        let mut elapsed_total = ((now - oldest_ts) as f64) / 1000.0;
+                        if elapsed_total < 1.0 { elapsed_total = 1.0; }
+
+                        let mut elapsed_60s = elapsed_total.min(60.0);
+                        if elapsed_60s < 1.0 { elapsed_60s = 1.0; }
+
+                        let hr_300s = work_300s / elapsed_total;
+                        let hr_60s = work_60s / elapsed_60s;
+
+                        let current_hashrate = (hr_60s * 0.4) + (hr_300s * 0.6);
+                        let is_online = current_hashrate > 0.0 || dt_idle < 60.0;
+
+                        if !is_online {
+                            keys_to_remove.push(full_worker.clone());
+                            pipeline.cmd("SET").arg(format!("worker:{}:hashrate", full_worker)).arg(0.0).ignore();
+                            pipeline.cmd("SREM").arg("pool:workers").arg(full_worker.clone()).ignore();
+                        } else {
+                            total_hashrate += current_hashrate;
+
+                            WORKER_HASHRATE.with_label_values(&[full_worker]).set(current_hashrate / 1e12);
+                            pipeline.cmd("SET").arg(format!("worker:{}:hashrate", full_worker)).arg(current_hashrate).ignore();
+
+                            // ⚡ Push Data to Redis so Chronos can capture shares AND blocks
+                            if state.unflushed_difficulty > 0.0 || state.unflushed_blocks > 0 {
+                                let parts: Vec<&str> = full_worker.split('.').collect();
+                                let wallet = parts[0];
+                                let wallet_key = format!("perennia:ledger:wallet:{}", wallet);
+
+                                pipeline.cmd("SADD").arg("pool:workers").arg(full_worker.clone()).ignore();
+
+                                if state.unflushed_difficulty > 0.0 {
+                                    pipeline.cmd("INCRBYFLOAT").arg(&wallet_key).arg(state.unflushed_difficulty).ignore();
+                                    pipeline.cmd("INCRBYFLOAT").arg(format!("worker:{}:shares", full_worker)).arg(state.unflushed_difficulty).ignore();
+                                    state.unflushed_difficulty = 0.0;
+                                }
+
+                                if state.unflushed_blocks > 0 {
+                                    pipeline.cmd("INCRBY").arg(format!("worker:{}:blocks_unpaid", full_worker)).arg(state.unflushed_blocks).ignore();
+                                    state.unflushed_blocks = 0;
+                                }
+                            }
+
+                            let parts: Vec<&str> = full_worker.split('.').collect();
+                            let wallet_address = if !parts.is_empty() { parts[0] } else { full_worker.as_str() };
+                            let worker_name = if parts.len() > 1 { parts[1..].join(".") } else { full_worker.to_string() };
+
+                            workers_array.push(json!({
+                                "fullIdentity": full_worker,
+                                "walletAddress": wallet_address,
+                                "name": worker_name,
+                                "trackingRate": current_hashrate,
+                                "sharesContributed": state.shares_contributed,
+                                "blocksFound": state.blocks_found,
+                                "status": "online"
+                            }));
+                        }
+                    }
+
+                    for key in keys_to_remove {
+                        worker_states.remove(&key);
+                    }
+                }
+
+                pipeline.cmd("SET").arg("pool:hashrate").arg(total_hashrate).ignore();
+
+                let telemetry_payload = json!({
+                    "totalHashrate": total_hashrate,
+                    "workers": workers_array
+                });
+
+                let payload_str = telemetry_payload.to_string();
+
+                pipeline.cmd("SET").arg("perennia:telemetry").arg(&payload_str).ignore();
+                pipeline.cmd("XADD").arg("telemetry:stream").arg("MAXLEN").arg("~").arg(100).arg("*").arg("payload").arg(&payload_str).ignore();
+                pipeline.cmd("PUBLISH").arg("telemetry:updates").arg(&payload_str).ignore();
+
+                if let Err(e) = pipeline.query_async::<_, ()>(&mut redis_conn).await {
+                    tracing::error!("🚨 CRITICAL LEDGER FAILURE: {}", e);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    if let Ok(new_conn) = redis_client.get_multiplexed_async_connection().await {
+                        redis_conn = new_conn;
+                    }
+                }
+            }
+        }
+    }
+}
+</file>
+
+<file path="src/oracle.rs">
+use std::time::Duration;
+use serde_json::Value;
+
+pub async fn start_spot_pricing_daemon() {
+    tracing::info!("🌐 Global Spot Price Oracle Daemon Booting...");
+    
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
+    let redis_client = match redis::Client::open("redis://127.0.0.1/") {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Spot Oracle Redis connection failed: {}", e);
+            return;
+        }
+    };
+
+    let mut redis_conn = match redis_client.get_multiplexed_async_connection().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Spot Oracle Redis multiplexer failed: {}", e);
+            return;
+        }
+    };
+
+    let mut interval = tokio::time::interval(Duration::from_secs(15));
+
+    loop {
+        interval.tick().await;
+
+        let url = "https://api.coingecko.com/api/v3/simple/price?ids=kaspa,bitcoin,ethereum,solana&vs_currencies=usd&include_24hr_change=true";
+        
+        match client.get(url).header("User-Agent", "Perennia-Core-Backend/1.0").send().await {
+            Ok(res) => {
+                if let Ok(data) = res.json::<serde_json::Value>().await {
+                    let mut pipeline = redis::pipe();
+                    
+                    pipeline.cmd("SET").arg("oracle:spot:prices_json").arg(data.to_string()).ignore();
+
+                    let assets = [
+                        ("kaspa", "KAS_USDC"),
+                        ("bitcoin", "BTC_USDC"),
+                        ("ethereum", "ETH_USDC"),
+                        ("solana", "SOL_USDC")
+                    ];
+
+                    for (cg_id, pair_id) in assets.iter() {
+                        if let Some(asset_data) = data.get(*cg_id) {
+                            if let Some(usd) = asset_data.get("usd").and_then(|v| v.as_f64()) {
+                                pipeline.cmd("SET").arg(format!("oracle:spot:{}", pair_id)).arg(usd.to_string()).ignore();
+                            }
+                            if let Some(change) = asset_data.get("usd_24h_change").and_then(|v| v.as_f64()) {
+                                pipeline.cmd("SET").arg(format!("oracle:change:{}", pair_id)).arg(change.to_string()).ignore();
+                            }
+                        }
+                    }
+
+                    if let Err(e) = pipeline.query_async::<_, ()>(&mut redis_conn).await {
+                        tracing::error!("Spot Oracle Redis Pipeline Failed: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Spot Oracle Upstream Fetch Failed: {}", e);
+            }
+        }
+    }
+}
+
+pub async fn start_oracle_daemon() {
+    tracing::info!("🔮 Yield Oracle Daemon Booting...");
+
+    let db_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:password@127.0.0.1:5432/perennia".to_string());
+    
+    let pool = match sqlx::PgPool::connect(&db_url).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!("Oracle DB connection failed: {}", e);
+            return;
+        }
+    };
+
+    let redis_client = match redis::Client::open("redis://127.0.0.1/") {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Oracle Redis connection failed: {}", e);
+            return;
+        }
+    };
+
+    let mut redis_conn = match redis_client.get_multiplexed_async_connection().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Oracle Redis multiplexer failed: {}", e);
+            return;
+        }
+    };
+
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+
+    loop {
+        interval.tick().await;
+
+        // ⚡ PHASE 2 PURGE: Legacy share_buffer and double-accounting removed. 
+        // Yield routing is now strictly handled by chronos.rs for absolute Silo precision.
+
+        // ⚡ Process Network Block Buffer into PostgreSQL 
+        let mut block_events = Vec::new();
+        loop {
+            let result: redis::RedisResult<Option<String>> = redis::cmd("LPOP")
+                .arg("perennia:oracle:block_buffer")
+                .query_async(&mut redis_conn)
+                .await;
+
+            match result {
+                Ok(Some(event_str)) => {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&event_str) {
+                        block_events.push(parsed);
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        if !block_events.is_empty() {
+            let mut tx_blocks = match pool.begin().await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!("Oracle failed to start DB transaction for blocks: {}", e);
+                    continue;
+                }
+            };
+            
+            let mut hashes = Vec::with_capacity(block_events.len());
+            let mut workers = Vec::with_capacity(block_events.len());
+            let mut nonces = Vec::with_capacity(block_events.len());
+            let mut diffs = Vec::with_capacity(block_events.len());
+
+            for evt in &block_events {
+                if let (Some(hash), Some(worker), Some(nonce), Some(diff)) = (
+                    evt["block_hash"].as_str(),
+                    evt["worker"].as_str(),
+                    evt["nonce"].as_u64(),
+                    evt["network_diff"].as_f64()
+                ) {
+                    hashes.push(hash.to_string());
+                    workers.push(worker.to_string());
+                    nonces.push(nonce as i64); 
+                    diffs.push(diff);
+                }
+            }
+
+            if !hashes.is_empty() {
+                let insert_res = sqlx::query(
+                    r#"
+                    INSERT INTO network_blocks (block_hash, worker_id, nonce, network_diff)
+                    SELECT * FROM UNNEST($1::text[], $2::text[], $3::bigint[], $4::float8[])
+                    ON CONFLICT (block_hash) DO NOTHING
+                    "#
+                )
+                .bind(&hashes).bind(&workers).bind(&nonces).bind(&diffs)
+                .execute(&mut *tx_blocks).await;
+
+                if let Err(e) = insert_res {
+                    tracing::error!("Failed to insert network blocks: {}", e);
+                    let _ = tx_blocks.rollback().await;
+                } else {
+                    let _ = tx_blocks.commit().await;
+                    tracing::info!("🧱 [ORACLE] Settled {} L1 network blocks into Postgres.", hashes.len());
+                }
+            }
+        }
+    }
+}
 </file>
 
 <file path="src/stratum_tcp/mod.rs">
@@ -3396,7 +3961,7 @@ fn clamp_to_power_of_2(diff: f64) -> u64 {
 pub async fn start_stratum_server(
     config: Arc<StratumConfig>, 
     job_manager: Arc<JobManager>,
-    valid_share_tx: mpsc::Sender<(String, f64)>,
+    valid_share_tx: mpsc::Sender<(String, f64, bool)>, // ⚡ UPDATED SIGNATURE
     port: u16,
     difficulty: f64,
     throttle_ms: u64
@@ -3432,10 +3997,13 @@ async fn handle_worker_connection(
     peer_addr: String,
     config: Arc<StratumConfig>,
     job_manager: Arc<JobManager>,
-    valid_share_tx: mpsc::Sender<(String, f64)>,
+    valid_share_tx: mpsc::Sender<(String, f64, bool)>, // ⚡ UPDATED SIGNATURE
     difficulty: f64,
     throttle_ms: u64
 ) -> anyhow::Result<()> {
+    // ⚡ FIX 1: Kill Nagle's Algorithm. Send tiny Stratum JSONs instantly!
+    socket.set_nodelay(true)?;
+
     let mut job_rx = job_manager.job_tx.subscribe();
     let conn_id = WORKER_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
     let extranonce1 = format!("{:04x}", conn_id & 0xFFFF); 
@@ -3481,10 +4049,11 @@ async fn handle_worker_connection(
                 response.push('\n');
                 write_half.write_all(response.as_bytes()).await?;
 
+                // ⚡ FIX 2: IceRiver Firmware requires the Extranonce2 size (4) passed here!
                 let en_json = json!({
                     "id": null,
                     "method": "mining.set_extranonce",
-                    "params": [extranonce1.clone()]
+                    "params": [extranonce1.clone(), 4] 
                 });
                 let mut en_resp = en_json.to_string();
                 en_resp.push('\n');
@@ -3537,7 +4106,11 @@ async fn handle_worker_connection(
     diff_msg.push('\n'); 
     write_half.write_all(diff_msg.as_bytes()).await?;
 
+    // ⚡ FIX 3: Enforce a newline on the Initial Job (Zero-Allocation approach)
     write_half.write_all(&initial_job[..]).await?; 
+    if !initial_job.ends_with(b"\n") {
+        write_half.write_all(b"\n").await?;
+    }
 
     let safe_throttle = if throttle_ms == 0 { 10 } else { throttle_ms };
     let mut throttle_interval = tokio::time::interval(Duration::from_millis(safe_throttle));
@@ -3565,8 +4138,14 @@ async fn handle_worker_connection(
 
             _ = throttle_interval.tick() => {
                 if let Some(payload) = pending_job_payload.take() {
+                    // ⚡ FIX 3: Enforce trailing newlines on all broadcasted jobs safely
                     if write_half.write_all(&payload[..]).await.is_err() {
                         anyhow::bail!("Write failed - Client disconnected");
+                    }
+                    if !payload.ends_with(b"\n") {
+                        if write_half.write_all(b"\n").await.is_err() {
+                            anyhow::bail!("Write failed - Client disconnected");
+                        }
                     }
                 }
             }
@@ -3625,7 +4204,6 @@ async fn handle_worker_connection(
                                         v => v.to_string(),
                                     }.replace('"', "").replace('\0', "").trim().to_string();
                                     
-                                    // Use authorized identity if submitted worker parameter is short/truncated
                                     let active_identity = if req_worker.starts_with("kaspa:") {
                                         req_worker.clone()
                                     } else if !current_worker_name.is_empty() {
@@ -3688,13 +4266,17 @@ async fn handle_worker_connection(
                                                 }
                                             });
 
+                                            // ⚡ Flagged true to tell telemetry UI to increment block count
+                                            let _ = valid_share_tx.try_send((active_identity.clone(), current_diff as f64, true));
                                             let _ = job_manager.block_submit_tx.try_send(rpc_block);
                                             is_accepted = true;
                                             
                                         } else if is_valid_share {
                                             tracing::info!("✅ [{}] TIER SHARE ACCEPTED | Worker: {} | Job: {}", peer_addr, active_identity, job_id);
                                             share_count += 1;
-                                            let _ = valid_share_tx.try_send((active_identity.clone(), current_diff as f64));
+                                            
+                                            // ⚡ Flagged false because it is a normal valid share, not a block
+                                            let _ = valid_share_tx.try_send((active_identity.clone(), current_diff as f64, false));
                                             is_accepted = true;
                                         } else {
                                             tracing::warn!("🚫 [{}] INVALID SHARE | Worker: {}", peer_addr, active_identity);

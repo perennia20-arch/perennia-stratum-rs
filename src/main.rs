@@ -5,8 +5,9 @@ mod kaspad_client;
 mod job_manager; 
 mod diff_engine; 
 mod oracle;
-mod sor; // ⚡ Inject the new Live SOR Engine
-mod chronos; // ⚡ Inject the Chronos Engine
+mod sor; 
+mod chronos; 
+mod state_api; // ⚡ INJECTED: Backend-Authoritative State Router
 
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -40,11 +41,16 @@ async fn main() -> anyhow::Result<()> {
             panic!("Database connection required for routing dependencies: {}", e);
         });
 
-    // ⚡ Ignite Chronos Backend Daemon
     let pool_chronos = pool.clone();
     tokio::spawn(async move {
         chronos::start_chronos_daemon(pool_chronos).await;
     });
+
+    if let Ok(redis_client_netting) = redis::Client::open("redis://127.0.0.1/") {
+        tokio::spawn(async move {
+            chronos::start_delta_netting_engine(redis_client_netting).await;
+        });
+    }
 
     telemetry::init_telemetry();
     let prom_port = config.prom_port.clone();
@@ -52,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
         telemetry::start_prometheus_exporter(prom_port).await;
     });
 
-    let (valid_share_tx, valid_share_rx) = mpsc::channel(10000);
+    let (valid_share_tx, valid_share_rx) = mpsc::channel::<(String, f64, bool)>(10000);
 
     tokio::spawn(async move {
         telemetry::start_accounting_engine(valid_share_rx).await;
@@ -62,15 +68,12 @@ async fn main() -> anyhow::Result<()> {
         oracle::start_oracle_daemon().await;
     });
 
-    // ⚡ Ignite the Global Spot Pricing Oracle Daemon
     tokio::spawn(async move {
         oracle::start_spot_pricing_daemon().await;
     });
 
-    // Restore Job Manager
     let (job_manager_arc, _job_rx, block_submit_rx) = JobManager::new();
 
-    // Restore Kaspad Client
     let config_clone = config.clone();
     let jm_clone = job_manager_arc.clone();
     
@@ -80,22 +83,20 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // ⚡ API Isolation: The Smart Order Router execution engine binds cleanly to port 8002
+    // ⚡ API Isolation: The Command Center Action Endpoint is now armed on port 8002
     let app = Router::new()
         .route("/v1/sor/execute", post(sor::handle_sor_execute))
+        .route("/v1/state/action", post(state_api::handle_state_action))
         .with_state(pool);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8002").await?;
     tokio::spawn(async move {
-        tracing::info!("🚀 Axum HTTP Server bound instantly on port 8002 (SOR Protocol Armed)");
+        tracing::info!("🚀 Axum HTTP Server bound instantly on port 8002 (SOR & State API Armed)");
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!("Axum Server Error: {}", e);
         }
     });
 
-    // ⚡ Restore 3-Tier Tokio Listeners for Physical Hash Power
-
-    // Tier 1: GPU/Mobile | Bind: 0.0.0.0:5551 | Diff: 1.0 | Throttle: 0ms
     let cfg_t1 = config.clone();
     let jm_t1 = job_manager_arc.clone();
     let tx_t1 = valid_share_tx.clone();
@@ -105,7 +106,6 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Tier 2: Home ASICs | Bind: 0.0.0.0:5552 | Diff: 256.0 | Throttle: 2500ms
     let cfg_t2 = config.clone();
     let jm_t2 = job_manager_arc.clone();
     let tx_t2 = valid_share_tx.clone();
@@ -115,12 +115,10 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Tier 3: Industrial ASICs | Bind: 0.0.0.0:5553 | Diff: 1024.0 | Throttle: 3000ms
     let cfg_t3 = config.clone();
     let jm_t3 = job_manager_arc.clone();
     let tx_t3 = valid_share_tx.clone();
     
-    // Blocking call on the final tier to keep the main thread alive
     stratum_tcp::start_stratum_server(cfg_t3, jm_t3, tx_t3, 5553, 1024.0, 3000).await?;
 
     Ok(())

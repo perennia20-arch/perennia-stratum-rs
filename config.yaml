@@ -2,8 +2,8 @@
 stratum_port: ":5555"
 kaspad_address: "127.0.0.1:16110"
 
-# Central Pool Wallet
-mining_address: "kaspa:qz2sehqzx8xetzkhz2ycqflwf8dhusyxhj0myv4ez72k0n6vdaj827jexnyzz"
+# Central Pool Wallet (Matched to Master Admin Treasury)
+mining_address: "kaspa:qrc3ezl770p2cjlfc3tjp6vqlldt6lgh3e80d6rm4rchtt0yrrpgzqave8579"
 
 # Public Pool Mechanics
 starting_diff: 64       # ⚡ Allows IceRiver and Goldshell miners to survive

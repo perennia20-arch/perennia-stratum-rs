@@ -3,15 +3,10 @@ use lazy_static::lazy_static;
 use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use serde_json::json;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// ⚡ 7-Tier Harmonic Cascade Time Constants (in Seconds)
-/// Tier 0 (1s) -> Tier 6 (377s Fibonacci Anchor)
-const EMA_WINDOWS: [f64; 7] = [1.0, 3.0, 8.0, 21.0, 55.0, 144.0, 377.0];
-
-/// Kaspa Fixed Difficulty Multiplier Constant (2^32 hashes per unit difficulty)
 const KASPA_DIFF_CONSTANT: f64 = 4_294_967_296.0;
 
 lazy_static! {
@@ -62,16 +57,17 @@ pub async fn start_prometheus_exporter(_bind_addr: String) {
     }
 }
 
-/// Internal struct tracking 64-byte harmonic state per worker
+// ⚡ The Block-Finder Bonus Update
 struct WorkerState {
     last_share_ts: u64,
-    emas: [f64; 7],
+    share_history: VecDeque<(u64, f64)>,
     shares_contributed: f64,
+    blocks_found: u64,
     unflushed_difficulty: f64,
-    unflushed_oracle_shares: Vec<(f64, u64)>, // (difficulty, timestamp)
+    unflushed_blocks: u64, // Ensures Chronos picks up newly found blocks
 }
 
-pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String, f64)>) {
+pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String, f64, bool)>) {
     tracing::info!("🏦 Institutional Accounting & Telemetry Engine Booted. Awaiting verified shares...");
 
     let redis_client = redis::Client::open("redis://127.0.0.1/").expect("Redis connection failed");
@@ -83,51 +79,36 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
         }
     };
 
-    // ⚡ 1000ms METRONOME TICK: High-frequency telemetry broadcast
     let mut flush_interval = tokio::time::interval(tokio::time::Duration::from_millis(1000));
     let mut worker_states: HashMap<String, WorkerState> = HashMap::new();
 
     loop {
         tokio::select! {
-            // ⚡ REAL-TIME SHARE INGESTION: Microsecond Continuous-Time EMA Cascade
-            Some((full_worker_name, difficulty)) = valid_share_rx.recv() => {
+            Some((full_worker_name, difficulty, is_network_block)) = valid_share_rx.recv() => {
                 let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-                let work = difficulty * KASPA_DIFF_CONSTANT;
 
                 let state = worker_states.entry(full_worker_name.clone()).or_insert_with(|| WorkerState {
                     last_share_ts: now,
-                    emas: [0.0; 7],
+                    share_history: VecDeque::new(),
                     shares_contributed: 0.0,
+                    blocks_found: 0,
                     unflushed_difficulty: 0.0,
-                    unflushed_oracle_shares: Vec::new(),
+                    unflushed_blocks: 0,
                 });
 
-                let dt_sec = (now.saturating_sub(state.last_share_ts)) as f64 / 1000.0;
-
-                // Execute Continuous-Time EMA Decay Across 7 Harmonic Tiers
-                for (i, &tau) in EMA_WINDOWS.iter().enumerate() {
-                    let alpha = 1.0 - f64::exp(-dt_sec / tau);
-                    
-                    // L'Hôpital Limit Guard against instant burst shares
-                    let contribution = if dt_sec > 0.001 {
-                        (work / dt_sec) * alpha
-                    } else {
-                        work / tau
-                    };
-
-                    state.emas[i] = (state.emas[i] * (1.0 - alpha)) + contribution;
-                }
-
+                state.share_history.push_back((now, difficulty));
                 state.last_share_ts = now;
                 state.shares_contributed += difficulty;
                 state.unflushed_difficulty += difficulty;
-                state.unflushed_oracle_shares.push((difficulty, now));
 
-                // ⚡ COMPILER FIX: IntCounterVec target WORKER_SHARES selected over GaugeVec WORKER_HASHRATE
+                if is_network_block {
+                    state.blocks_found += 1;
+                    state.unflushed_blocks += 1;
+                }
+
                 WORKER_SHARES.with_label_values(&[&full_worker_name, "valid"]).inc_by(difficulty as u64);
             }
 
-            // ⚡ 1000ms BROADCAST METRONOME: Read-Time Decay Projection & Stream Pipeline
             _ = flush_interval.tick() => {
                 let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
                 let mut pipeline = redis::pipe();
@@ -135,22 +116,47 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                 let mut workers_array = Vec::new();
                 let mut keys_to_remove = Vec::new();
 
+                let cutoff_300s = now.saturating_sub(300_000);
+                let cutoff_60s = now.saturating_sub(60_000); 
+
                 if !worker_states.is_empty() {
                     for (full_worker, state) in worker_states.iter_mut() {
                         let dt_idle = (now.saturating_sub(state.last_share_ts)) as f64 / 1000.0;
-                        let mut projected_emas = [0.0; 7];
 
-                        // Read-Time Projection Decay (projects drain without touching base state)
-                        for (i, &tau) in EMA_WINDOWS.iter().enumerate() {
-                            let alpha = 1.0 - f64::exp(-dt_idle / tau);
-                            projected_emas[i] = state.emas[i] * (1.0 - alpha);
+                        while let Some(&(ts, _)) = state.share_history.front() {
+                            if ts < cutoff_300s {
+                                state.share_history.pop_front();
+                            } else {
+                                break;
+                            }
                         }
 
-                        // Tier 2 (8-second window) serves as the primary UI Hashes/sec rate
-                        let current_hashrate = projected_emas[2];
+                        let mut work_60s = 0.0;
+                        let mut work_300s = 0.0;
+                        let mut oldest_ts = now;
 
-                        // Drop offline if tracking rate falls below 5 GH/s and idle > 30s
-                        let is_online = current_hashrate > 5_000_000_000.0 || dt_idle < 30.0;
+                        for &(ts, diff) in state.share_history.iter() {
+                            let work = diff * KASPA_DIFF_CONSTANT;
+                            work_300s += work;
+                            if ts >= cutoff_60s {
+                                work_60s += work;
+                            }
+                            if ts < oldest_ts {
+                                oldest_ts = ts;
+                            }
+                        }
+
+                        let mut elapsed_total = ((now - oldest_ts) as f64) / 1000.0;
+                        if elapsed_total < 1.0 { elapsed_total = 1.0; }
+
+                        let mut elapsed_60s = elapsed_total.min(60.0);
+                        if elapsed_60s < 1.0 { elapsed_60s = 1.0; }
+
+                        let hr_300s = work_300s / elapsed_total;
+                        let hr_60s = work_60s / elapsed_60s;
+
+                        let current_hashrate = (hr_60s * 0.4) + (hr_300s * 0.6);
+                        let is_online = current_hashrate > 0.0 || dt_idle < 60.0;
 
                         if !is_online {
                             keys_to_remove.push(full_worker.clone());
@@ -159,31 +165,27 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                         } else {
                             total_hashrate += current_hashrate;
 
-                            // Update Prometheus Gauge (in TH/s)
                             WORKER_HASHRATE.with_label_values(&[full_worker]).set(current_hashrate / 1e12);
-
                             pipeline.cmd("SET").arg(format!("worker:{}:hashrate", full_worker)).arg(current_hashrate).ignore();
 
-                            // Execute Ledger & Oracle Buffer Flushes if new shares were ingested
-                            if state.unflushed_difficulty > 0.0 {
+                            // ⚡ Push Data to Redis so Chronos can capture shares AND blocks
+                            if state.unflushed_difficulty > 0.0 || state.unflushed_blocks > 0 {
                                 let parts: Vec<&str> = full_worker.split('.').collect();
                                 let wallet = parts[0];
                                 let wallet_key = format!("perennia:ledger:wallet:{}", wallet);
 
-                                pipeline.cmd("INCRBYFLOAT").arg(&wallet_key).arg(state.unflushed_difficulty).ignore();
                                 pipeline.cmd("SADD").arg("pool:workers").arg(full_worker.clone()).ignore();
-                                pipeline.cmd("INCRBYFLOAT").arg(format!("worker:{}:shares", full_worker)).arg(state.unflushed_difficulty).ignore();
 
-                                for (diff, ts) in state.unflushed_oracle_shares.drain(..) {
-                                    let oracle_event = json!({
-                                        "worker": full_worker,
-                                        "difficulty": diff,
-                                        "timestamp": ts
-                                    });
-                                    pipeline.cmd("RPUSH").arg("perennia:oracle:share_buffer").arg(oracle_event.to_string()).ignore();
+                                if state.unflushed_difficulty > 0.0 {
+                                    pipeline.cmd("INCRBYFLOAT").arg(&wallet_key).arg(state.unflushed_difficulty).ignore();
+                                    pipeline.cmd("INCRBYFLOAT").arg(format!("worker:{}:shares", full_worker)).arg(state.unflushed_difficulty).ignore();
+                                    state.unflushed_difficulty = 0.0;
                                 }
 
-                                state.unflushed_difficulty = 0.0;
+                                if state.unflushed_blocks > 0 {
+                                    pipeline.cmd("INCRBY").arg(format!("worker:{}:blocks_unpaid", full_worker)).arg(state.unflushed_blocks).ignore();
+                                    state.unflushed_blocks = 0;
+                                }
                             }
 
                             let parts: Vec<&str> = full_worker.split('.').collect();
@@ -196,14 +198,12 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                                 "name": worker_name,
                                 "trackingRate": current_hashrate,
                                 "sharesContributed": state.shares_contributed,
-                                "blocksFound": 0,
-                                "status": "online",
-                                "harmonicMesh": projected_emas
+                                "blocksFound": state.blocks_found,
+                                "status": "online"
                             }));
                         }
                     }
 
-                    // Evict completely drained offline workers
                     for key in keys_to_remove {
                         worker_states.remove(&key);
                     }
@@ -218,35 +218,14 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
 
                 let payload_str = telemetry_payload.to_string();
 
-                // 1. Snapshot Cache for HTTP Polling endpoints
-                pipeline.cmd("SET")
-                    .arg("perennia:telemetry")
-                    .arg(&payload_str)
-                    .ignore();
+                pipeline.cmd("SET").arg("perennia:telemetry").arg(&payload_str).ignore();
+                pipeline.cmd("XADD").arg("telemetry:stream").arg("MAXLEN").arg("~").arg(100).arg("*").arg("payload").arg(&payload_str).ignore();
+                pipeline.cmd("PUBLISH").arg("telemetry:updates").arg(&payload_str).ignore();
 
-                // 2. ⚡ REAL-TIME REDIS STREAM: XADD for WebSocket Event Pipelines
-                pipeline.cmd("XADD")
-                    .arg("telemetry:stream")
-                    .arg("MAXLEN").arg("~").arg(100)
-                    .arg("*")
-                    .arg("payload").arg(&payload_str)
-                    .ignore();
-                    
-                // 3. ⚡ SVELTEKIT SSE: Pub/Sub Broadcast
-                pipeline.cmd("PUBLISH")
-                    .arg("telemetry:updates")
-                    .arg(&payload_str)
-                    .ignore();
-
-                // Execute Atomic Pipeline
                 if let Err(e) = pipeline.query_async::<_, ()>(&mut redis_conn).await {
                     tracing::error!("🚨 CRITICAL LEDGER FAILURE: {}", e);
-                    tracing::warn!("🔄 Attempting to re-establish broken Redis multiplexer pipeline...");
-                    
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                    
                     if let Ok(new_conn) = redis_client.get_multiplexed_async_connection().await {
-                        tracing::info!("✅ Redis connection successfully restored.");
                         redis_conn = new_conn;
                     }
                 }

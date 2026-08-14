@@ -44,12 +44,36 @@ CREATE TABLE IF NOT EXISTS network_blocks (
 );
 
 -- ==============================================================================
--- 5. SOVEREIGN COMMAND CENTER STATE (Phase 2 Upgrade)
+-- 5. SOVEREIGN COMMAND CENTER STATE 
 -- ==============================================================================
 CREATE TABLE IF NOT EXISTS user_command_centers (
     wallet_address VARCHAR(255) PRIMARY KEY,
     layout_state JSONB NOT NULL DEFAULT '{}'::jsonb,
     last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ==============================================================================
+-- 6. COMPLIANCE & TAX FORTRESS LEDGER
+-- ==============================================================================
+CREATE TABLE IF NOT EXISTS entity_kyc (
+    wallet_address VARCHAR(255) PRIMARY KEY,
+    legal_name VARCHAR(255) NOT NULL,
+    entity_type VARCHAR(50) NOT NULL,
+    tax_id_hash TEXT NOT NULL,
+    business_address TEXT NOT NULL,
+    verification_status VARCHAR(50) DEFAULT 'pending',
+    verified_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE TABLE IF NOT EXISTS tax_ledger_events (
+    event_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    wallet_address VARCHAR(255) NOT NULL,
+    asset_ticker VARCHAR(20) NOT NULL,
+    event_type VARCHAR(50) NOT NULL,
+    gross_proceeds_usd DOUBLE PRECISION NOT NULL,
+    amount_tokens DOUBLE PRECISION NOT NULL,
+    spot_price_at_execution DOUBLE PRECISION NOT NULL,
+    recorded_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
 -- ==============================================================================
@@ -62,9 +86,7 @@ CREATE INDEX IF NOT EXISTS idx_micro_shares_settlement ON micro_shares(is_settle
 CREATE INDEX IF NOT EXISTS idx_network_blocks_worker ON network_blocks(worker_id);
 CREATE INDEX IF NOT EXISTS idx_network_blocks_time ON network_blocks(discovered_at DESC);
 CREATE INDEX IF NOT EXISTS idx_user_command_centers_updated ON user_command_centers(last_updated DESC);
-
--- Drop legacy B-Tree for time-series if it exists from Phase 1
-DROP INDEX IF EXISTS idx_micro_shares_recorded;
+CREATE INDEX IF NOT EXISTS idx_tax_ledger_wallet ON tax_ledger_events(wallet_address, recorded_at DESC);
 
 -- BRIN (Block Range Index) for hyper-optimized append-only time-series data
 CREATE INDEX IF NOT EXISTS idx_micro_shares_recorded_brin 
@@ -80,4 +102,4 @@ CREATE UNLOGGED TABLE IF NOT EXISTS rwa_oracle_feeds (
     PRIMARY KEY (ticker, updated_at)
 );
 
-CREATE INDEX idx_rwa_oracle_ticker_time ON rwa_oracle_feeds (ticker, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_rwa_oracle_ticker_time ON rwa_oracle_feeds (ticker, updated_at DESC);

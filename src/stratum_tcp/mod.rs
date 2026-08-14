@@ -29,7 +29,7 @@ fn clamp_to_power_of_2(diff: f64) -> u64 {
 pub async fn start_stratum_server(
     config: Arc<StratumConfig>, 
     job_manager: Arc<JobManager>,
-    valid_share_tx: mpsc::Sender<(String, f64)>,
+    valid_share_tx: mpsc::Sender<(String, f64, bool)>, // ⚡ UPDATED SIGNATURE
     port: u16,
     difficulty: f64,
     throttle_ms: u64
@@ -65,7 +65,7 @@ async fn handle_worker_connection(
     peer_addr: String,
     config: Arc<StratumConfig>,
     job_manager: Arc<JobManager>,
-    valid_share_tx: mpsc::Sender<(String, f64)>,
+    valid_share_tx: mpsc::Sender<(String, f64, bool)>, // ⚡ UPDATED SIGNATURE
     difficulty: f64,
     throttle_ms: u64
 ) -> anyhow::Result<()> {
@@ -334,13 +334,17 @@ async fn handle_worker_connection(
                                                 }
                                             });
 
+                                            // ⚡ Flagged true to tell telemetry UI to increment block count
+                                            let _ = valid_share_tx.try_send((active_identity.clone(), current_diff as f64, true));
                                             let _ = job_manager.block_submit_tx.try_send(rpc_block);
                                             is_accepted = true;
                                             
                                         } else if is_valid_share {
                                             tracing::info!("✅ [{}] TIER SHARE ACCEPTED | Worker: {} | Job: {}", peer_addr, active_identity, job_id);
                                             share_count += 1;
-                                            let _ = valid_share_tx.try_send((active_identity.clone(), current_diff as f64));
+                                            
+                                            // ⚡ Flagged false because it is a normal valid share, not a block
+                                            let _ = valid_share_tx.try_send((active_identity.clone(), current_diff as f64, false));
                                             is_accepted = true;
                                         } else {
                                             tracing::warn!("🚫 [{}] INVALID SHARE | Worker: {}", peer_addr, active_identity);
