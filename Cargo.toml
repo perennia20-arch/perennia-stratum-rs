@@ -1,3 +1,5 @@
+# Cargo.toml
+
 [package]
 name = "perennia-stratum-rs"
 version = "0.2.0"
@@ -23,13 +25,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dashmap = "6.0"
 
+# 🛡️ SOVEREIGN WEBSOCKET ORACLE
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
+
 # 🛡️ BRIDGE API ORCHESTRATION & SOR ROUTING MATRIX
 axum = "0.7"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 hex = "0.4"
 
 # 🛡️ SOVEREIGN INFRASTRUCTURE: PostgreSQL Yield Streaming WAL
-# ⚡ Added `json` feature to allow binding JSONB natively into the Chronos Daemon
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.8", features = ["v4", "serde"] }

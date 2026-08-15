@@ -1,3 +1,4 @@
+// src/telemetry/mod.rs
 use prometheus::{GaugeVec, IntCounterVec, Opts, Registry, TextEncoder, Encoder};
 use lazy_static::lazy_static;
 use tokio::net::TcpListener;
@@ -6,6 +7,7 @@ use tokio::sync::mpsc;
 use std::collections::{HashMap, VecDeque};
 use serde_json::json;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::env;
 
 const KASPA_DIFF_CONSTANT: f64 = 4_294_967_296.0;
 
@@ -57,20 +59,22 @@ pub async fn start_prometheus_exporter(_bind_addr: String) {
     }
 }
 
-// ⚡ The Block-Finder Bonus Update
 struct WorkerState {
     last_share_ts: u64,
     share_history: VecDeque<(u64, f64)>,
     shares_contributed: f64,
     blocks_found: u64,
     unflushed_difficulty: f64,
-    unflushed_blocks: u64, // Ensures Chronos picks up newly found blocks
+    unflushed_blocks: u64, 
 }
 
 pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String, f64, bool)>) {
     tracing::info!("🏦 Institutional Accounting & Telemetry Engine Booted. Awaiting verified shares...");
 
-    let redis_client = redis::Client::open("redis://127.0.0.1/").expect("Redis connection failed");
+    // ⚡ INFRASTRUCTURE HARDENING
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
+    let redis_client = redis::Client::open(redis_url).expect("Redis connection failed");
+    
     let mut redis_conn = match redis_client.get_multiplexed_async_connection().await {
         Ok(c) => c,
         Err(e) => {
@@ -168,7 +172,6 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                             WORKER_HASHRATE.with_label_values(&[full_worker]).set(current_hashrate / 1e12);
                             pipeline.cmd("SET").arg(format!("worker:{}:hashrate", full_worker)).arg(current_hashrate).ignore();
 
-                            // ⚡ Push Data to Redis so Chronos can capture shares AND blocks
                             if state.unflushed_difficulty > 0.0 || state.unflushed_blocks > 0 {
                                 let parts: Vec<&str> = full_worker.split('.').collect();
                                 let wallet = parts[0];

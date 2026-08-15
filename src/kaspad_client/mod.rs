@@ -1,9 +1,11 @@
+// src/kaspad_client/mod.rs
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use redis::AsyncCommands; 
 use crate::config::StratumConfig;
 use crate::job_manager::JobManager; 
+use std::env;
 
 pub mod protowire {
     tonic::include_proto!("protowire");
@@ -20,13 +22,16 @@ pub async fn start_kaspad_client(
     job_manager: Arc<JobManager>,
     mut block_submit_rx: mpsc::Receiver<RpcBlock>
 ) -> anyhow::Result<()> {
-    let mut url = config.kaspad_address.clone();
+    
+    // ⚡ INFRASTRUCTURE HARDENING
+    let mut url = env::var("KASPAD_ADDRESS").unwrap_or_else(|_| config.kaspad_address.clone());
     if !url.starts_with("http") {
         url = format!("http://{}", url);
     }
     
-    tracing::info!("🔌 Connecting to local Redis Cache for Frontend UI...");
-    let redis_client = redis::Client::open("redis://127.0.0.1/")?;
+    tracing::info!("🔌 Connecting to Distributed Redis Cluster for Frontend UI...");
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
+    let redis_client = redis::Client::open(redis_url)?;
     let mut redis_conn = redis_client.get_multiplexed_async_connection().await?;
     
     tracing::info!("🔗 Booting gRPC Uplink to Upstream Node: {}", url);
@@ -113,7 +118,6 @@ pub async fn start_kaspad_client(
                         tracing::error!("❌ GET_BLOCK_TEMPLATE REJECTED BY NODE: {}", err.message);
                     } else if let Some(block) = res.block {
                         
-                        // ⚡ Mainnet Math: Ensures block reward is securely captured so Chronos doesn't fault out
                         let mut block_reward = 50.0;
                         if let Some(coinbase_tx) = block.transactions.first() {
                             let total_sompi: u64 = coinbase_tx.outputs.iter().map(|o| o.amount).sum();
@@ -139,7 +143,6 @@ pub async fn start_kaspad_client(
                     if let Some(err) = res.error {
                         tracing::error!("❌ GET_BLOCK_DAG_INFO REJECTED BY NODE: {}", err.message);
                     } else {
-                        // ⚡ Pushes real-time network expected hashes (Difficulty) into Redis
                         let _: redis::RedisResult<()> = redis_conn.set("pool:network_diff", res.difficulty).await;
                     }
                 }

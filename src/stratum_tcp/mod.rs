@@ -1,3 +1,4 @@
+// src/stratum_tcp/mod.rs
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::AsyncWriteExt;
 use tokio_util::codec::{FramedRead, LinesCodec};
@@ -29,7 +30,7 @@ fn clamp_to_power_of_2(diff: f64) -> u64 {
 pub async fn start_stratum_server(
     config: Arc<StratumConfig>, 
     job_manager: Arc<JobManager>,
-    valid_share_tx: mpsc::Sender<(String, f64, bool)>, // ⚡ UPDATED SIGNATURE
+    valid_share_tx: mpsc::Sender<(String, f64, bool)>,
     port: u16,
     difficulty: f64,
     throttle_ms: u64
@@ -65,11 +66,10 @@ async fn handle_worker_connection(
     peer_addr: String,
     config: Arc<StratumConfig>,
     job_manager: Arc<JobManager>,
-    valid_share_tx: mpsc::Sender<(String, f64, bool)>, // ⚡ UPDATED SIGNATURE
+    valid_share_tx: mpsc::Sender<(String, f64, bool)>,
     difficulty: f64,
     throttle_ms: u64
 ) -> anyhow::Result<()> {
-    // ⚡ FIX 1: Kill Nagle's Algorithm. Send tiny Stratum JSONs instantly!
     socket.set_nodelay(true)?;
 
     let mut job_rx = job_manager.job_tx.subscribe();
@@ -86,11 +86,18 @@ async fn handle_worker_connection(
     let mut current_worker_name = String::new();
 
     let mut share_count = 0;
+    let mut invalid_share_count = 0;
     let mut last_vardiff_retarget = Instant::now();
     let target_shares_per_min = config.shares_per_min as f64;
 
+    // Handshake DoS Hardening: 30 second maximum connection idle limit
     while handshake_state < 2 {
-        let line_res = reader.next().await;
+        let line_timeout = tokio::time::timeout(Duration::from_secs(30), reader.next()).await;
+        let line_res = match line_timeout {
+            Ok(res) => res,
+            Err(_) => anyhow::bail!("EOF - Handshake timeout (Possible Slowloris / Inactive Client)"),
+        };
+        
         if line_res.is_none() { anyhow::bail!("EOF - Client closed connection during handshake"); }
         
         let payload_str = match line_res.unwrap() {
@@ -117,7 +124,6 @@ async fn handle_worker_connection(
                 response.push('\n');
                 write_half.write_all(response.as_bytes()).await?;
 
-                // ⚡ FIX 2: IceRiver Firmware requires the Extranonce2 size (4) passed here!
                 let en_json = json!({
                     "id": null,
                     "method": "mining.set_extranonce",
@@ -174,7 +180,6 @@ async fn handle_worker_connection(
     diff_msg.push('\n'); 
     write_half.write_all(diff_msg.as_bytes()).await?;
 
-    // ⚡ FIX 3: Enforce a newline on the Initial Job (Zero-Allocation approach)
     write_half.write_all(&initial_job[..]).await?; 
     if !initial_job.ends_with(b"\n") {
         write_half.write_all(b"\n").await?;
@@ -206,7 +211,6 @@ async fn handle_worker_connection(
 
             _ = throttle_interval.tick() => {
                 if let Some(payload) = pending_job_payload.take() {
-                    // ⚡ FIX 3: Enforce trailing newlines on all broadcasted jobs safely
                     if write_half.write_all(&payload[..]).await.is_err() {
                         anyhow::bail!("Write failed - Client disconnected");
                     }
@@ -250,7 +254,13 @@ async fn handle_worker_connection(
                 }
             }
 
-            line_res = reader.next() => {
+            // Mining DoS Hardening: 600 second maximum execution timeout without a submitted share
+            line_timeout = tokio::time::timeout(Duration::from_secs(600), reader.next()) => {
+                let line_res = match line_timeout {
+                    Ok(res) => res,
+                    Err(_) => anyhow::bail!("EOF - Miner inactive timeout (No shares submitted in 600s)"),
+                };
+                
                 if line_res.is_none() { anyhow::bail!("EOF - Client closed connection"); }
                 
                 let payload_str = match line_res.unwrap() {
@@ -334,21 +344,27 @@ async fn handle_worker_connection(
                                                 }
                                             });
 
-                                            // ⚡ Flagged true to tell telemetry UI to increment block count
                                             let _ = valid_share_tx.try_send((active_identity.clone(), current_diff as f64, true));
                                             let _ = job_manager.block_submit_tx.try_send(rpc_block);
                                             is_accepted = true;
+                                            invalid_share_count = 0; // Reset strike counter on valid interaction
                                             
                                         } else if is_valid_share {
                                             tracing::info!("✅ [{}] TIER SHARE ACCEPTED | Worker: {} | Job: {}", peer_addr, active_identity, job_id);
                                             share_count += 1;
                                             
-                                            // ⚡ Flagged false because it is a normal valid share, not a block
                                             let _ = valid_share_tx.try_send((active_identity.clone(), current_diff as f64, false));
                                             is_accepted = true;
+                                            invalid_share_count = 0; // Reset strike counter on valid interaction
                                         } else {
                                             tracing::warn!("🚫 [{}] INVALID SHARE | Worker: {}", peer_addr, active_identity);
                                             err_msg = json!([20, "Invalid share", null]);
+                                            
+                                            // Invalid Share DoS Protection Lockout
+                                            invalid_share_count += 1;
+                                            if invalid_share_count >= 5 {
+                                                anyhow::bail!("Disconnecting worker: Too many consecutive invalid shares.");
+                                            }
                                         }
                                     } else {
                                         tracing::warn!("⚠️ [{}] STALE JOB REJECTED: {}", peer_addr, job_id);

@@ -1,3 +1,4 @@
+// src/main.rs
 mod config;
 mod stratum_tcp;
 mod telemetry;
@@ -7,7 +8,7 @@ mod diff_engine;
 mod oracle;
 mod sor; 
 mod chronos; 
-mod state_api; // ⚡ INJECTED: Backend-Authoritative State Router
+mod state_api; 
 
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -30,7 +31,10 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Targeted Treasury Wallet: {}", config.mining_address);
 
     tracing::info!("Initializing PostgreSQL Pool...");
+    
+    // ⚡ INFRASTRUCTURE HARDENING
     let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://postgres:password@127.0.0.1:5432/perennia".to_string());
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
     
     let pool = PgPoolOptions::new()
         .max_connections(10)
@@ -46,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
         chronos::start_chronos_daemon(pool_chronos).await;
     });
 
-    if let Ok(redis_client_netting) = redis::Client::open("redis://127.0.0.1/") {
+    if let Ok(redis_client_netting) = redis::Client::open(redis_url.clone()) {
         tokio::spawn(async move {
             chronos::start_delta_netting_engine(redis_client_netting).await;
         });
@@ -83,7 +87,6 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // ⚡ API Isolation: The Command Center Action Endpoint is now armed on port 8002
     let app = Router::new()
         .route("/v1/sor/execute", post(sor::handle_sor_execute))
         .route("/v1/state/action", post(state_api::handle_state_action))

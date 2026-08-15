@@ -1,7 +1,9 @@
+// src/state_api.rs
 use axum::{Json, extract::State};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use std::env;
 
 #[derive(Deserialize, Debug)]
 pub struct StateActionReq {
@@ -20,7 +22,10 @@ pub async fn handle_state_action(
     State(pool): State<PgPool>,
     Json(req): Json<StateActionReq>,
 ) -> Result<Json<ActionResponse>, Json<ActionResponse>> {
-    let redis_client = match redis::Client::open("redis://127.0.0.1/") {
+    
+    // ⚡ INFRASTRUCTURE HARDENING
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
+    let redis_client = match redis::Client::open(redis_url) {
         Ok(c) => c,
         Err(e) => return Err(Json(ActionResponse { success: false, error: Some(e.to_string()) })),
     };
@@ -43,7 +48,7 @@ pub async fn handle_state_action(
 
     let mut state: Value = match row {
         Ok(Some(r)) => r.layout_state,
-        _ => json!({"workers": [], "silos": [], "plants": [], "manualLps": [], "systemMode": "base"}),
+        _ => json!({"workers": [], "sectors": [], "manualLps": [], "systemMode": "base"}),
     };
 
     match req.action.as_str() {
@@ -77,134 +82,79 @@ pub async fn handle_state_action(
                 }
             }
         },
-        "ASSIGN_WORKER_TO_SILO" => {
-            if let Some(worker_id) = req.payload.get("workerId").and_then(|i| i.as_str()) {
-                let silo_id = req.payload.get("siloId").unwrap_or(&Value::Null).clone();
-                if let Some(workers) = state.get_mut("workers").and_then(|w| w.as_array_mut()) {
-                    for w in workers.iter_mut() {
-                        if w.get("id").and_then(|i| i.as_str()).unwrap_or("") == worker_id {
-                            w["assignedSiloId"] = silo_id.clone();
-                        }
-                    }
+        "ADD_SECTOR" => {
+            let new_pct = req.payload.get("allocationPercentage").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let mut total_pct = new_pct;
+
+            if let Some(sectors) = state.get("sectors").and_then(|s| s.as_array()) {
+                for sec in sectors {
+                    total_pct += sec.get("allocationPercentage").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 }
             }
-        },
-        "ADD_SILO" => {
-            if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
-                silos.push(req.payload.clone());
+
+            if total_pct > 100.0 {
+                let _ = tx.rollback().await;
+                return Err(Json(ActionResponse { success: false, error: Some("Total sector allocation cannot exceed 100%".to_string()) }));
+            }
+
+            if let Some(sectors) = state.get_mut("sectors").and_then(|s| s.as_array_mut()) {
+                sectors.push(req.payload.clone());
             } else {
-                state["silos"] = json!([req.payload.clone()]);
+                state["sectors"] = json!([req.payload.clone()]);
             }
         },
-        "DELETE_SILO" => {
+        "DELETE_SECTOR" => {
             if let Some(id) = req.payload.get("id").and_then(|i| i.as_str()) {
-                if let Some(workers) = state.get_mut("workers").and_then(|w| w.as_array_mut()) {
-                    for w in workers.iter_mut() {
-                        if w.get("assignedSiloId").and_then(|i| i.as_str()).unwrap_or("") == id {
-                            w["assignedSiloId"] = Value::Null;
-                        }
-                    }
-                }
-                if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
-                    silos.retain(|s| s.get("id").and_then(|i| i.as_str()).unwrap_or("") != id);
+                if let Some(sectors) = state.get_mut("sectors").and_then(|s| s.as_array_mut()) {
+                    sectors.retain(|s| s.get("id").and_then(|i| i.as_str()).unwrap_or("") != id);
                 }
             }
         },
-        "RENAME_SILO" => {
-            if let (Some(id), Some(name)) = (req.payload.get("id").and_then(|i| i.as_str()), req.payload.get("name").and_then(|n| n.as_str())) {
-                if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
-                    for s in silos.iter_mut() {
-                        if s.get("id").and_then(|i| i.as_str()).unwrap_or("") == id {
-                            s["name"] = json!(name);
+        "RENAME_SECTOR" => {
+            if let (Some(id), Some(name)) = (
+                req.payload.get("id").and_then(|i| i.as_str()),
+                req.payload.get("name").and_then(|n| n.as_str())
+            ) {
+                if let Some(sectors) = state.get_mut("sectors").and_then(|s| s.as_array_mut()) {
+                    for sec in sectors.iter_mut() {
+                        if sec.get("id").and_then(|i| i.as_str()).unwrap_or("") == id {
+                            sec["name"] = json!(name);
                         }
                     }
                 }
             }
         },
-        "RESIZE_SILO" => {
-            if let (Some(id), Some(width)) = (req.payload.get("id").and_then(|i| i.as_str()), req.payload.get("width").and_then(|n| n.as_i64())) {
-                if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
-                    for s in silos.iter_mut() {
-                        if s.get("id").and_then(|i| i.as_str()).unwrap_or("") == id {
-                            s["width"] = json!(width);
+        "UPDATE_SECTOR_ALLOCATION" => {
+            if let (Some(id), Some(new_pct)) = (
+                req.payload.get("id").and_then(|i| i.as_str()),
+                req.payload.get("allocationPercentage").and_then(|p| p.as_f64())
+            ) {
+                let mut total_pct = new_pct;
+                if let Some(sectors) = state.get("sectors").and_then(|s| s.as_array()) {
+                    for sec in sectors {
+                        if sec.get("id").and_then(|i| i.as_str()).unwrap_or("") != id {
+                            total_pct += sec.get("allocationPercentage").and_then(|v| v.as_f64()).unwrap_or(0.0);
                         }
-                    }
-                }
-            }
-        },
-        "UPDATE_SETTLEMENT" => {
-            if let Some(id) = req.payload.get("id").and_then(|i| i.as_str()) {
-                if let Some(config) = req.payload.get("config") {
-                    if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
-                        for s in silos.iter_mut() {
-                            if s.get("id").and_then(|i| i.as_str()).unwrap_or("") == id {
-                                s["settlementConfig"] = config.clone();
-                            }
-                        }
-                    }
-                }
-            }
-        },
-        "ADD_PLANT" => {
-            if let Some(plants) = state.get_mut("plants").and_then(|p| p.as_array_mut()) {
-                plants.push(req.payload.clone());
-            } else {
-                state["plants"] = json!([req.payload.clone()]);
-            }
-        },
-        "DELETE_PLANT" => {
-            if let Some(id) = req.payload.get("id").and_then(|i| i.as_str()) {
-                if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
-                    for s in silos.iter_mut() {
-                        if s.get("assignedPlantId").and_then(|i| i.as_str()).unwrap_or("") == id {
-                            s["assignedPlantId"] = Value::Null;
-                        }
-                    }
-                }
-                if let Some(plants) = state.get_mut("plants").and_then(|p| p.as_array_mut()) {
-                    plants.retain(|p| p.get("id").and_then(|i| i.as_str()).unwrap_or("") != id);
-                }
-            }
-        },
-        "UPDATE_PLANT_PARAMS" => {
-            if let Some(id) = req.payload.get("id").and_then(|i| i.as_str()) {
-                if let Some(plants) = state.get_mut("plants").and_then(|p| p.as_array_mut()) {
-                    for p in plants.iter_mut() {
-                        if p.get("id").and_then(|i| i.as_str()).unwrap_or("") == id {
-                            if let Some(ac) = req.payload.get("autoCompound") { p["autoCompound"] = ac.clone(); }
-                            if let Some(ld) = req.payload.get("liquidityDeposit") { p["liquidityDeposit"] = ld.clone(); }
-                            if let Some(apr) = req.payload.get("currentApr") { p["currentApr"] = apr.clone(); }
-                        }
-                    }
-                }
-            }
-        },
-        "ASSIGN_SILO_TO_PLANT" => {
-            if let Some(silo_id) = req.payload.get("siloId").and_then(|i| i.as_str()) {
-                let plant_id = req.payload.get("plantId").unwrap_or(&Value::Null).clone();
-                
-                if !plant_id.is_null() {
-                    let mut current_silo_count = 0;
-                    if let Some(silos) = state.get("silos").and_then(|s| s.as_array()) {
-                        for s in silos {
-                            if s.get("assignedPlantId").unwrap_or(&Value::Null) == &plant_id {
-                                current_silo_count += 1;
-                            }
-                        }
-                    }
-                    if current_silo_count >= 2 {
-                        let _ = tx.rollback().await;
-                        return Err(Json(ActionResponse { success: false, error: Some("Synthesis Failed: A Plant can only hold exactly 2 Silos.".to_string()) }));
                     }
                 }
 
-                if let Some(silos) = state.get_mut("silos").and_then(|s| s.as_array_mut()) {
-                    for s in silos.iter_mut() {
-                        if s.get("id").and_then(|i| i.as_str()).unwrap_or("") == silo_id {
-                            s["assignedPlantId"] = plant_id.clone();
+                if total_pct > 100.0 {
+                    let _ = tx.rollback().await;
+                    return Err(Json(ActionResponse { success: false, error: Some("Total sector allocation cannot exceed 100%".to_string()) }));
+                }
+
+                if let Some(sectors) = state.get_mut("sectors").and_then(|s| s.as_array_mut()) {
+                    for sec in sectors.iter_mut() {
+                        if sec.get("id").and_then(|i| i.as_str()).unwrap_or("") == id {
+                            sec["allocationPercentage"] = json!(new_pct);
                         }
                     }
                 }
+            }
+        },
+        "REORDER_SECTORS" => {
+            if let Some(new_array) = req.payload.as_array() {
+                state["sectors"] = json!(new_array);
             }
         },
         "ADD_MANUAL_LP" => {
@@ -255,7 +205,7 @@ pub async fn handle_state_action(
         "wallet": req.wallet,
         "state": state
     });
-    
+
     let _: () = redis::cmd("PUBLISH")
         .arg("telemetry:updates")
         .arg(update_payload.to_string())

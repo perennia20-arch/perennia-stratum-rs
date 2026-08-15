@@ -1,3 +1,4 @@
+// src/sor.rs
 use axum::{Json, extract::State};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -128,7 +129,10 @@ pub async fn handle_sor_execute(
     Json(payload): Json<SorExecuteRequest>,
 ) -> Result<Json<SorExecutionPlan>, Json<SorError>> {
     let client = Client::new();
-    let redis_client = match redis::Client::open("redis://127.0.0.1/") {
+    
+    // ⚡ INFRASTRUCTURE HARDENING
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
+    let redis_client = match redis::Client::open(redis_url) {
         Ok(c) => c,
         Err(e) => return Err(Json(SorError { error: format!("Redis Error: {}", e) })),
     };
@@ -150,11 +154,10 @@ pub async fn handle_sor_execute(
     let is_overclocked = payload.systemMode.as_deref() == Some("overclocked");
     let tx_uuid = Uuid::new_v4().to_string();
 
-    // ROUTE A: STANDARD DARK POOL NETTING
     if !is_overclocked {
         tracing::info!("🕸️ [STANDARD MODE] Routing to Dark Pool: {}", payload.wallet);
         
-        let protocol_fee_rate = 0.015; // 1.5% Standard Spread
+        let protocol_fee_rate = 0.015; 
         let execution_rate = spot_rate * (1.0 - protocol_fee_rate);
         let estimated_output = payload.amount * execution_rate;
         let fee_captured_usd = payload.amount * pay_usd * protocol_fee_rate;
@@ -192,7 +195,6 @@ pub async fn handle_sor_execute(
         }));
     }
 
-    // ROUTE B: OVERCLOCKED AUCTION (Instant L1 Waterfall)
     tracing::info!("🚀 [OVERCLOCKED] High-Velocity Mode Triggered for {}", payload.wallet);
 
     let mut remaining_amount = payload.amount;
@@ -212,7 +214,6 @@ pub async fn handle_sor_execute(
     let corp_sol = env::var("PERENNIA_TREASURY_SOL_ADDRESS")
         .unwrap_or_else(|_| "HN7cAB1wJe3D1v6K18u1nC9Wvy98aV3X45kv5FgvV61a".to_string());
 
-    // TIER 1: PERENNIA TREASURY (Instant L1 Fill)
     let mut treasury_bal = 0.0;
 
     if payload.receiveAsset == "BTC" {
@@ -297,7 +298,6 @@ pub async fn handle_sor_execute(
         }
     }
 
-    // TIER 2: KASPLEX KRC-20
     if remaining_amount > 0.0 {
         let kasplex_res = client.get(&format!("https://api.kasplex.org/v1/krc20/token/{}", payload.receiveAsset))
             .send().await;
@@ -333,7 +333,6 @@ pub async fn handle_sor_execute(
         }
     }
 
-    // TIER 3: CHAINGE FINANCE
     if remaining_amount * pay_usd >= min_chainge_usd {
         let chainge_api_key = env::var("CHAINGE_API_KEY").unwrap_or_default();
         let chainge_req = json!({
@@ -370,7 +369,6 @@ pub async fn handle_sor_execute(
         }
     }
 
-    // TIER 4: CHANGENOW
     if remaining_amount * pay_usd >= min_changenow_usd {
         let changenow_key = env::var("CHANGENOW_API_KEY").unwrap_or_default();
         let cnow_req = json!({
