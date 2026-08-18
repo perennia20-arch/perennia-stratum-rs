@@ -6,12 +6,16 @@ kaspad_address: "127.0.0.1:16110"
 mining_address: "kaspa:qrc3ezl770p2cjlfc3tjp6vqlldt6lgh3e80d6rm4rchtt0yrrpgzqave8579"
 
 # Public Pool Mechanics
-starting_diff: 64       # ⚡ Allows IceRiver and Goldshell miners to survive
-min_share_diff: 2.0      
-var_diff: true           
+starting_diff: 64 # Allows IceRiver and Goldshell miners to survive
+min_share_diff: 2.0
+var_diff: true
 shares_per_min: 20
 extranonce_size: 2
 
 # Telemetry System
-prom_port: ":8081"
+prom_port: ":9091"
 print_stats: true
+
+# Settlement Invariants
+default_unassigned_settlement_threshold: 100.0
+coinbase_maturity_daa_confirmations: 500

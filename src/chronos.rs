@@ -10,6 +10,7 @@ const MINIMUM_UTXO_SWEEP_THRESHOLD: f64 = 0.0005;
 const OVERCLOCK_BASE_FEE: f64 = 0.0001;
 const OVERCLOCK_VAR_FEE: f64 = 0.005;
 const OVERCLOCK_PREMIUM_FEE: f64 = 0.005;
+const DEFAULT_UNASSIGNED_SETTLEMENT_THRESHOLD: f64 = 100.0; // Added: The 100 KAS threshold for unallocated workers
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct NettingOrder {
@@ -127,8 +128,15 @@ pub async fn start_chronos_daemon(pool: PgPool) {
 
     loop {
         interval.tick().await;
+        
+        // 1. Process standard Sector Matrix (Silos and Plants)
         if let Err(e) = execute_settlement_tick(&pool, &redis_client, &http_client).await {
             tracing::error!("🚨 Chronos Execution Error: {}", e);
+        }
+
+        // 2. Process Default 100 KAS thresholds for unallocated workers
+        if let Err(e) = process_unassigned_reserve_settlements(&pool, &redis_client, &http_client).await {
+            tracing::error!("🚨 Chronos Reserve Settlement Error: {}", e);
         }
     }
 }
@@ -440,5 +448,102 @@ async fn execute_settlement_tick(
         let _ = tx.commit().await;
     }
 
+    Ok(())
+}
+
+/// Newly Added: Processes unassigned worker reserves that have exceeded the 100 KAS threshold
+async fn process_unassigned_reserve_settlements(
+    pool: &PgPool,
+    redis_client: &redis::Client,
+    http_client: &Client
+) -> anyhow::Result<()> {
+    let mut redis_conn = redis_client.get_multiplexed_async_connection().await?;
+    let rust_backend_url = std::env::var("RUST_BACKEND_URL").unwrap_or_else(|_| "http://127.0.0.1:8002".to_string());
+    
+    let mut tx = pool.begin().await?;
+
+    // Lock rows with sufficient reserve balances
+    let records = sqlx::query!(
+        r#"
+        SELECT wallet_address, streaming_balance_kas 
+        FROM yield_reservoirs 
+        WHERE streaming_balance_kas >= $1
+        FOR UPDATE SKIP LOCKED
+        "#,
+        DEFAULT_UNASSIGNED_SETTLEMENT_THRESHOLD
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+
+    for record in records {
+        let payout_amount = record.streaming_balance_kas;
+        let target_wallet = record.wallet_address.clone();
+
+        tracing::info!(
+            "⚡ [CHRONOS] Auto-Settling Unassigned Reserve: {} KAS -> Target: {}",
+            payout_amount, target_wallet
+        );
+
+        // Execute On-Chain Payout via the existing sorEngine REST architecture
+        let req_payload = json!({ 
+            "wallet": target_wallet, 
+            "payAsset": "KAS", 
+            "receiveAsset": "KAS", 
+            "amount": payout_amount, 
+            "slippageTolerance": 0.00 
+        });
+        
+        let host_api = format!("{}/v1/sor/execute", rust_backend_url);
+
+        match http_client.post(&host_api).json(&req_payload).send().await {
+            Ok(res) => {
+                if let Ok(data) = res.json::<Value>().await {
+                    // Confirm execution success if sorEngine returns an estimate or txId
+                    if data.get("estimatedOutput").is_some() || data.get("txId").is_some() {
+                        
+                        // Deduct settled amount from synthetic ledger
+                        sqlx::query!(
+                            r#"
+                            UPDATE yield_reservoirs 
+                            SET streaming_balance_kas = streaming_balance_kas - $1,
+                                last_updated = CURRENT_TIMESTAMP
+                            WHERE wallet_address = $2
+                            "#,
+                            payout_amount,
+                            target_wallet
+                        )
+                        .execute(&mut *tx)
+                        .await?;
+
+                        let tx_id = data.get("txId").and_then(|v| v.as_str()).unwrap_or("sor_auto_settle").to_string();
+
+                        // Push real-time SSE notification via Redis to update UI
+                        let notification = json!({
+                            "event": "SETTLEMENT_EXECUTED",
+                            "wallet": target_wallet,
+                            "amount": payout_amount,
+                            "asset": "KAS",
+                            "tx_id": tx_id,
+                            "type": "unassigned_reserve"
+                        });
+                        
+                        let _: () = redis::cmd("PUBLISH")
+                            .arg(format!("telemetry:{}", target_wallet))
+                            .arg(notification.to_string())
+                            .query_async(&mut redis_conn)
+                            .await
+                            .unwrap_or(());
+
+                        tracing::info!("✅ [CHRONOS] Payout confirmed for {}.", target_wallet);
+                    }
+                }
+            },
+            Err(e) => {
+                tracing::error!("❌ [CHRONOS] Failed REST execution for {}: {:?}", target_wallet, e);
+            }
+        }
+    }
+
+    tx.commit().await?;
     Ok(())
 }

@@ -1473,226 +1473,6 @@ pub fn verify_share(header: &Header, nonce: u64, min_share_diff: f64) -> (bool, 
 }
 </file>
 
-<file path="src/state_api.rs">
-// src/state_api.rs
-use axum::{Json, extract::State};
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use sqlx::PgPool;
-use std::env;
-
-#[derive(Deserialize, Debug)]
-pub struct StateActionReq {
-    pub wallet: String,
-    pub action: String,
-    pub payload: Value,
-}
-
-#[derive(Serialize)]
-pub struct ActionResponse {
-    pub success: bool,
-    pub error: Option<String>,
-}
-
-pub async fn handle_state_action(
-    State(pool): State<PgPool>,
-    Json(req): Json<StateActionReq>,
-) -> Result<Json<ActionResponse>, Json<ActionResponse>> {
-    
-    // ⚡ INFRASTRUCTURE HARDENING
-    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
-    let redis_client = match redis::Client::open(redis_url) {
-        Ok(c) => c,
-        Err(e) => return Err(Json(ActionResponse { success: false, error: Some(e.to_string()) })),
-    };
-    let mut redis_conn = match redis_client.get_multiplexed_async_connection().await {
-        Ok(c) => c,
-        Err(e) => return Err(Json(ActionResponse { success: false, error: Some(e.to_string()) })),
-    };
-
-    let mut tx = match pool.begin().await {
-        Ok(t) => t,
-        Err(e) => return Err(Json(ActionResponse { success: false, error: Some(e.to_string()) })),
-    };
-
-    let row = sqlx::query!(
-        "SELECT layout_state FROM user_command_centers WHERE wallet_address = $1 FOR UPDATE",
-        req.wallet
-    )
-    .fetch_optional(&mut *tx)
-    .await;
-
-    let mut state: Value = match row {
-        Ok(Some(r)) => r.layout_state,
-        _ => json!({"workers": [], "sectors": [], "manualLps": [], "systemMode": "base"}),
-    };
-
-    match req.action.as_str() {
-        "ADD_WORKER" => {
-            if let Some(workers) = state.get_mut("workers").and_then(|w| w.as_array_mut()) {
-                workers.push(req.payload.clone());
-            } else {
-                state["workers"] = json!([req.payload.clone()]);
-            }
-        },
-        "DELETE_WORKER" => {
-            if let Some(id) = req.payload.get("id").and_then(|i| i.as_str()) {
-                if let Some(workers) = state.get_mut("workers").and_then(|w| w.as_array_mut()) {
-                    workers.retain(|w| w.get("id").and_then(|i| i.as_str()).unwrap_or("") != id);
-                }
-            }
-        },
-        "RENAME_WORKER" => {
-            if let (Some(id), Some(name), Some(wallet_worker)) = (
-                req.payload.get("id").and_then(|i| i.as_str()),
-                req.payload.get("name").and_then(|n| n.as_str()),
-                req.payload.get("walletWorker").and_then(|w| w.as_str())
-            ) {
-                if let Some(workers) = state.get_mut("workers").and_then(|w| w.as_array_mut()) {
-                    for w in workers.iter_mut() {
-                        if w.get("id").and_then(|i| i.as_str()).unwrap_or("") == id {
-                            w["name"] = json!(name);
-                            w["walletWorker"] = json!(wallet_worker);
-                        }
-                    }
-                }
-            }
-        },
-        "ADD_SECTOR" => {
-            let new_pct = req.payload.get("allocationPercentage").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let mut total_pct = new_pct;
-
-            if let Some(sectors) = state.get("sectors").and_then(|s| s.as_array()) {
-                for sec in sectors {
-                    total_pct += sec.get("allocationPercentage").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                }
-            }
-
-            if total_pct > 100.0 {
-                let _ = tx.rollback().await;
-                return Err(Json(ActionResponse { success: false, error: Some("Total sector allocation cannot exceed 100%".to_string()) }));
-            }
-
-            if let Some(sectors) = state.get_mut("sectors").and_then(|s| s.as_array_mut()) {
-                sectors.push(req.payload.clone());
-            } else {
-                state["sectors"] = json!([req.payload.clone()]);
-            }
-        },
-        "DELETE_SECTOR" => {
-            if let Some(id) = req.payload.get("id").and_then(|i| i.as_str()) {
-                if let Some(sectors) = state.get_mut("sectors").and_then(|s| s.as_array_mut()) {
-                    sectors.retain(|s| s.get("id").and_then(|i| i.as_str()).unwrap_or("") != id);
-                }
-            }
-        },
-        "RENAME_SECTOR" => {
-            if let (Some(id), Some(name)) = (
-                req.payload.get("id").and_then(|i| i.as_str()),
-                req.payload.get("name").and_then(|n| n.as_str())
-            ) {
-                if let Some(sectors) = state.get_mut("sectors").and_then(|s| s.as_array_mut()) {
-                    for sec in sectors.iter_mut() {
-                        if sec.get("id").and_then(|i| i.as_str()).unwrap_or("") == id {
-                            sec["name"] = json!(name);
-                        }
-                    }
-                }
-            }
-        },
-        "UPDATE_SECTOR_ALLOCATION" => {
-            if let (Some(id), Some(new_pct)) = (
-                req.payload.get("id").and_then(|i| i.as_str()),
-                req.payload.get("allocationPercentage").and_then(|p| p.as_f64())
-            ) {
-                let mut total_pct = new_pct;
-                if let Some(sectors) = state.get("sectors").and_then(|s| s.as_array()) {
-                    for sec in sectors {
-                        if sec.get("id").and_then(|i| i.as_str()).unwrap_or("") != id {
-                            total_pct += sec.get("allocationPercentage").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                        }
-                    }
-                }
-
-                if total_pct > 100.0 {
-                    let _ = tx.rollback().await;
-                    return Err(Json(ActionResponse { success: false, error: Some("Total sector allocation cannot exceed 100%".to_string()) }));
-                }
-
-                if let Some(sectors) = state.get_mut("sectors").and_then(|s| s.as_array_mut()) {
-                    for sec in sectors.iter_mut() {
-                        if sec.get("id").and_then(|i| i.as_str()).unwrap_or("") == id {
-                            sec["allocationPercentage"] = json!(new_pct);
-                        }
-                    }
-                }
-            }
-        },
-        "REORDER_SECTORS" => {
-            if let Some(new_array) = req.payload.as_array() {
-                state["sectors"] = json!(new_array);
-            }
-        },
-        "ADD_MANUAL_LP" => {
-            if let Some(pos) = req.payload.get("position") {
-                if let Some(lps) = state.get_mut("manualLps").and_then(|l| l.as_array_mut()) {
-                    lps.push(pos.clone());
-                } else {
-                    state["manualLps"] = json!([pos.clone()]);
-                }
-            }
-        },
-        "SYSTEM_MODE" => {
-            if let Some(mode) = req.payload.get("mode").and_then(|m| m.as_str()) {
-                state["systemMode"] = json!(mode);
-            }
-        },
-        "UPDATE_TAX_FORTRESS" => {
-            if let Some(active) = req.payload.get("escrowActive").and_then(|a| a.as_bool()) {
-                if let Some(tf) = state.get_mut("taxFortress").and_then(|t| t.as_object_mut()) {
-                    tf.insert("escrowActive".to_string(), json!(active));
-                } else {
-                    state["taxFortress"] = json!({ "escrowActive": active });
-                }
-            }
-        }
-        _ => {}
-    }
-
-    let save_res = sqlx::query!(
-        "INSERT INTO user_command_centers (wallet_address, layout_state, last_updated) 
-         VALUES ($1, $2, CURRENT_TIMESTAMP) 
-         ON CONFLICT (wallet_address) DO UPDATE SET layout_state = EXCLUDED.layout_state, last_updated = CURRENT_TIMESTAMP",
-        req.wallet,
-        state
-    )
-    .execute(&mut *tx)
-    .await;
-
-    if let Err(e) = save_res {
-        let _ = tx.rollback().await;
-        return Err(Json(ActionResponse { success: false, error: Some(e.to_string()) }));
-    }
-
-    let _ = tx.commit().await;
-
-    let update_payload = json!({
-        "layout_state_update": true,
-        "wallet": req.wallet,
-        "state": state
-    });
-
-    let _: () = redis::cmd("PUBLISH")
-        .arg("telemetry:updates")
-        .arg(update_payload.to_string())
-        .query_async(&mut redis_conn)
-        .await
-        .unwrap_or(());
-
-    Ok(Json(ActionResponse { success: true, error: None }))
-}
-</file>
-
 <file path=".envecho">
 
 </file>
@@ -1930,6 +1710,226 @@ impl StratumConfig {
 }
 </file>
 
+<file path="src/state_api.rs">
+// src/state_api.rs
+use axum::{Json, extract::State};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sqlx::PgPool;
+use std::env;
+
+#[derive(Deserialize, Debug)]
+pub struct StateActionReq {
+    pub wallet: String,
+    pub action: String,
+    pub payload: Value,
+}
+
+#[derive(Serialize)]
+pub struct ActionResponse {
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+pub async fn handle_state_action(
+    State(pool): State<PgPool>,
+    Json(req): Json<StateActionReq>,
+) -> Result<Json<ActionResponse>, Json<ActionResponse>> {
+    
+    // ⚡ INFRASTRUCTURE HARDENING
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
+    let redis_client = match redis::Client::open(redis_url) {
+        Ok(c) => c,
+        Err(e) => return Err(Json(ActionResponse { success: false, error: Some(e.to_string()) })),
+    };
+    let mut redis_conn = match redis_client.get_multiplexed_async_connection().await {
+        Ok(c) => c,
+        Err(e) => return Err(Json(ActionResponse { success: false, error: Some(e.to_string()) })),
+    };
+
+    let mut tx = match pool.begin().await {
+        Ok(t) => t,
+        Err(e) => return Err(Json(ActionResponse { success: false, error: Some(e.to_string()) })),
+    };
+
+    let row = sqlx::query!(
+        "SELECT layout_state FROM user_command_centers WHERE wallet_address = $1 FOR UPDATE",
+        req.wallet
+    )
+    .fetch_optional(&mut *tx)
+    .await;
+
+    let mut state: Value = match row {
+        Ok(Some(r)) => r.layout_state,
+        _ => json!({"workers": [], "sectors": [], "manualLps": [], "systemMode": "base"}),
+    };
+
+    match req.action.as_str() {
+        "ADD_WORKER" => {
+            if let Some(workers) = state.get_mut("workers").and_then(|w| w.as_array_mut()) {
+                workers.push(req.payload.clone());
+            } else {
+                state["workers"] = json!([req.payload.clone()]);
+            }
+        },
+        "DELETE_WORKER" => {
+            if let Some(id) = req.payload.get("id").and_then(|i| i.as_str()) {
+                if let Some(workers) = state.get_mut("workers").and_then(|w| w.as_array_mut()) {
+                    workers.retain(|w| w.get("id").and_then(|i| i.as_str()).unwrap_or("") != id);
+                }
+            }
+        },
+        "RENAME_WORKER" => {
+            if let (Some(id), Some(name), Some(wallet_worker)) = (
+                req.payload.get("id").and_then(|i| i.as_str()),
+                req.payload.get("name").and_then(|n| n.as_str()),
+                req.payload.get("walletWorker").and_then(|w| w.as_str())
+            ) {
+                if let Some(workers) = state.get_mut("workers").and_then(|w| w.as_array_mut()) {
+                    for w in workers.iter_mut() {
+                        if w.get("id").and_then(|i| i.as_str()).unwrap_or("") == id {
+                            w["name"] = json!(name);
+                            w["walletWorker"] = json!(wallet_worker);
+                        }
+                    }
+                }
+            }
+        },
+        "ADD_SECTOR" => {
+            let new_pct = req.payload.get("allocationPercentage").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let mut total_pct = new_pct;
+
+            if let Some(sectors) = state.get("sectors").and_then(|s| s.as_array()) {
+                for sec in sectors {
+                    total_pct += sec.get("allocationPercentage").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                }
+            }
+
+            if total_pct > 100.0 {
+                let _ = tx.rollback().await;
+                return Err(Json(ActionResponse { success: false, error: Some("Total sector allocation cannot exceed 100%".to_string()) }));
+            }
+
+            if let Some(sectors) = state.get_mut("sectors").and_then(|s| s.as_array_mut()) {
+                sectors.push(req.payload.clone());
+            } else {
+                state["sectors"] = json!([req.payload.clone()]);
+            }
+        },
+        "DELETE_SECTOR" => {
+            if let Some(id) = req.payload.get("id").and_then(|i| i.as_str()) {
+                if let Some(sectors) = state.get_mut("sectors").and_then(|s| s.as_array_mut()) {
+                    sectors.retain(|s| s.get("id").and_then(|i| i.as_str()).unwrap_or("") != id);
+                }
+            }
+        },
+        "RENAME_SECTOR" => {
+            if let (Some(id), Some(name)) = (
+                req.payload.get("id").and_then(|i| i.as_str()),
+                req.payload.get("name").and_then(|n| n.as_str())
+            ) {
+                if let Some(sectors) = state.get_mut("sectors").and_then(|s| s.as_array_mut()) {
+                    for sec in sectors.iter_mut() {
+                        if sec.get("id").and_then(|i| i.as_str()).unwrap_or("") == id {
+                            sec["name"] = json!(name);
+                        }
+                    }
+                }
+            }
+        },
+        "UPDATE_SECTOR_ALLOCATION" => {
+            if let (Some(id), Some(new_pct)) = (
+                req.payload.get("id").and_then(|i| i.as_str()),
+                req.payload.get("allocationPercentage").and_then(|p| p.as_f64())
+            ) {
+                let mut total_pct = new_pct;
+                if let Some(sectors) = state.get("sectors").and_then(|s| s.as_array()) {
+                    for sec in sectors {
+                        if sec.get("id").and_then(|i| i.as_str()).unwrap_or("") != id {
+                            total_pct += sec.get("allocationPercentage").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        }
+                    }
+                }
+
+                if total_pct > 100.0 {
+                    let _ = tx.rollback().await;
+                    return Err(Json(ActionResponse { success: false, error: Some("Total sector allocation cannot exceed 100%".to_string()) }));
+                }
+
+                if let Some(sectors) = state.get_mut("sectors").and_then(|s| s.as_array_mut()) {
+                    for sec in sectors.iter_mut() {
+                        if sec.get("id").and_then(|i| i.as_str()).unwrap_or("") == id {
+                            sec["allocationPercentage"] = json!(new_pct);
+                        }
+                    }
+                }
+            }
+        },
+        "REORDER_SECTORS" => {
+            if let Some(new_array) = req.payload.as_array() {
+                state["sectors"] = json!(new_array);
+            }
+        },
+        "ADD_MANUAL_LP" => {
+            if let Some(pos) = req.payload.get("position") {
+                if let Some(lps) = state.get_mut("manualLps").and_then(|l| l.as_array_mut()) {
+                    lps.push(pos.clone());
+                } else {
+                    state["manualLps"] = json!([pos.clone()]);
+                }
+            }
+        },
+        "SYSTEM_MODE" => {
+            if let Some(mode) = req.payload.get("mode").and_then(|m| m.as_str()) {
+                state["systemMode"] = json!(mode);
+            }
+        },
+        "UPDATE_TAX_FORTRESS" => {
+            if let Some(active) = req.payload.get("escrowActive").and_then(|a| a.as_bool()) {
+                if let Some(tf) = state.get_mut("taxFortress").and_then(|t| t.as_object_mut()) {
+                    tf.insert("escrowActive".to_string(), json!(active));
+                } else {
+                    state["taxFortress"] = json!({ "escrowActive": active });
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let save_res = sqlx::query!(
+        "INSERT INTO user_command_centers (wallet_address, layout_state, last_updated) 
+         VALUES ($1, $2, CURRENT_TIMESTAMP) 
+         ON CONFLICT (wallet_address) DO UPDATE SET layout_state = EXCLUDED.layout_state, last_updated = CURRENT_TIMESTAMP",
+        req.wallet,
+        state
+    )
+    .execute(&mut *tx)
+    .await;
+
+    if let Err(e) = save_res {
+        let _ = tx.rollback().await;
+        return Err(Json(ActionResponse { success: false, error: Some(e.to_string()) }));
+    }
+
+    let _ = tx.commit().await;
+
+    let update_payload = json!({
+        "layout_state_update": true,
+        "wallet": req.wallet,
+        "state": state
+    });
+
+    let _: () = redis::cmd("PUBLISH")
+        .arg("telemetry:updates")
+        .arg(update_payload.to_string())
+        .query_async(&mut redis_conn)
+        .await
+        .unwrap_or(());
+
+    Ok(Json(ActionResponse { success: true, error: None }))
+}
+</file>
+
 <file path=".gitignore">
 /target/
 **/*.rs.bk
@@ -1937,6 +1937,114 @@ impl StratumConfig {
 Cargo.lock
 .DS_Store
 node_modules/
+</file>
+
+<file path="db/schema.sql">
+-- ==============================================================================
+-- PERENNIA LLC: SOVEREIGN WRITE-AHEAD LOG (WAL) & REAL-TIME LEDGER SCHEMA
+-- Deployment Environment: Bare-Metal Ubuntu PostgreSQL 16+
+-- Architecture: High-Velocity BRIN Indexing & L1 Block Ledger
+-- ==============================================================================
+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- 1. Sovereign tracking of bare-metal hardware identities
+CREATE TABLE IF NOT EXISTS worker_profiles (
+    worker_id VARCHAR(255) PRIMARY KEY,
+    wallet_address VARCHAR(255) NOT NULL,
+    device_profile VARCHAR(100) NOT NULL DEFAULT 'unknown',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 2. Continuous Fluidity: Real-time balance streaming for active smart contract polling
+CREATE TABLE IF NOT EXISTS yield_reservoirs (
+    wallet_address VARCHAR(255) PRIMARY KEY,
+    streaming_balance_kas DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    total_yield_kas DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 3. UNLOGGED WAL: Millions of sub-second micro-shares map directly here from the Redis Oracle
+CREATE UNLOGGED TABLE IF NOT EXISTS micro_shares (
+    share_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    worker_id VARCHAR(255) NOT NULL,
+    difficulty_weight DOUBLE PRECISION NOT NULL,
+    kas_value_delta DOUBLE PRECISION NOT NULL,
+    network_diff DOUBLE PRECISION NOT NULL,
+    is_settled BOOLEAN NOT NULL DEFAULT false,
+    recorded_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 4. The L1 Block Ledger: Persistent tracking of global Kaspa network discoveries
+CREATE TABLE IF NOT EXISTS network_blocks (
+    block_hash VARCHAR(64) PRIMARY KEY,
+    worker_id VARCHAR(255) NOT NULL,
+    nonce BIGINT NOT NULL,
+    network_diff DOUBLE PRECISION NOT NULL,
+    is_orphaned BOOLEAN DEFAULT false,
+    discovered_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ==============================================================================
+-- 5. SOVEREIGN COMMAND CENTER STATE 
+-- ==============================================================================
+CREATE TABLE IF NOT EXISTS user_command_centers (
+    wallet_address VARCHAR(255) PRIMARY KEY,
+    layout_state JSONB NOT NULL DEFAULT '{}'::jsonb,
+    last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ==============================================================================
+-- 6. COMPLIANCE & TAX FORTRESS LEDGER
+-- ==============================================================================
+CREATE TABLE IF NOT EXISTS entity_kyc (
+    wallet_address VARCHAR(255) PRIMARY KEY,
+    legal_name VARCHAR(255) NOT NULL,
+    entity_type VARCHAR(50) NOT NULL,
+    tax_id_hash TEXT NOT NULL,
+    business_address TEXT NOT NULL,
+    verification_status VARCHAR(50) DEFAULT 'pending',
+    verified_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE TABLE IF NOT EXISTS tax_ledger_events (
+    event_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    wallet_address VARCHAR(255) NOT NULL,
+    asset_ticker VARCHAR(20) NOT NULL,
+    event_type VARCHAR(50) NOT NULL,
+    gross_proceeds_usd DOUBLE PRECISION NOT NULL,
+    amount_tokens DOUBLE PRECISION NOT NULL,
+    spot_price_at_execution DOUBLE PRECISION NOT NULL,
+    recorded_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ==============================================================================
+-- HIGH-PERFORMANCE INDEXING MATRIX
+-- ==============================================================================
+
+-- B-Tree Indexes for exact-match lookups
+CREATE INDEX IF NOT EXISTS idx_micro_shares_worker ON micro_shares(worker_id);
+CREATE INDEX IF NOT EXISTS idx_micro_shares_settlement ON micro_shares(is_settled);
+CREATE INDEX IF NOT EXISTS idx_network_blocks_worker ON network_blocks(worker_id);
+CREATE INDEX IF NOT EXISTS idx_network_blocks_time ON network_blocks(discovered_at DESC);
+CREATE INDEX IF NOT EXISTS idx_user_command_centers_updated ON user_command_centers(last_updated DESC);
+CREATE INDEX IF NOT EXISTS idx_tax_ledger_wallet ON tax_ledger_events(wallet_address, recorded_at DESC);
+
+-- BRIN (Block Range Index) for hyper-optimized append-only time-series data
+CREATE INDEX IF NOT EXISTS idx_micro_shares_recorded_brin 
+ON micro_shares USING brin (recorded_at) WITH (pages_per_range = 128);
+
+-- RWA Oracle Telemetry (Unlogged for high-velocity ingest)
+CREATE UNLOGGED TABLE IF NOT EXISTS rwa_oracle_feeds (
+    ticker VARCHAR(16) NOT NULL,
+    asset_class VARCHAR(16) NOT NULL,
+    price_usd NUMERIC(18, 8) NOT NULL,
+    oracle_source VARCHAR(32) NOT NULL DEFAULT 'PYTH_HERMES',
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (ticker, updated_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rwa_oracle_ticker_time ON rwa_oracle_feeds (ticker, updated_at DESC);
 </file>
 
 <file path="src/chronos.rs">
@@ -1952,6 +2060,7 @@ const MINIMUM_UTXO_SWEEP_THRESHOLD: f64 = 0.0005;
 const OVERCLOCK_BASE_FEE: f64 = 0.0001;
 const OVERCLOCK_VAR_FEE: f64 = 0.005;
 const OVERCLOCK_PREMIUM_FEE: f64 = 0.005;
+const DEFAULT_UNASSIGNED_SETTLEMENT_THRESHOLD: f64 = 100.0; // Added: The 100 KAS threshold for unallocated workers
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct NettingOrder {
@@ -2069,8 +2178,15 @@ pub async fn start_chronos_daemon(pool: PgPool) {
 
     loop {
         interval.tick().await;
+        
+        // 1. Process standard Sector Matrix (Silos and Plants)
         if let Err(e) = execute_settlement_tick(&pool, &redis_client, &http_client).await {
             tracing::error!("🚨 Chronos Execution Error: {}", e);
+        }
+
+        // 2. Process Default 100 KAS thresholds for unallocated workers
+        if let Err(e) = process_unassigned_reserve_settlements(&pool, &redis_client, &http_client).await {
+            tracing::error!("🚨 Chronos Reserve Settlement Error: {}", e);
         }
     }
 }
@@ -2382,6 +2498,103 @@ async fn execute_settlement_tick(
         let _ = tx.commit().await;
     }
 
+    Ok(())
+}
+
+/// Newly Added: Processes unassigned worker reserves that have exceeded the 100 KAS threshold
+async fn process_unassigned_reserve_settlements(
+    pool: &PgPool,
+    redis_client: &redis::Client,
+    http_client: &Client
+) -> anyhow::Result<()> {
+    let mut redis_conn = redis_client.get_multiplexed_async_connection().await?;
+    let rust_backend_url = std::env::var("RUST_BACKEND_URL").unwrap_or_else(|_| "http://127.0.0.1:8002".to_string());
+    
+    let mut tx = pool.begin().await?;
+
+    // Lock rows with sufficient reserve balances
+    let records = sqlx::query!(
+        r#"
+        SELECT wallet_address, streaming_balance_kas 
+        FROM yield_reservoirs 
+        WHERE streaming_balance_kas >= $1
+        FOR UPDATE SKIP LOCKED
+        "#,
+        DEFAULT_UNASSIGNED_SETTLEMENT_THRESHOLD
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+
+    for record in records {
+        let payout_amount = record.streaming_balance_kas;
+        let target_wallet = record.wallet_address.clone();
+
+        tracing::info!(
+            "⚡ [CHRONOS] Auto-Settling Unassigned Reserve: {} KAS -> Target: {}",
+            payout_amount, target_wallet
+        );
+
+        // Execute On-Chain Payout via the existing sorEngine REST architecture
+        let req_payload = json!({ 
+            "wallet": target_wallet, 
+            "payAsset": "KAS", 
+            "receiveAsset": "KAS", 
+            "amount": payout_amount, 
+            "slippageTolerance": 0.00 
+        });
+        
+        let host_api = format!("{}/v1/sor/execute", rust_backend_url);
+
+        match http_client.post(&host_api).json(&req_payload).send().await {
+            Ok(res) => {
+                if let Ok(data) = res.json::<Value>().await {
+                    // Confirm execution success if sorEngine returns an estimate or txId
+                    if data.get("estimatedOutput").is_some() || data.get("txId").is_some() {
+                        
+                        // Deduct settled amount from synthetic ledger
+                        sqlx::query!(
+                            r#"
+                            UPDATE yield_reservoirs 
+                            SET streaming_balance_kas = streaming_balance_kas - $1,
+                                last_updated = CURRENT_TIMESTAMP
+                            WHERE wallet_address = $2
+                            "#,
+                            payout_amount,
+                            target_wallet
+                        )
+                        .execute(&mut *tx)
+                        .await?;
+
+                        let tx_id = data.get("txId").and_then(|v| v.as_str()).unwrap_or("sor_auto_settle").to_string();
+
+                        // Push real-time SSE notification via Redis to update UI
+                        let notification = json!({
+                            "event": "SETTLEMENT_EXECUTED",
+                            "wallet": target_wallet,
+                            "amount": payout_amount,
+                            "asset": "KAS",
+                            "tx_id": tx_id,
+                            "type": "unassigned_reserve"
+                        });
+                        
+                        let _: () = redis::cmd("PUBLISH")
+                            .arg(format!("telemetry:{}", target_wallet))
+                            .arg(notification.to_string())
+                            .query_async(&mut redis_conn)
+                            .await
+                            .unwrap_or(());
+
+                        tracing::info!("✅ [CHRONOS] Payout confirmed for {}.", target_wallet);
+                    }
+                }
+            },
+            Err(e) => {
+                tracing::error!("❌ [CHRONOS] Failed REST execution for {}: {:?}", target_wallet, e);
+            }
+        }
+    }
+
+    tx.commit().await?;
     Ok(())
 }
 </file>
@@ -2951,112 +3164,28 @@ codegen-units = 1
 panic = "abort"
 </file>
 
-<file path="db/schema.sql">
--- ==============================================================================
--- PERENNIA LLC: SOVEREIGN WRITE-AHEAD LOG (WAL) & REAL-TIME LEDGER SCHEMA
--- Deployment Environment: Bare-Metal Ubuntu PostgreSQL 16+
--- Architecture: High-Velocity BRIN Indexing & L1 Block Ledger
--- ==============================================================================
+<file path="config.yaml">
+# Core Network Parameters (Pivoted to Local Node)
+stratum_port: ":5555"
+kaspad_address: "127.0.0.1:16110"
 
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+# Central Pool Wallet (Matched to Master Admin Treasury)
+mining_address: "kaspa:qrc3ezl770p2cjlfc3tjp6vqlldt6lgh3e80d6rm4rchtt0yrrpgzqave8579"
 
--- 1. Sovereign tracking of bare-metal hardware identities
-CREATE TABLE IF NOT EXISTS worker_profiles (
-    worker_id VARCHAR(255) PRIMARY KEY,
-    wallet_address VARCHAR(255) NOT NULL,
-    device_profile VARCHAR(100) NOT NULL DEFAULT 'unknown',
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
+# Public Pool Mechanics
+starting_diff: 64 # Allows IceRiver and Goldshell miners to survive
+min_share_diff: 2.0
+var_diff: true
+shares_per_min: 20
+extranonce_size: 2
 
--- 2. Continuous Fluidity: Real-time balance streaming for active smart contract polling
-CREATE TABLE IF NOT EXISTS yield_reservoirs (
-    wallet_address VARCHAR(255) PRIMARY KEY,
-    streaming_balance_kas DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-    total_yield_kas DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-    last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
+# Telemetry System
+prom_port: ":9091"
+print_stats: true
 
--- 3. UNLOGGED WAL: Millions of sub-second micro-shares map directly here from the Redis Oracle
-CREATE UNLOGGED TABLE IF NOT EXISTS micro_shares (
-    share_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    worker_id VARCHAR(255) NOT NULL,
-    difficulty_weight DOUBLE PRECISION NOT NULL,
-    kas_value_delta DOUBLE PRECISION NOT NULL,
-    network_diff DOUBLE PRECISION NOT NULL,
-    is_settled BOOLEAN NOT NULL DEFAULT false,
-    recorded_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
--- 4. The L1 Block Ledger: Persistent tracking of global Kaspa network discoveries
-CREATE TABLE IF NOT EXISTS network_blocks (
-    block_hash VARCHAR(64) PRIMARY KEY,
-    worker_id VARCHAR(255) NOT NULL,
-    nonce BIGINT NOT NULL,
-    network_diff DOUBLE PRECISION NOT NULL,
-    is_orphaned BOOLEAN DEFAULT false,
-    discovered_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
--- ==============================================================================
--- 5. SOVEREIGN COMMAND CENTER STATE 
--- ==============================================================================
-CREATE TABLE IF NOT EXISTS user_command_centers (
-    wallet_address VARCHAR(255) PRIMARY KEY,
-    layout_state JSONB NOT NULL DEFAULT '{}'::jsonb,
-    last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
--- ==============================================================================
--- 6. COMPLIANCE & TAX FORTRESS LEDGER
--- ==============================================================================
-CREATE TABLE IF NOT EXISTS entity_kyc (
-    wallet_address VARCHAR(255) PRIMARY KEY,
-    legal_name VARCHAR(255) NOT NULL,
-    entity_type VARCHAR(50) NOT NULL,
-    tax_id_hash TEXT NOT NULL,
-    business_address TEXT NOT NULL,
-    verification_status VARCHAR(50) DEFAULT 'pending',
-    verified_at TIMESTAMP WITH TIME ZONE
-);
-
-CREATE TABLE IF NOT EXISTS tax_ledger_events (
-    event_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    wallet_address VARCHAR(255) NOT NULL,
-    asset_ticker VARCHAR(20) NOT NULL,
-    event_type VARCHAR(50) NOT NULL,
-    gross_proceeds_usd DOUBLE PRECISION NOT NULL,
-    amount_tokens DOUBLE PRECISION NOT NULL,
-    spot_price_at_execution DOUBLE PRECISION NOT NULL,
-    recorded_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
--- ==============================================================================
--- HIGH-PERFORMANCE INDEXING MATRIX
--- ==============================================================================
-
--- B-Tree Indexes for exact-match lookups
-CREATE INDEX IF NOT EXISTS idx_micro_shares_worker ON micro_shares(worker_id);
-CREATE INDEX IF NOT EXISTS idx_micro_shares_settlement ON micro_shares(is_settled);
-CREATE INDEX IF NOT EXISTS idx_network_blocks_worker ON network_blocks(worker_id);
-CREATE INDEX IF NOT EXISTS idx_network_blocks_time ON network_blocks(discovered_at DESC);
-CREATE INDEX IF NOT EXISTS idx_user_command_centers_updated ON user_command_centers(last_updated DESC);
-CREATE INDEX IF NOT EXISTS idx_tax_ledger_wallet ON tax_ledger_events(wallet_address, recorded_at DESC);
-
--- BRIN (Block Range Index) for hyper-optimized append-only time-series data
-CREATE INDEX IF NOT EXISTS idx_micro_shares_recorded_brin 
-ON micro_shares USING brin (recorded_at) WITH (pages_per_range = 128);
-
--- RWA Oracle Telemetry (Unlogged for high-velocity ingest)
-CREATE UNLOGGED TABLE IF NOT EXISTS rwa_oracle_feeds (
-    ticker VARCHAR(16) NOT NULL,
-    asset_class VARCHAR(16) NOT NULL,
-    price_usd NUMERIC(18, 8) NOT NULL,
-    oracle_source VARCHAR(32) NOT NULL DEFAULT 'PYTH_HERMES',
-    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (ticker, updated_at)
-);
-
-CREATE INDEX IF NOT EXISTS idx_rwa_oracle_ticker_time ON rwa_oracle_feeds (ticker, updated_at DESC);
+# Settlement Invariants
+default_unassigned_settlement_threshold: 100.0
+coinbase_maturity_daa_confirmations: 500
 </file>
 
 <file path="src/kaspad_client/mod.rs">
@@ -3367,26 +3496,6 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
-</file>
-
-<file path="config.yaml">
-# Core Network Parameters (Pivoted to Local Node)
-stratum_port: ":5555"
-kaspad_address: "127.0.0.1:16110"
-
-# Central Pool Wallet (Matched to Master Admin Treasury)
-mining_address: "kaspa:qrc3ezl770p2cjlfc3tjp6vqlldt6lgh3e80d6rm4rchtt0yrrpgzqave8579"
-
-# Public Pool Mechanics
-starting_diff: 64       # ⚡ Allows IceRiver and Goldshell miners to survive
-min_share_diff: 2.0      
-var_diff: true           
-shares_per_min: 20
-extranonce_size: 2
-
-# Telemetry System
-prom_port: ":8081"
-print_stats: true
 </file>
 
 <file path="src/telemetry/mod.rs">

@@ -111,12 +111,21 @@ pub async fn start_kaspad_client(
     
     tokio::spawn(async move {
         let mut req_id = 3;
+        let mut sync_warned = false; // Prevents log spam while waiting for sync
+
         while let Ok(Some(response)) = response_stream.message().await {
             match response.payload {
                 Some(ResponsePayload::GetBlockTemplateResponse(res)) => {
                     if let Some(err) = res.error {
                         tracing::error!("❌ GET_BLOCK_TEMPLATE REJECTED BY NODE: {}", err.message);
+                    } else if !res.is_synced {
+                        // ⚡ THE FIX: Warn the user if the node is out of sync instead of silently failing
+                        if !sync_warned {
+                            tracing::warn!("⏳ Kaspa Node is currently syncing (IBD). Awaiting network convergence to acquire block templates...");
+                            sync_warned = true;
+                        }
                     } else if let Some(block) = res.block {
+                        sync_warned = false; // Reset the warning flag once we get a block
                         
                         let mut block_reward = 50.0;
                         if let Some(coinbase_tx) = block.transactions.first() {
@@ -137,6 +146,8 @@ pub async fn start_kaspad_client(
                             }
                             job_manager.process_new_block(block.clone());
                         }
+                    } else {
+                        tracing::warn!("⚠️ Node claims to be synced but returned an empty block template.");
                     }
                 }
                 Some(ResponsePayload::GetBlockDagInfoResponse(res)) => {

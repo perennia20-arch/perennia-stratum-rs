@@ -23,7 +23,6 @@ pub async fn handle_state_action(
     Json(req): Json<StateActionReq>,
 ) -> Result<Json<ActionResponse>, Json<ActionResponse>> {
     
-    // ⚡ INFRASTRUCTURE HARDENING
     let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
     let redis_client = match redis::Client::open(redis_url) {
         Ok(c) => c,
@@ -34,27 +33,44 @@ pub async fn handle_state_action(
         Err(e) => return Err(Json(ActionResponse { success: false, error: Some(e.to_string()) })),
     };
 
+    // Strictly enforce the kaspa: prefix for all database indexing
+    let clean_wallet = req.wallet.to_lowercase().replace("kaspa:", "").trim().to_string();
+    let master_identity = format!("kaspa:{}", clean_wallet);
+
     let mut tx = match pool.begin().await {
         Ok(t) => t,
         Err(e) => return Err(Json(ActionResponse { success: false, error: Some(e.to_string()) })),
     };
 
-    let row = sqlx::query!(
-        "SELECT layout_state FROM user_command_centers WHERE wallet_address = $1 FOR UPDATE",
-        req.wallet
+    // ⚡ THE FIX: Use fetch_all to prevent the SQL driver from crashing if a ghost row exists
+    let rows = sqlx::query!(
+        "SELECT layout_state FROM user_command_centers WHERE wallet_address = $1 OR wallet_address = $2",
+        master_identity,
+        clean_wallet
     )
-    .fetch_optional(&mut *tx)
+    .fetch_all(&mut *tx)
     .await;
 
-    let mut state: Value = match row {
-        Ok(Some(r)) => r.layout_state,
-        _ => json!({"workers": [], "sectors": [], "manualLps": [], "systemMode": "base"}),
-    };
+    let mut state: Value = json!({"workers": [], "sectors": [], "manualLps": [], "systemMode": "base"});
+    
+    if let Ok(results) = rows {
+        for r in results {
+            state = r.layout_state;
+            // If we find a profile that actually has configured sectors, we prioritize it
+            if state.get("sectors").and_then(|s| s.as_array()).map(|a| a.len()).unwrap_or(0) > 0 {
+                break;
+            }
+        }
+    }
 
     match req.action.as_str() {
         "ADD_WORKER" => {
             if let Some(workers) = state.get_mut("workers").and_then(|w| w.as_array_mut()) {
-                workers.push(req.payload.clone());
+                let new_id = req.payload.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                let exists = workers.iter().any(|w| w.get("id").and_then(|i| i.as_str()).unwrap_or("") == new_id);
+                if !exists {
+                    workers.push(req.payload.clone());
+                }
             } else {
                 state["workers"] = json!([req.payload.clone()]);
             }
@@ -92,7 +108,7 @@ pub async fn handle_state_action(
                 }
             }
 
-            if total_pct > 100.0 {
+            if total_pct > 100.001 {
                 let _ = tx.rollback().await;
                 return Err(Json(ActionResponse { success: false, error: Some("Total sector allocation cannot exceed 100%".to_string()) }));
             }
@@ -138,7 +154,7 @@ pub async fn handle_state_action(
                     }
                 }
 
-                if total_pct > 100.0 {
+                if total_pct > 100.001 {
                     let _ = tx.rollback().await;
                     return Err(Json(ActionResponse { success: false, error: Some("Total sector allocation cannot exceed 100%".to_string()) }));
                 }
@@ -147,6 +163,20 @@ pub async fn handle_state_action(
                     for sec in sectors.iter_mut() {
                         if sec.get("id").and_then(|i| i.as_str()).unwrap_or("") == id {
                             sec["allocationPercentage"] = json!(new_pct);
+                        }
+                    }
+                }
+            }
+        },
+        "UPDATE_SETTLEMENT" => {
+            if let (Some(id), Some(config)) = (
+                req.payload.get("id").and_then(|i| i.as_str()),
+                req.payload.get("config")
+            ) {
+                if let Some(sectors) = state.get_mut("sectors").and_then(|s| s.as_array_mut()) {
+                    for sec in sectors.iter_mut() {
+                        if sec.get("id").and_then(|i| i.as_str()).unwrap_or("") == id {
+                            sec["settlementConfig"] = config.clone();
                         }
                     }
                 }
@@ -183,11 +213,12 @@ pub async fn handle_state_action(
         _ => {}
     }
 
+    // Always save to the master_identity (kaspa: prefix) to unify the profiles
     let save_res = sqlx::query!(
         "INSERT INTO user_command_centers (wallet_address, layout_state, last_updated) 
          VALUES ($1, $2, CURRENT_TIMESTAMP) 
          ON CONFLICT (wallet_address) DO UPDATE SET layout_state = EXCLUDED.layout_state, last_updated = CURRENT_TIMESTAMP",
-        req.wallet,
+        master_identity,
         state
     )
     .execute(&mut *tx)
@@ -198,11 +229,14 @@ pub async fn handle_state_action(
         return Err(Json(ActionResponse { success: false, error: Some(e.to_string()) }));
     }
 
+    // Erase the ghost row from the database so it never crashes the parser again
+    let _ = sqlx::query!("DELETE FROM user_command_centers WHERE wallet_address = $1", clean_wallet).execute(&mut *tx).await;
+
     let _ = tx.commit().await;
 
     let update_payload = json!({
         "layout_state_update": true,
-        "wallet": req.wallet,
+        "wallet": master_identity,
         "state": state
     });
 
