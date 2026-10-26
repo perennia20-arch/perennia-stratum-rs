@@ -6,3 +6,7 @@ repomix*
 *.pem
 *.key
 node_modules/
+kaspa-keygen/
+db/
+setup.js
+test-wrpc.js
