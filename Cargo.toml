@@ -1,0 +1,146 @@
+
+# Cargo.toml
+
+
+
+[package]
+
+name = "perennia-stratum-rs"
+
+version = "0.2.0"
+
+edition = "2021"
+
+description = "High-Performance Zero-Allocation Stratum Server for Kaspa Toccata (Streaming Oracle Edition)"
+
+default-run = "perennia-stratum-rs"
+
+
+
+[dependencies]
+
+tokio = { version = "1.36", features = ["full"] }
+
+tokio-util = { version = "0.7", features = ["codec"] }
+
+bytes = "1.5" 
+
+tokio-stream = "0.1"
+
+tonic = "0.11"
+
+prost = "0.12"
+
+serde = { version = "1.0", features = ["derive"] }
+
+serde_json = { version = "1.0", features = ["raw_value"] }
+
+serde_yaml = "0.9" 
+
+itoa = "1.0" 
+
+prometheus = "0.13"
+
+lazy_static = "1.4"
+
+redis = { version = "0.25", features = ["tokio-comp"] }
+
+anyhow = "1.0"
+
+tracing = "0.1"
+
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+dashmap = "6.0"
+
+urlencoding = "2.1"
+
+dotenvy = "0.15"
+
+
+
+# 🛡️ SOVEREIGN WEBSOCKET ORACLE
+
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
+
+futures-util = "0.3"
+
+
+
+# 🛡️ BRIDGE API ORCHESTRATION & SOR ROUTING MATRIX
+
+axum = "0.7"
+
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+
+hex = "0.4"
+
+sha2 = "0.10"
+
+hmac = "0.12"
+
+base64 = "0.21"
+
+
+
+# 🛡️ SOVEREIGN INFRASTRUCTURE: PostgreSQL Yield Streaming WAL
+
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json"] }
+
+chrono = { version = "0.4", features = ["serde"] }
+
+uuid = { version = "1.8", features = ["v4", "serde"] }
+
+
+
+# 🛡️ Enterprise Path A: Official Kaspa Consensus Core Cryptography
+
+kaspa-consensus-core = { git = "https://github.com/kaspanet/rusty-kaspa", branch = "master" }
+
+kaspa-hashes = { git = "https://github.com/kaspanet/rusty-kaspa", branch = "master" }
+
+kaspa-math = { git = "https://github.com/kaspanet/rusty-kaspa", branch = "master" }
+
+kaspa-pow = { git = "https://github.com/kaspanet/rusty-kaspa", branch = "master" } 
+
+secp256k1 = { version = "0.29.0", features = ["global-context", "rand-std"] }
+
+
+
+[build-dependencies]
+
+tonic-build = "0.11" 
+
+
+
+# ⚡ EXPLICIT TEST BINARY DECLARATION
+
+[[bin]]
+
+name = "dark_pool_stress"
+
+path = "tests/dark_pool_stress.rs"
+
+test = false
+
+
+
+# ⚡ PRIMARY SERVER BINARY DECLARATION
+
+[[bin]]
+
+name = "perennia-stratum-rs"
+
+path = "src/main.rs"
+
+
+
+[profile.release]
+
+opt-level = 3
+
+lto = "fat"
+
+codegen-units = 1
+
+panic = "abort"

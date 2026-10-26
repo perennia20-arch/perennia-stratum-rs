@@ -1,0 +1,48 @@
+
+# Core Network Parameters (RPC Node Array for Automatic Failover)
+
+stratum_port: ":5555"
+
+kaspad_addresses:
+
+  - "127.0.0.1:16110"
+
+  - "192.168.1.100:16110"
+
+  - "api.kaspa.org:16110"
+
+
+
+# Central Pool Wallet (Matched to Master Admin Treasury)
+
+mining_address: "kaspa:qrc3ezl770p2cjlfc3tjp6vqlldt6lgh3e80d6rm4rchtt0yrrpgzqave8579"
+
+
+
+# Public Pool Mechanics
+
+starting_diff: 64
+
+min_share_diff: 2.0
+
+var_diff: true
+
+shares_per_min: 20
+
+extranonce_size: 2
+
+
+
+# Telemetry System
+
+prom_port: ":9091"
+
+print_stats: true
+
+
+
+# Settlement Invariants
+
+default_unassigned_settlement_threshold: 50.0
+
+coinbase_maturity_daa_confirmations: 500
