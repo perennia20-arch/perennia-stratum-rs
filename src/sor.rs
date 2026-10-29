@@ -49,6 +49,12 @@ const DEFAULT_ONLINE_MAX_UNHEDGED_KAS: f64 = 50_000.0;
 pub const MIN_DARK_POOL_POSITION_USD: f64 = 5.00;
 const LONG_TAIL_PASSTHROUGH_FEE_RATE: f64 = 0.015;
 pub const DEFAULT_ECOSYSTEM_TICKER: &str = "SILO";
+pub const DEFAULT_HOT_WALLET_CEILING_KAS: f64 = 5_000.0;
+pub const DEFAULT_HOT_WALLET_MIN_RUNWAY_KAS: f64 = 250.0;
+pub const KASPA_ADDR_VERSION_P2PK_SCHNORR: u8 = 0x00;
+pub const KASPA_ADDR_VERSION_P2PK_ECDSA: u8 = 0x01;
+pub const KASPA_ADDR_VERSION_P2SH: u8 = 0x08;
+const KASPA_BECH32_CHARSET: &[u8; 32] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[allow(non_snake_case)]
@@ -100,6 +106,17 @@ pub struct SorError {
     pub error: String,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[allow(non_snake_case)]
+pub struct HifoDisposalSummary {
+    pub totalDisposedTokens: f64,
+    pub totalCostBasisUsd: f64,
+    pub grossProceedsUsd: f64,
+    pub realizedGainLossUsd: f64,
+    pub holdingPeriod: String,
+    pub matchedLotsCount: usize,
+}
+
 pub fn resolve_ecosystem_ticker() -> String {
     env::var("PERENNIA_ECOSYSTEM_TICKER")
         .ok()
@@ -116,12 +133,50 @@ fn normalize_kaspa_base32(addr: &str) -> String {
         .to_string()
 }
 
-fn resolve_treasury_kas_address() -> Result<String, String> {
+pub fn resolve_treasury_kas_address() -> Result<String, String> {
     let clean = crate::chronos::resolve_master_treasury_address();
     if clean.is_empty() {
-        return Err("CRITICAL: Master Treasury KAS address not configured in environment or config.yaml.".to_string());
+        return Err("CRITICAL: Hot Payout Signer KAS address not configured in environment or config.yaml.".to_string());
     }
     Ok(format!("kaspa:{}", clean))
+}
+
+pub fn resolve_hot_signer_private_key() -> Result<String, String> {
+    if let Ok(hot_key) = env::var("PERENNIA_HOT_KAS_PRIVATE_KEY") {
+        let trimmed = hot_key.trim().to_string();
+        if !trimmed.is_empty() {
+            return Ok(trimmed);
+        }
+    }
+    env::var("PERENNIA_TREASURY_PRIVATE_KEY")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "CRITICAL: Neither PERENNIA_HOT_KAS_PRIVATE_KEY nor PERENNIA_TREASURY_PRIVATE_KEY is configured in memory.".to_string())
+}
+
+pub fn resolve_cold_vault_kas_address() -> Option<String> {
+    env::var("PERENNIA_COLD_KAS_ADDRESS")
+        .ok()
+        .map(|s| normalize_kaspa_base32(&s))
+        .filter(|s| s.len() >= 55)
+        .map(|clean| format!("kaspa:{}", clean))
+}
+
+pub fn get_hot_wallet_ceiling_kas() -> f64 {
+    env::var("PERENNIA_HOT_WALLET_CEILING_KAS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|&v| v >= 100.0)
+        .unwrap_or(DEFAULT_HOT_WALLET_CEILING_KAS)
+}
+
+pub fn get_hot_wallet_min_runway_kas() -> f64 {
+    env::var("PERENNIA_HOT_WALLET_MIN_RUNWAY_KAS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|&v| v >= 50.0)
+        .unwrap_or(DEFAULT_HOT_WALLET_MIN_RUNWAY_KAS)
 }
 
 fn get_secure_client() -> Client {
@@ -132,7 +187,7 @@ fn get_secure_client() -> Client {
         .unwrap_or_else(|_| Client::new())
 }
 
-fn get_fee_per_gram() -> u64 {
+pub fn get_fee_per_gram() -> u64 {
     env::var("KASPA_FEE_PER_GRAM")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -224,30 +279,100 @@ pub fn parse_json_u64(val: Option<&Value>) -> Option<u64> {
     val.and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok())))
 }
 
-fn decode_address_to_script(address: &str) -> Result<String, String> {
-    let clean_addr = address.trim().replace("kaspa:", "");
-    let formatted_addr = format!("kaspa:{}", clean_addr);
-    let parts: Vec<&str> = formatted_addr.split(':').collect();
-    if parts.len() != 2 {
-        return Err("Invalid address format".to_string());
+pub fn kaspa_bech32m_polymod(values: &[u8]) -> u64 {
+    let mut c: u64 = 1;
+    for &v in values {
+        let c0 = c >> 35;
+        c = ((c & 0x07ff_ffff_ff) << 5) ^ (v as u64);
+        if (c0 & 1) != 0 {
+            c ^= 0x98f2_bc8e_61;
+        }
+        if (c0 & 2) != 0 {
+            c ^= 0x79b7_6d99_e2;
+        }
+        if (c0 & 4) != 0 {
+            c ^= 0xf33e_5fb3_c4;
+        }
+        if (c0 & 8) != 0 {
+            c ^= 0xae2e_abe2_a8;
+        }
+        if (c0 & 16) != 0 {
+            c ^= 0x1e4f_43e4_70;
+        }
     }
-    let base32 = parts[1];
-    if base32.len() < 8 {
-        return Err("Address too short".to_string());
+    c ^ 1
+}
+
+pub fn encode_kaspa_bech32m_address(version: u8, hash32: &[u8; 32]) -> String {
+    let prefix = b"kaspa";
+    let mut prefix_values: Vec<u8> = prefix.iter().map(|b| b & 31).collect();
+    prefix_values.push(0);
+    let mut payload = Vec::with_capacity(33);
+    payload.push(version);
+    payload.extend_from_slice(hash32);
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    let mut payload5: Vec<u8> = Vec::with_capacity(54);
+    for &byte in &payload {
+        acc = (acc << 8) | (byte as u32);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            payload5.push(((acc >> bits) & 31) as u8);
+        }
+    }
+    if bits > 0 {
+        payload5.push(((acc << (5 - bits)) & 31) as u8);
+    }
+    let mut mod_input = Vec::with_capacity(prefix_values.len() + payload5.len() + 8);
+    mod_input.extend_from_slice(&prefix_values);
+    mod_input.extend_from_slice(&payload5);
+    mod_input.extend_from_slice(&[0u8; 8]);
+    let polymod = kaspa_bech32m_polymod(&mod_input);
+    let mut out_str = String::with_capacity(6 + payload5.len() + 8);
+    out_str.push_str("kaspa:");
+    for &w in &payload5 {
+        out_str.push(KASPA_BECH32_CHARSET[(w & 31) as usize] as char);
+    }
+    for i in 0..8 {
+        let idx = ((polymod >> (5 * (7 - i))) & 31) as usize;
+        out_str.push(KASPA_BECH32_CHARSET[idx] as char);
+    }
+    out_str
+}
+
+pub fn encode_kaspa_p2sh_address(script_hash32: &[u8; 32]) -> String {
+    encode_kaspa_bech32m_address(KASPA_ADDR_VERSION_P2SH, script_hash32)
+}
+
+pub fn decode_kaspa_address_version_and_hash(address: &str) -> Result<(u8, [u8; 32]), String> {
+    let clean_addr = address.trim().to_lowercase().replace("kaspa:", "");
+    if clean_addr.len() < 55 || clean_addr.len() > 75 {
+        return Err(format!("Invalid Kaspa Bech32m payload length ({})", clean_addr.len()));
     }
     let charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
-    let mut decoded = Vec::new();
-    for c in base32[..base32.len() - 8].chars() {
+    let mut all_words: Vec<u8> = Vec::with_capacity(clean_addr.len());
+    for c in clean_addr.chars() {
         if let Some(idx) = charset.find(c) {
-            decoded.push(idx as u8);
+            all_words.push(idx as u8);
         } else {
             return Err(format!("Invalid base32 character detected: {}", c));
         }
     }
-    let mut out = Vec::new();
+    if all_words.len() < 9 {
+        return Err("Address payload too short".to_string());
+    }
+    let mut polymod_input: Vec<u8> = b"kaspa".iter().map(|b| b & 31).collect();
+    polymod_input.push(0);
+    polymod_input.extend_from_slice(&all_words);
+    if kaspa_bech32m_polymod(&polymod_input) != 0 {
+        return Err("Kaspa Bech32m polymod checksum verification failed".to_string());
+    }
+    let data_words = &all_words[..all_words.len() - 8];
+    let mut out = Vec::with_capacity(34);
     let mut val = 0u32;
     let mut bits = 0;
-    for &d in &decoded {
+    for &d in data_words {
         val = (val << 5) | (d as u32);
         bits += 5;
         while bits >= 8 {
@@ -255,16 +380,54 @@ fn decode_address_to_script(address: &str) -> Result<String, String> {
             out.push((val >> bits) as u8);
         }
     }
-    if out.len() < 33 {
-        return Err(format!("Decoded public key is too short. Expected 33 bytes, got {}", out.len()));
+    if out.len() < 32 {
+        return Err(format!(
+            "Decoded address payload is too short. Expected 33 bytes, got {}",
+            out.len()
+        ));
     }
-    let pubkey = &out[1..33];
-    let mut hex_str = String::new();
-    for byte in pubkey {
-        use std::fmt::Write;
-        write!(&mut hex_str, "{:02x}", byte).unwrap();
+    let version = out[0];
+    if version != KASPA_ADDR_VERSION_P2PK_SCHNORR
+        && version != KASPA_ADDR_VERSION_P2PK_ECDSA
+        && version != KASPA_ADDR_VERSION_P2SH
+    {
+        return Err(format!("Unsupported Kaspa address version byte: 0x{:02x}", version));
     }
-    Ok(format!("20{}ac", hex_str))
+    let mut hash32 = [0u8; 32];
+    let slice_end = (1 + 32).min(out.len());
+    hash32[..(slice_end - 1)].copy_from_slice(&out[1..slice_end]);
+    Ok((version, hash32))
+}
+
+pub fn decode_address_to_script(address: &str) -> Result<String, String> {
+    let (version, hash32) = decode_kaspa_address_version_and_hash(address)?;
+    let hex_str = hex::encode(hash32);
+    if version == KASPA_ADDR_VERSION_P2SH {
+        Ok(format!("a9{}87", hex_str))
+    } else {
+        Ok(format!("20{}ac", hex_str))
+    }
+}
+
+async fn is_registered_dynamic_ticker(
+    redis_conn: &mut redis::aio::MultiplexedConnection,
+    ticker: &str,
+) -> bool {
+    let clean = ticker.trim().to_uppercase();
+    if crate::oracle::DYNAMIC_ORACLE_TICKERS.contains(&clean) {
+        return true;
+    }
+    let is_member: i32 = redis::cmd("SISMEMBER")
+        .arg("oracle:dynamic_tickers")
+        .arg(&clean)
+        .query_async(redis_conn)
+        .await
+        .unwrap_or(0);
+    if is_member == 1 {
+        crate::oracle::register_dynamic_oracle_ticker(&clean);
+        return true;
+    }
+    false
 }
 
 async fn get_usd_price(
@@ -291,7 +454,7 @@ async fn get_usd_price(
     }
     if crate::oracle::is_pyth_rwa_asset(&clean) {
         if let Ok(Some(row)) = sqlx::query(
-            "SELECT price_usd FROM rwa_oracle_feeds WHERE ticker = $1 AND price_usd > 0 ORDER BY updated_at DESC LIMIT 1"
+            "SELECT price_usd FROM rwa_oracle_feeds WHERE ticker = $1 AND price_usd > 0 AND updated_at >= CURRENT_TIMESTAMP - INTERVAL '15 minutes' ORDER BY updated_at DESC LIMIT 1"
         )
         .bind(&clean)
         .fetch_optional(pool)
@@ -299,8 +462,9 @@ async fn get_usd_price(
         {
             let p = row.try_get::<f64, _>("price_usd").unwrap_or(0.0);
             if p > 0.0 {
-                let _: () = redis::cmd("SET")
+                let _: () = redis::cmd("SETEX")
                     .arg(&key)
+                    .arg(60)
                     .arg(p.to_string())
                     .query_async(redis_conn)
                     .await
@@ -309,11 +473,74 @@ async fn get_usd_price(
             }
         }
     }
+    if is_registered_dynamic_ticker(redis_conn, &clean).await {
+        let client = get_secure_client();
+        let kas_spot: f64 = redis::cmd("GET")
+            .arg("oracle:spot:KAS_USDC")
+            .query_async::<_, Option<String>>(redis_conn)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let live_price = fetch_third_party_long_tail_price_usd(&client, &clean, kas_spot).await;
+        if live_price > 0.0 {
+            let _: () = redis::cmd("SETEX")
+                .arg(&key)
+                .arg(30)
+                .arg(live_price.to_string())
+                .query_async(redis_conn)
+                .await
+                .unwrap_or(());
+            return live_price;
+        }
+    }
     0.0
 }
 
 async fn fetch_third_party_long_tail_price_usd(client: &Client, ticker: &str, kas_usd: f64) -> f64 {
     let clean = ticker.trim().to_uppercase();
+    if let Ok(res) = client
+        .get(&format!("https://api.mexc.com/api/v3/ticker/price?symbol={}USDT", clean))
+        .send()
+        .await
+    {
+        if res.status().is_success() {
+            if let Ok(data) = res.json::<Value>().await {
+                if let Some(p_usd) = data
+                    .get("price")
+                    .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| v.as_f64()))
+                {
+                    if p_usd > 0.0 {
+                        return p_usd;
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(res) = client
+        .get(&format!("https://api.gateio.ws/api/v4/spot/tickers?currency_pair={}_USDT", clean))
+        .send()
+        .await
+    {
+        if res.status().is_success() {
+            if let Ok(data) = res.json::<Value>().await {
+                let item = if let Some(arr) = data.as_array() {
+                    arr.first().cloned().unwrap_or(Value::Null)
+                } else {
+                    data
+                };
+                if let Some(p_usd) = item
+                    .get("last")
+                    .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| v.as_f64()))
+                {
+                    if p_usd > 0.0 {
+                        return p_usd;
+                    }
+                }
+            }
+        }
+    }
     if let Ok(res) = client
         .get(&format!("https://api.kas.fyi/v1/tokens/krc20/{}/market", clean))
         .send()
@@ -379,7 +606,6 @@ pub async fn get_lp_pair_reserves(pool: &PgPool, quote_asset: &str) -> (f64, f64
     let pool_pair = format!("KAS/{}", clean_quote);
     let mut total_kas = 0.0;
     let mut total_quote = 0.0;
-
     if let Ok(Some(row)) = sqlx::query(
         "SELECT COALESCE(SUM(staked_asset_a), 0.0) AS reserve_a, COALESCE(SUM(staked_asset_b), 0.0) AS reserve_b FROM liquidity_providers WHERE pool_pair = $1"
     )
@@ -390,7 +616,6 @@ pub async fn get_lp_pair_reserves(pool: &PgPool, quote_asset: &str) -> (f64, f64
         total_kas += row.try_get::<f64, _>("reserve_a").unwrap_or(0.0).max(0.0);
         total_quote += row.try_get::<f64, _>("reserve_b").unwrap_or(0.0).max(0.0);
     }
-
     if let Ok(rows) = sqlx::query(
         "SELECT pool_pair, staked_asset_a, weights_json, reserves_json FROM liquidity_providers WHERE pool_pair LIKE 'KAS/%/%'"
     )
@@ -427,7 +652,6 @@ pub async fn get_lp_pair_reserves(pool: &PgPool, quote_asset: &str) -> (f64, f64
             }
         }
     }
-
     (total_kas, total_quote)
 }
 
@@ -441,7 +665,6 @@ pub async fn get_multi_asset_cross_pair_reserves(
     let mut reserve_in = 0.0;
     let mut reserve_out = 0.0;
     let mut matching_plants = 0usize;
-
     if let Ok(rows) = sqlx::query(
         "SELECT pool_pair, staked_asset_a, staked_asset_b, weights_json, reserves_json FROM liquidity_providers"
     )
@@ -484,7 +707,6 @@ pub async fn get_silo_staking_fee_cap(
 ) -> Option<(f64, String, f64)> {
     let eco_ticker = resolve_ecosystem_ticker();
     let mut total_staked_silo = 0.0;
-
     if let Ok(Some(row)) = sqlx::query(
         "SELECT COALESCE(SUM(amount_staked), 0.0) AS staked_sum FROM silo_staking_positions WHERE (wallet_address = $1 OR wallet_address = $2) AND token_ticker = $3 AND status = 'ACTIVE'"
     )
@@ -496,7 +718,6 @@ pub async fn get_silo_staking_fee_cap(
     {
         total_staked_silo += row.try_get::<f64, _>("staked_sum").unwrap_or(0.0).max(0.0);
     }
-
     let eco_pair = format!("KAS/{}", eco_ticker);
     if let Ok(Some(row)) = sqlx::query(
         "SELECT COALESCE(SUM(staked_asset_b), 0.0) AS lp_silo_sum FROM liquidity_providers WHERE (wallet_address = $1 OR wallet_address = $2) AND pool_pair = $3"
@@ -509,7 +730,6 @@ pub async fn get_silo_staking_fee_cap(
     {
         total_staked_silo += row.try_get::<f64, _>("lp_silo_sum").unwrap_or(0.0).max(0.0);
     }
-
     if total_staked_silo >= 1_000_000.0 {
         Some((
             0.0025,
@@ -559,7 +779,6 @@ async fn compute_inventory_skew_and_guard(
     let is_whale = gross_trade_usd >= 2000.0;
     let mut base_tier_rate = if is_whale { 0.005 } else { 0.015 };
     let mut silo_tier_label: Option<String> = None;
-
     if let Some((silo_cap_rate, label, _staked_qty)) =
         get_silo_staking_fee_cap(pool, clean_wallet, prefixed_wallet).await
     {
@@ -568,7 +787,6 @@ async fn compute_inventory_skew_and_guard(
             silo_tier_label = Some(label);
         }
     }
-
     if pay_asset == "KAS" && receive_asset != "KAS" {
         let (_lp_kas_reserve, lp_quote_reserve) = get_lp_pair_reserves(pool, receive_asset).await;
         let lp_absorbable_kas = ((lp_quote_reserve * rec_usd) / pay_usd).max(0.0);
@@ -619,7 +837,6 @@ async fn compute_inventory_skew_and_guard(
         let label = silo_tier_label.unwrap_or_else(|| "Perennia Liquidity Pool (Batched)".to_string());
         return Ok((effective_rate, label));
     }
-
     let (_res_in, _res_out, plant_count) =
         get_multi_asset_cross_pair_reserves(pool, pay_asset, receive_asset).await;
     let default_label = if plant_count > 0 {
@@ -689,16 +906,172 @@ async fn sync_unassigned_kas_debit(pool: &PgPool, clean_wallet: &str, from_unass
     }
 }
 
+pub async fn record_hifo_acquisition_lot(
+    pool: &PgPool,
+    clean_wallet: &str,
+    asset_ticker: &str,
+    amount_tokens: f64,
+    fmv_usd_per_token: f64,
+    source_event_type: &str,
+    source_tx_hash: Option<&str>,
+) {
+    if amount_tokens <= 0.0 || fmv_usd_per_token <= 0.0 {
+        return;
+    }
+    let clean_asset = asset_ticker.trim().to_uppercase();
+    let sompi = (amount_tokens * 100_000_000.0).round() as i64;
+    let total_cost_basis = amount_tokens * fmv_usd_per_token;
+    let _ = sqlx::query(
+        r#"
+        INSERT INTO hifo_tax_lots
+        (wallet_address, asset_ticker, kas_sompi, initial_tokens, remaining_sompi, remaining_tokens, fmv_usd_per_token, total_cost_basis_usd, source_event_type, source_tx_hash, status)
+        VALUES ($1, $2, $3, $4, $3, $4, $5, $6, $7, $8, 'OPEN')
+        "#,
+    )
+    .bind(clean_wallet)
+    .bind(&clean_asset)
+    .bind(sompi)
+    .bind(amount_tokens)
+    .bind(fmv_usd_per_token)
+    .bind(total_cost_basis)
+    .bind(source_event_type)
+    .bind(source_tx_hash)
+    .execute(pool)
+    .await;
+}
+
+pub async fn execute_passive_hifo_disposal(
+    pool: &PgPool,
+    clean_wallet: &str,
+    asset_ticker: &str,
+    disposed_tokens: f64,
+    execution_spot_usd: f64,
+    disposal_tx_hash: Option<&str>,
+) -> HifoDisposalSummary {
+    let clean_asset = asset_ticker.trim().to_uppercase();
+    let gross_proceeds_usd = disposed_tokens * execution_spot_usd;
+    let mut remaining_to_match_tokens = disposed_tokens.max(0.0);
+    let mut accumulated_cost_basis_usd = 0.0_f64;
+    let mut matched_lots_count = 0usize;
+    let mut has_short_term = false;
+    let mut has_long_term = false;
+    if let Ok(open_lots) = sqlx::query(
+        r#"
+        SELECT lot_id, acquired_at, remaining_sompi, remaining_tokens, fmv_usd_per_token,
+               GREATEST(0, EXTRACT(DAY FROM (CURRENT_TIMESTAMP - acquired_at))::INTEGER) AS holding_days
+        FROM hifo_tax_lots
+        WHERE (wallet_address = $1 OR wallet_address = $2)
+          AND asset_ticker = $3
+          AND status = 'OPEN'
+          AND remaining_tokens > 1e-9
+        ORDER BY fmv_usd_per_token DESC, acquired_at ASC
+        "#,
+    )
+    .bind(clean_wallet)
+    .bind(format!("kaspa:{}", clean_wallet))
+    .bind(&clean_asset)
+    .fetch_all(pool)
+    .await
+    {
+        for row in open_lots {
+            if remaining_to_match_tokens <= 1e-9 {
+                break;
+            }
+            let lot_id: Uuid = row.get("lot_id");
+            let acquired_at: chrono::DateTime<chrono::Utc> = row.get("acquired_at");
+            let lot_rem_tokens: f64 = row.try_get("remaining_tokens").unwrap_or(0.0);
+            let lot_fmv_usd: f64 = row.try_get("fmv_usd_per_token").unwrap_or(0.0);
+            let holding_days: i32 = row.try_get("holding_days").unwrap_or(0);
+            if lot_rem_tokens <= 1e-9 {
+                continue;
+            }
+            let consumed_tokens = remaining_to_match_tokens.min(lot_rem_tokens);
+            let consumed_sompi = (consumed_tokens * 100_000_000.0).round() as i64;
+            let next_rem_tokens = (lot_rem_tokens - consumed_tokens).max(0.0);
+            let next_rem_sompi = (next_rem_tokens * 100_000_000.0).round() as i64;
+            let next_status = if next_rem_tokens <= 1e-8 { "DEPLETED" } else { "OPEN" };
+            let slice_cost_basis_usd = consumed_tokens * lot_fmv_usd;
+            let slice_proceeds_usd = consumed_tokens * execution_spot_usd;
+            let slice_gain_loss_usd = slice_proceeds_usd - slice_cost_basis_usd;
+            let is_long_term = holding_days > 365;
+            if is_long_term {
+                has_long_term = true;
+            } else {
+                has_short_term = true;
+            }
+            let _ = sqlx::query(
+                r#"
+                UPDATE hifo_tax_lots
+                SET remaining_tokens = $1,
+                    remaining_sompi = $2,
+                    status = $3
+                WHERE lot_id = $4
+                "#,
+            )
+            .bind(next_rem_tokens)
+            .bind(next_rem_sompi)
+            .bind(next_status)
+            .bind(lot_id)
+            .execute(pool)
+            .await;
+            let _ = sqlx::query(
+                r#"
+                INSERT INTO hifo_disposal_matches
+                (lot_id, wallet_address, asset_ticker, disposed_sompi, disposed_tokens, acquired_at, holding_period_days, is_long_term, cost_basis_usd, gross_proceeds_usd, realized_gain_loss_usd, disposal_tx_hash)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                "#,
+            )
+            .bind(lot_id)
+            .bind(clean_wallet)
+            .bind(&clean_asset)
+            .bind(consumed_sompi)
+            .bind(consumed_tokens)
+            .bind(acquired_at)
+            .bind(holding_days)
+            .bind(is_long_term)
+            .bind(slice_cost_basis_usd)
+            .bind(slice_proceeds_usd)
+            .bind(slice_gain_loss_usd)
+            .bind(disposal_tx_hash)
+            .execute(pool)
+            .await;
+            accumulated_cost_basis_usd += slice_cost_basis_usd;
+            remaining_to_match_tokens = (remaining_to_match_tokens - consumed_tokens).max(0.0);
+            matched_lots_count += 1;
+        }
+    }
+    if remaining_to_match_tokens > 1e-8 {
+        accumulated_cost_basis_usd += remaining_to_match_tokens * execution_spot_usd;
+        has_short_term = true;
+    }
+    let holding_period = match (has_long_term, has_short_term) {
+        (true, false) => "LONG_TERM".to_string(),
+        (true, true) => "MIXED_TERM".to_string(),
+        _ => "SHORT_TERM".to_string(),
+    };
+    HifoDisposalSummary {
+        totalDisposedTokens: disposed_tokens,
+        totalCostBasisUsd: accumulated_cost_basis_usd,
+        grossProceedsUsd: gross_proceeds_usd,
+        realizedGainLossUsd: gross_proceeds_usd - accumulated_cost_basis_usd,
+        holdingPeriod: holding_period,
+        matchedLotsCount: matched_lots_count,
+    }
+}
+
 async fn record_dex_swap_tax_event(
     pool: &PgPool,
     clean_wallet: &str,
+    pay_asset: &str,
     receive_asset: &str,
     pay_amount: f64,
     estimated_output: f64,
     pay_usd: f64,
     rec_usd: f64,
     spot_rate: f64,
+    tx_uuid: &str,
 ) {
+    let pay_ticker = pay_asset.trim().to_uppercase();
     let target_ticker = receive_asset.trim().to_uppercase();
     let gross_usd = if target_ticker == "USDC" || target_ticker == "USDT" || target_ticker == "USD" {
         estimated_output
@@ -710,15 +1083,49 @@ async fn record_dex_swap_tax_event(
         pay_amount * spot_rate
     };
     let execution_spot = if rec_usd > 0.0 { rec_usd } else { spot_rate };
+    let pay_spot = if pay_usd > 0.0 {
+        pay_usd
+    } else if pay_amount > 0.0 {
+        gross_usd / pay_amount
+    } else {
+        0.0
+    };
     if gross_usd > 0.0 && estimated_output > 0.0 {
+        let hifo_summary = execute_passive_hifo_disposal(
+            pool,
+            clean_wallet,
+            &pay_ticker,
+            pay_amount,
+            pay_spot,
+            Some(tx_uuid),
+        )
+        .await;
+        record_hifo_acquisition_lot(
+            pool,
+            clean_wallet,
+            &target_ticker,
+            estimated_output,
+            execution_spot,
+            "DEX_SWAP_ACQUISITION",
+            Some(tx_uuid),
+        )
+        .await;
         let _ = sqlx::query(
-            "INSERT INTO tax_ledger_events (wallet_address, asset_ticker, event_type, gross_proceeds_usd, amount_tokens, spot_price_at_execution) VALUES ($1, $2, 'DEX_SWAP', $3, $4, $5)"
+            r#"
+            INSERT INTO tax_ledger_events
+            (wallet_address, asset_ticker, event_type, gross_proceeds_usd, amount_tokens, spot_price_at_execution, tx_hash, cost_basis_usd, realized_gain_loss_usd, holding_period)
+            VALUES ($1, $2, 'DEX_SWAP', $3, $4, $5, $6, $7, $8, $9)
+            "#,
         )
         .bind(clean_wallet)
         .bind(&target_ticker)
         .bind(gross_usd)
         .bind(estimated_output)
         .bind(execution_spot)
+        .bind(tx_uuid)
+        .bind(hifo_summary.totalCostBasisUsd)
+        .bind(hifo_summary.realizedGainLossUsd)
+        .bind(&hifo_summary.holdingPeriod)
         .execute(pool)
         .await;
     }
@@ -742,13 +1149,23 @@ pub async fn handle_sor_execute(
         Ok(c) => c,
         Err(e) => return Err(Json(SorError { error: format!("Redis Connection Error: {}", e) })),
     };
-
     let pay_asset_clean = payload.payAsset.trim().to_uppercase();
     let receive_asset_clean = payload.receiveAsset.trim().to_uppercase();
-    let pay_oracle_supported = crate::oracle::is_oracle_supported_asset(&pay_asset_clean);
-    let rec_oracle_supported = crate::oracle::is_oracle_supported_asset(&receive_asset_clean);
     let pay_usd = get_usd_price(&pool, &mut redis_conn, &pay_asset_clean).await;
     let rec_usd = get_usd_price(&pool, &mut redis_conn, &receive_asset_clean).await;
+
+    if pay_usd > 0.0 && !crate::oracle::is_oracle_supported_asset(&pay_asset_clean) {
+        crate::oracle::register_dynamic_oracle_ticker(&pay_asset_clean);
+    }
+    if rec_usd > 0.0 && !crate::oracle::is_oracle_supported_asset(&receive_asset_clean) {
+        crate::oracle::register_dynamic_oracle_ticker(&receive_asset_clean);
+    }
+
+    let pay_oracle_supported = crate::oracle::is_oracle_supported_asset(&pay_asset_clean)
+        || is_registered_dynamic_ticker(&mut redis_conn, &pay_asset_clean).await;
+    let rec_oracle_supported = crate::oracle::is_oracle_supported_asset(&receive_asset_clean)
+        || is_registered_dynamic_ticker(&mut redis_conn, &receive_asset_clean).await;
+
     let min_dark_pool_usd = get_min_dark_pool_position_usd();
     let clean_wallet = normalize_kaspa_base32(&payload.wallet);
     let prefixed_wallet = format!("kaspa:{}", clean_wallet);
@@ -773,7 +1190,6 @@ pub async fn handle_sor_execute(
             ),
         }));
     }
-
     if !pay_oracle_supported || !rec_oracle_supported {
         if pay_asset_clean != "KAS" {
             return Err(Json(SorError {
@@ -885,12 +1301,14 @@ pub async fn handle_sor_execute(
             record_dex_swap_tax_event(
                 &pool,
                 &clean_wallet,
+                &pay_asset_clean,
                 &receive_asset_clean,
                 payload.amount,
                 estimated_output,
                 kas_spot,
                 third_party_token_usd,
                 passthrough_spot_rate,
+                &tx_uuid,
             )
             .await;
             return Ok(Json(SorExecutionPlan {
@@ -1029,7 +1447,6 @@ pub async fn handle_sor_execute(
             formattedUtxos: payload.utxos.clone(),
         }));
     }
-
     let spot_rate = pay_usd / rec_usd;
     let (dynamic_fee_rate, route_provider_label) = compute_inventory_skew_and_guard(
         &pool,
@@ -1045,13 +1462,11 @@ pub async fn handle_sor_execute(
     )
     .await
     .map_err(|e| Json(SorError { error: e }))?;
-
     let protocol_fee_rate = dynamic_fee_rate;
     let execution_rate = spot_rate * (1.0 - protocol_fee_rate);
     let estimated_output = payload.amount * execution_rate;
     let trade_usd_value = payload.amount * pay_usd;
     let output_usd_value = estimated_output * rec_usd;
-
     if receive_asset_clean != "KAS" && output_usd_value < min_dark_pool_usd {
         let existing_bal_str: Option<String> = redis::cmd("HGET")
             .arg(&ledger_key)
@@ -1072,7 +1487,6 @@ pub async fn handle_sor_execute(
             }));
         }
     }
-
     let fee_captured_usd = trade_usd_value * protocol_fee_rate;
     let kas_spot = if pay_asset_clean == "KAS" {
         pay_usd
@@ -1081,7 +1495,6 @@ pub async fn handle_sor_execute(
     } else {
         get_usd_price(&pool, &mut redis_conn, "KAS").await
     };
-
     let mut netting_order = build_netting_order_json(
         &payload.wallet,
         &pay_asset_clean,
@@ -1096,7 +1509,6 @@ pub async fn handle_sor_execute(
         netting_order["fee_captured_usd"] = json!(0.0);
         netting_order["dust_fee_kas"] = json!(dust_fee_kas);
     }
-
     let debit_res: (i32, String) = redis::cmd("EVAL")
         .arg(LUA_ATOMIC_DEBIT_SINGLE)
         .arg(1)
@@ -1106,7 +1518,6 @@ pub async fn handle_sor_execute(
         .query_async(&mut redis_conn)
         .await
         .unwrap_or((0, "0".to_string()));
-
     if debit_res.0 == 1 {
         if let Ok(from_unassigned) = debit_res.1.parse::<f64>() {
             sync_unassigned_kas_debit(&pool, &clean_wallet, from_unassigned).await;
@@ -1130,12 +1541,14 @@ pub async fn handle_sor_execute(
         record_dex_swap_tax_event(
             &pool,
             &clean_wallet,
+            &pay_asset_clean,
             &receive_asset_clean,
             payload.amount,
             estimated_output,
             pay_usd,
             rec_usd,
             spot_rate,
+            &tx_uuid,
         )
         .await;
         return Ok(Json(SorExecutionPlan {
@@ -1154,13 +1567,11 @@ pub async fn handle_sor_execute(
             formattedUtxos: payload.utxos.clone(),
         }));
     }
-
     if pay_asset_clean != "KAS" {
         return Err(Json(SorError {
             error: format!("Insufficient synthetic {} balance in Treasury Ledger.", pay_asset_clean)
         }));
     }
-
     let utxos = payload.utxos.as_ref().ok_or_else(|| Json(SorError {
         error: "Insufficient synthetic KAS balance and no on-chain UTXOs provided.".to_string()
     }))?;
@@ -1169,7 +1580,6 @@ pub async fn handle_sor_execute(
             error: "Insufficient synthetic KAS balance and 0 on-chain UTXOs available.".to_string()
         }));
     }
-
     let target_amount_sompi = (payload.amount * 1e8).floor() as u64;
     let mut gathered_sompi = 0u64;
     let mut tx_inputs = Vec::new();
@@ -1319,25 +1729,120 @@ pub async fn execute_autonomous_hedge(amount_kas: f64, side: &str) -> Result<Str
     }
 }
 
+pub async fn verify_transaction_on_dag(deterministic_txid: &str) -> Option<u64> {
+    let clean_txid = deterministic_txid.trim();
+    if clean_txid.is_empty() {
+        return None;
+    }
+    let client = get_secure_client();
+    let rest_url = std::env::var("KASPA_REST_URL")
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .unwrap_or_else(|_| "https://api.kaspa.org".to_string());
+    let tx_endpoint = format!("{}/transactions/{}", rest_url, clean_txid);
+    if let Ok(res) = client.get(&tx_endpoint).send().await {
+        if res.status().is_success() {
+            if let Ok(json_val) = res.json::<Value>().await {
+                let is_accepted = json_val
+                    .get("is_accepted")
+                    .or_else(|| json_val.get("isAccepted"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let accepting_daa = json_val
+                    .get("accepting_block_blue_score")
+                    .or_else(|| json_val.get("block_time"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1);
+                if is_accepted || json_val.get("transaction_id").is_some() {
+                    return Some(accepting_daa.max(1));
+                }
+            }
+        }
+    }
+    None
+}
+
+pub async fn broadcast_signed_tx_json(
+    broadcast_payload: &Value,
+    deterministic_txid: &str,
+) -> Result<String, String> {
+    match crate::kaspad_client::submit_transaction_grpc(broadcast_payload, false).await {
+        Ok(tx_id) => return Ok(tx_id),
+        Err(grpc_err) => {
+            let lower = grpc_err.to_lowercase();
+            if lower.contains("already")
+                || lower.contains("duplicate")
+                || lower.contains("in mempool")
+            {
+                return Ok(deterministic_txid.to_string());
+            }
+            tracing::warn!(
+                "⚠️ [LOCAL GRPC BROADCAST] SubmitTransaction failed ({}); attempting REST fallback...",
+                grpc_err
+            );
+        }
+    }
+    let client = get_secure_client();
+    let rest_url = std::env::var("KASPA_REST_URL")
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .unwrap_or_else(|_| "https://api.kaspa.org".to_string());
+    let broadcast_res = client
+        .post(format!("{}/transactions", rest_url))
+        .json(broadcast_payload)
+        .send()
+        .await;
+    match broadcast_res {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                if let Ok(resp_json) = resp.json::<Value>().await {
+                    if let Some(tx_id) = resp_json.get("transactionId").and_then(|v| v.as_str()) {
+                        return Ok(tx_id.to_string());
+                    }
+                }
+                return Ok(deterministic_txid.to_string());
+            }
+            let err_text = resp.text().await.unwrap_or_default();
+            if err_text.to_lowercase().contains("already")
+                || err_text.to_lowercase().contains("duplicate")
+                || err_text.to_lowercase().contains("in mempool")
+            {
+                return Ok(deterministic_txid.to_string());
+            }
+            if verify_transaction_on_dag(deterministic_txid).await.is_some() {
+                return Ok(deterministic_txid.to_string());
+            }
+            Err(format!("Broadcast rejected by node: {}", err_text))
+        }
+        Err(net_err) => {
+            if verify_transaction_on_dag(deterministic_txid).await.is_some() {
+                tracing::info!(
+                    "✅ [IDEMPOTENT DAG RECOVERY] Network stream dropped during broadcast, but deterministic_txid {} is already on the BlockDAG.",
+                    deterministic_txid
+                );
+                return Ok(deterministic_txid.to_string());
+            }
+            Err(format!("Broadcast Dispatch Network Error: {}", net_err))
+        }
+    }
+}
+
 pub async fn execute_utxo_consolidation_chunk(chunk: &[UtxoInput]) -> Result<String, String> {
     if chunk.len() < 2 {
         return Ok("SKIPPED_SINGLE_UTXO".to_string());
     }
-    let client = get_secure_client();
     let fee_per_gram = get_fee_per_gram();
     let corp_kas = resolve_treasury_kas_address()?;
-    let private_key_hex = env::var("PERENNIA_TREASURY_PRIVATE_KEY")
-        .map(|s| s.trim().to_string())
-        .map_err(|_| "CRITICAL: PERENNIA_TREASURY_PRIVATE_KEY not configured.".to_string())?;
-    let rest_url = std::env::var("KASPA_REST_URL")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "https://api.kaspa.org".to_string());
+    let private_key_hex = resolve_hot_signer_private_key()?;
     let mut gathered_sompi: u64 = 0;
     let mut core_inputs = Vec::new();
     let mut utxo_entries = Vec::new();
+    let mut input_amounts = Vec::new();
     for utxo in chunk {
         let amt = utxo.amount.round() as u64;
+        if amt == 0 {
+            continue;
+        }
         gathered_sompi += amt;
+        input_amounts.push(amt);
         let prev_id = TransactionId::from_str(&utxo.transactionId).unwrap_or_default();
         core_inputs.push(TransactionInput::new(
             TransactionOutpoint::new(prev_id, utxo.index),
@@ -1348,9 +1853,20 @@ pub async fn execute_utxo_consolidation_chunk(chunk: &[UtxoInput]) -> Result<Str
         let spk_bytes = hex::decode(&utxo.scriptPublicKey).unwrap_or_default();
         utxo_entries.push(UtxoEntry::new(amt, ScriptPublicKey::from_vec(0, spk_bytes), 0, false, None));
     }
-    let fee_sompi = calculate_transaction_mass(core_inputs.len(), 1, 0) * fee_per_gram;
+    if core_inputs.len() < 2 {
+        return Ok("SKIPPED_SINGLE_UTXO".to_string());
+    }
+    let compute_mass = calculate_transaction_mass(core_inputs.len(), 1, 0);
+    let provisional_fee = compute_mass * fee_per_gram;
+    if gathered_sompi <= provisional_fee {
+        return Err("Chunk UTXO sum insufficient to cover consolidation compute fee.".to_string());
+    }
+    let provisional_out = gathered_sompi - provisional_fee;
+    let storage_mass = calculate_storage_mass(&input_amounts, &[provisional_out]);
+    let effective_mass = compute_mass.max(storage_mass);
+    let fee_sompi = effective_mass * fee_per_gram;
     if gathered_sompi <= fee_sompi {
-        return Err("Chunk UTXO sum insufficient to cover consolidation fee.".to_string());
+        return Err("Chunk UTXO sum insufficient to cover consolidation storage mass fee.".to_string());
     }
     let target_amount_sompi = gathered_sompi - fee_sompi;
     let corp_script = decode_address_to_script(&corp_kas)?;
@@ -1360,10 +1876,11 @@ pub async fn execute_utxo_consolidation_chunk(chunk: &[UtxoInput]) -> Result<Str
         covenant: None,
     }];
     let mut transaction = Transaction::new(0, core_inputs, core_outputs, 0, SubnetworkId::default(), 0, vec![]);
+    let deterministic_txid = transaction.id().to_string();
     let secp = Secp256k1::new();
     let private_key_clean = private_key_hex.trim_start_matches("0x");
-    let keypair = Keypair::from_seckey_slice(&secp, &hex::decode(private_key_clean).unwrap_or_default())
-        .map_err(|e| e.to_string())?;
+    let mut key_bytes = hex::decode(private_key_clean).unwrap_or_default();
+    let keypair = Keypair::from_seckey_slice(&secp, &key_bytes).map_err(|e| e.to_string())?;
     let mut generated_signatures = Vec::new();
     {
         let populated_tx = PopulatedTransaction::new(&transaction, utxo_entries);
@@ -1378,6 +1895,7 @@ pub async fn execute_utxo_consolidation_chunk(chunk: &[UtxoInput]) -> Result<Str
             generated_signatures.push(sig_script);
         }
     }
+    key_bytes.fill(0);
     for (i, sig_script) in generated_signatures.into_iter().enumerate() {
         transaction.inputs[i].signature_script = sig_script;
     }
@@ -1406,30 +1924,146 @@ pub async fn execute_utxo_consolidation_chunk(chunk: &[UtxoInput]) -> Result<Str
             "payload": hex::encode(&transaction.payload)
         }
     });
-    let broadcast_res = client.post(format!("{}/transactions", rest_url))
-        .json(&broadcast_payload)
-        .send()
-        .await
-        .map_err(|e| format!("Consolidation Broadcast Failed: {}", e))?;
-    if broadcast_res.status().is_success() {
-        if let Ok(resp_json) = broadcast_res.json::<Value>().await {
-            if let Some(tx_id) = resp_json.get("transactionId").and_then(|v| v.as_str()) {
-                return Ok(tx_id.to_string());
+    broadcast_signed_tx_json(&broadcast_payload, &deterministic_txid).await
+}
+
+pub async fn execute_idempotent_mass_physical_settlement(
+    pool: &PgPool,
+    idempotency_key: &str,
+    payouts: &[(String, f64)],
+) -> Result<String, String> {
+    let clean_key = idempotency_key.trim();
+    if clean_key.is_empty() {
+        return execute_mass_physical_settlement(payouts).await;
+    }
+    if let Ok(Some(existing)) = sqlx::query(
+        "SELECT batch_id, deterministic_txid, signed_tx_json, state FROM idempotent_payout_batches WHERE idempotency_key = $1 LIMIT 1"
+    )
+    .bind(clean_key)
+    .fetch_optional(pool)
+    .await
+    {
+        let state: String = existing.try_get("state").unwrap_or_default();
+        let det_txid: Option<String> = existing.try_get("deterministic_txid").ok().flatten();
+        let signed_json: Option<Value> = existing.try_get("signed_tx_json").ok().flatten();
+        if let Some(ref txid_str) = det_txid {
+            if !txid_str.is_empty() {
+                if state == "CONFIRMED_DAA" {
+                    return Ok(txid_str.clone());
+                }
+                if let Some(daa) = verify_transaction_on_dag(txid_str).await {
+                    let _ = sqlx::query(
+                        "UPDATE idempotent_payout_batches SET state = 'CONFIRMED_DAA', daa_score = $2, updated_at = CURRENT_TIMESTAMP WHERE idempotency_key = $1"
+                    )
+                    .bind(clean_key)
+                    .bind(daa as i64)
+                    .execute(pool)
+                    .await;
+                    return Ok(txid_str.clone());
+                }
+                if let Some(ref payload_val) = signed_json {
+                    if let Ok(broadcasted_txid) = broadcast_signed_tx_json(payload_val, txid_str).await {
+                        let _ = sqlx::query(
+                            "UPDATE idempotent_payout_batches SET state = 'BROADCASTED', updated_at = CURRENT_TIMESTAMP WHERE idempotency_key = $1"
+                        )
+                        .bind(clean_key)
+                        .execute(pool)
+                        .await;
+                        return Ok(broadcasted_txid);
+                    }
+                }
             }
         }
-        Err("Consolidation broadcast returned no transactionId.".to_string())
-    } else {
-        let err_text = broadcast_res.text().await.unwrap_or_default();
-        Err(format!("Consolidation rejected by node: {}", err_text))
+    }
+    let batch_id = format!("BATCH-{}", &Uuid::new_v4().simple().to_string().to_uppercase()[..12]);
+    let manifest_json = serde_json::to_value(payouts).unwrap_or_else(|_| json!([]));
+    let total_sompi_est: i64 = payouts
+        .iter()
+        .map(|(_, amt)| ((*amt).max(0.0) * 1e8).floor() as i64)
+        .sum();
+    let _ = sqlx::query(
+        r#"
+        INSERT INTO idempotent_payout_batches
+        (batch_id, idempotency_key, total_sompi, recipient_manifest, state)
+        VALUES ($1, $2, $3, $4, 'QUEUED')
+        ON CONFLICT (idempotency_key) DO UPDATE SET
+            state = 'LOCKED_FOR_SIGNING',
+            updated_at = CURRENT_TIMESTAMP
+        "#,
+    )
+    .bind(&batch_id)
+    .bind(clean_key)
+    .bind(total_sompi_est)
+    .bind(&manifest_json)
+    .execute(pool)
+    .await;
+    let _ = sqlx::query(
+        "UPDATE idempotent_payout_batches SET state = 'LOCKED_FOR_SIGNING', updated_at = CURRENT_TIMESTAMP WHERE idempotency_key = $1"
+    )
+    .bind(clean_key)
+    .execute(pool)
+    .await;
+    let (deterministic_txid, broadcast_payload) = assemble_and_sign_mass_settlement(payouts).await?;
+    if deterministic_txid == "TREASURY_HOUSE_ANCHOR_NO_OP" || deterministic_txid == "NO_PAYOUTS_REQUIRED" {
+        let _ = sqlx::query(
+            "UPDATE idempotent_payout_batches SET deterministic_txid = $2, state = 'CONFIRMED_DAA', updated_at = CURRENT_TIMESTAMP WHERE idempotency_key = $1"
+        )
+        .bind(clean_key)
+        .bind(&deterministic_txid)
+        .execute(pool)
+        .await;
+        return Ok(deterministic_txid);
+    }
+    let _ = sqlx::query(
+        r#"
+        UPDATE idempotent_payout_batches
+        SET deterministic_txid = $2,
+            signed_tx_json = $3,
+            state = 'DETERMINISTIC_TXID_GENERATED',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE idempotency_key = $1
+        "#,
+    )
+    .bind(clean_key)
+    .bind(&deterministic_txid)
+    .bind(&broadcast_payload)
+    .execute(pool)
+    .await;
+    if let Some(daa) = verify_transaction_on_dag(&deterministic_txid).await {
+        let _ = sqlx::query(
+            "UPDATE idempotent_payout_batches SET state = 'CONFIRMED_DAA', daa_score = $2, updated_at = CURRENT_TIMESTAMP WHERE idempotency_key = $1"
+        )
+        .bind(clean_key)
+        .bind(daa as i64)
+        .execute(pool)
+        .await;
+        return Ok(deterministic_txid);
+    }
+    match broadcast_signed_tx_json(&broadcast_payload, &deterministic_txid).await {
+        Ok(tx_id) => {
+            let _ = sqlx::query(
+                "UPDATE idempotent_payout_batches SET state = 'BROADCASTED', deterministic_txid = $2, updated_at = CURRENT_TIMESTAMP WHERE idempotency_key = $1"
+            )
+            .bind(clean_key)
+            .bind(&tx_id)
+            .execute(pool)
+            .await;
+            Ok(tx_id)
+        }
+        Err(err_msg) => {
+            let _ = sqlx::query(
+                "UPDATE idempotent_payout_batches SET retry_count = retry_count + 1, last_error = $2, updated_at = CURRENT_TIMESTAMP WHERE idempotency_key = $1"
+            )
+            .bind(clean_key)
+            .bind(&err_msg)
+            .execute(pool)
+            .await;
+            Err(err_msg)
+        }
     }
 }
 
-pub async fn execute_physical_settlement(destination: &str, amount_kas: f64) -> Result<String, String> {
-    let payouts = vec![(destination.to_string(), amount_kas)];
-    execute_mass_physical_settlement(&payouts).await
-}
-
-pub async fn execute_mass_physical_settlement(payouts: &[(String, f64)]) -> Result<String, String> {
+async fn assemble_and_sign_mass_settlement(payouts: &[(String, f64)]) -> Result<(String, Value), String> {
     let client = get_secure_client();
     let fee_per_gram = get_fee_per_gram();
     let corp_kas = resolve_treasury_kas_address()?;
@@ -1452,38 +2086,46 @@ pub async fn execute_mass_physical_settlement(payouts: &[(String, f64)]) -> Resu
         .cloned()
         .collect();
     if external_payouts.is_empty() {
-        return Ok("TREASURY_HOUSE_ANCHOR_NO_OP".to_string());
+        return Ok(("TREASURY_HOUSE_ANCHOR_NO_OP".to_string(), json!({})));
     }
-    let private_key_hex = env::var("PERENNIA_TREASURY_PRIVATE_KEY")
-        .map(|s| s.trim().to_string())
-        .map_err(|_| "CRITICAL: PERENNIA_TREASURY_PRIVATE_KEY not configured in environment.".to_string())?;
-    let rest_url = std::env::var("KASPA_REST_URL")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "https://api.kaspa.org".to_string());
-    let utxos_url = format!("{}/addresses/{}/utxos", rest_url, corp_kas);
-    let utxo_res = client.get(&utxos_url).send().await.map_err(|e| format!("UTXO Network Fetch Error: {}", e))?;
-    if !utxo_res.status().is_success() {
-        let err_text = utxo_res.text().await.unwrap_or_default();
-        return Err(format!("L1 Node Rejected UTXO Query: {}", err_text));
-    }
-    let text_payload = utxo_res.text().await.unwrap_or_default();
-    let raw_utxos: Vec<Value> = serde_json::from_str(&text_payload)
-        .map_err(|e| format!("UTXO Parsing Error: {}. Payload: {}", e, text_payload))?;
+    let private_key_hex = resolve_hot_signer_private_key()?;
+    let raw_utxos: Vec<Value> = match crate::kaspad_client::get_utxos_by_address_grpc(&corp_kas).await {
+        Ok(entries) => entries,
+        Err(grpc_err) => {
+            tracing::warn!(
+                "⚠️ [LOCAL GRPC UTXO] GetUtxosByAddresses failed ({}); falling back to KASPA_REST_URL...",
+                grpc_err
+            );
+            let rest_url = std::env::var("KASPA_REST_URL")
+                .map(|s| s.trim().trim_end_matches('/').to_string())
+                .unwrap_or_else(|_| "https://api.kaspa.org".to_string());
+            let utxos_url = format!("{}/addresses/{}/utxos", rest_url, corp_kas);
+            let utxo_res = client
+                .get(&utxos_url)
+                .send()
+                .await
+                .map_err(|e| format!("UTXO Network Fetch Error: {}", e))?;
+            if !utxo_res.status().is_success() {
+                let err_text = utxo_res.text().await.unwrap_or_default();
+                return Err(format!("L1 Node Rejected UTXO Query: {}", err_text));
+            }
+            let text_payload = utxo_res.text().await.unwrap_or_default();
+            serde_json::from_str(&text_payload)
+                .map_err(|e| format!("UTXO Parsing Error: {}. Payload: {}", e, text_payload))?
+        }
+    };
     let mut total_target_sompi: u64 = 0;
-    let mut tx_outputs = Vec::new();
     let mut core_outputs = Vec::new();
     let mut payout_output_amounts = Vec::new();
     for (destination, amount_kas) in &external_payouts {
         let target_amount_sompi = (amount_kas * 1e8).floor() as u64;
-        if target_amount_sompi == 0 { continue; }
+        if target_amount_sompi == 0 {
+            continue;
+        }
         total_target_sompi += target_amount_sompi;
         payout_output_amounts.push(target_amount_sompi);
         let dest_script = decode_address_to_script(destination.trim())
             .map_err(|e| format!("Destination script error for {}: {}", destination, e))?;
-        tx_outputs.push(json!({
-            "amount": target_amount_sompi,
-            "scriptPublicKey": dest_script
-        }));
         core_outputs.push(TransactionOutput {
             value: target_amount_sompi,
             script_public_key: ScriptPublicKey::from_vec(0, hex::decode(&dest_script).unwrap_or_default()),
@@ -1491,7 +2133,7 @@ pub async fn execute_mass_physical_settlement(payouts: &[(String, f64)]) -> Resu
         });
     }
     if total_target_sompi == 0 {
-        return Ok("NO_PAYOUTS_REQUIRED".to_string());
+        return Ok(("NO_PAYOUTS_REQUIRED".to_string(), json!({})));
     }
     let mut parsed_utxos = Vec::new();
     for u in raw_utxos {
@@ -1499,7 +2141,7 @@ pub async fn execute_mass_physical_settlement(payouts: &[(String, f64)]) -> Resu
             u.pointer("/outpoint/transactionId").and_then(|v| v.as_str()),
             parse_json_u64(u.pointer("/outpoint/index")),
             parse_json_u64(u.pointer("/utxoEntry/amount")),
-            u.pointer("/utxoEntry/scriptPublicKey/scriptPublicKey").and_then(|v| v.as_str())
+            u.pointer("/utxoEntry/scriptPublicKey/scriptPublicKey").and_then(|v| v.as_str()),
         ) {
             parsed_utxos.push((
                 amount,
@@ -1508,7 +2150,7 @@ pub async fn execute_mass_physical_settlement(payouts: &[(String, f64)]) -> Resu
                     index: index as u32,
                     amount: amount as f64,
                     scriptPublicKey: script.to_string(),
-                }
+                },
             ));
         }
     }
@@ -1544,17 +2186,15 @@ pub async fn execute_mass_physical_settlement(payouts: &[(String, f64)]) -> Resu
     let network_fee_sompi = effective_mass * fee_per_gram;
     let total_required = total_target_sompi + network_fee_sompi;
     if gathered_sompi < total_required {
-        return Err(format!("Insufficient Master Treasury Mass. Required {} sompi, Found {} sompi", total_required, gathered_sompi));
+        return Err(format!(
+            "Insufficient Hot Signer Mass. Required {} sompi, Found {} sompi",
+            total_required, gathered_sompi
+        ));
     }
-    let mut tx_inputs = Vec::new();
     let mut core_inputs = Vec::new();
     let mut utxo_entries = Vec::new();
     for utxo in &selected_utxos {
         let prev_id = TransactionId::from_str(&utxo.transactionId).unwrap_or_default();
-        tx_inputs.push(json!({
-            "previousOutpoint": { "transactionId": utxo.transactionId, "index": utxo.index },
-            "signatureScript": "", "sequence": 0, "sigOpCount": 1
-        }));
         core_inputs.push(TransactionInput::new(
             TransactionOutpoint::new(prev_id, utxo.index),
             vec![],
@@ -1562,15 +2202,17 @@ pub async fn execute_mass_physical_settlement(payouts: &[(String, f64)]) -> Resu
             1,
         ));
         let spk_bytes = hex::decode(&utxo.scriptPublicKey).unwrap_or_default();
-        utxo_entries.push(UtxoEntry::new(utxo.amount.round() as u64, ScriptPublicKey::from_vec(0, spk_bytes), 0, false, None));
+        utxo_entries.push(UtxoEntry::new(
+            utxo.amount.round() as u64,
+            ScriptPublicKey::from_vec(0, spk_bytes),
+            0,
+            false,
+            None,
+        ));
     }
     let change_sompi = gathered_sompi - total_required;
     if change_sompi >= MIN_CHANGE_SOMPI {
         let corp_script = decode_address_to_script(&corp_kas).map_err(|e| format!("Corp script error: {}", e))?;
-        tx_outputs.push(json!({
-            "amount": change_sompi,
-            "scriptPublicKey": corp_script
-        }));
         core_outputs.push(TransactionOutput {
             value: change_sompi,
             script_public_key: ScriptPublicKey::from_vec(0, hex::decode(&corp_script).unwrap_or_default()),
@@ -1578,12 +2220,14 @@ pub async fn execute_mass_physical_settlement(payouts: &[(String, f64)]) -> Resu
         });
     }
     let mut transaction = Transaction::new(0, core_inputs, core_outputs, 0, SubnetworkId::default(), 0, vec![]);
+    let deterministic_txid = transaction.id().to_string();
     let secp = Secp256k1::new();
     let private_key_clean = private_key_hex.trim_start_matches("0x");
-    let keypair = Keypair::from_seckey_slice(&secp, &hex::decode(private_key_clean).unwrap_or_default()).map_err(|e| e.to_string())?;
+    let mut key_bytes = hex::decode(private_key_clean).unwrap_or_default();
+    let keypair = Keypair::from_seckey_slice(&secp, &key_bytes).map_err(|e| e.to_string())?;
     let mut generated_signatures = Vec::new();
     {
-        let populated_tx = PopulatedTransaction::new(&transaction, utxo_entries.clone());
+        let populated_tx = PopulatedTransaction::new(&transaction, utxo_entries);
         let mut reused_values = SigHashReusedValuesUnsync::new();
         for i in 0..transaction.inputs.len() {
             let sighash = calc_schnorr_signature_hash(&populated_tx, i, SIG_HASH_ALL, &mut reused_values);
@@ -1595,6 +2239,7 @@ pub async fn execute_mass_physical_settlement(payouts: &[(String, f64)]) -> Resu
             generated_signatures.push(sig_script);
         }
     }
+    key_bytes.fill(0);
     for (i, sig_script) in generated_signatures.into_iter().enumerate() {
         transaction.inputs[i].signature_script = sig_script;
     }
@@ -1623,20 +2268,21 @@ pub async fn execute_mass_physical_settlement(payouts: &[(String, f64)]) -> Resu
             "payload": hex::encode(&transaction.payload)
         }
     });
-    let broadcast_res = client.post(format!("{}/transactions", rest_url))
-        .json(&broadcast_payload)
-        .send()
-        .await
-        .map_err(|e| format!("Broadcast Dispatch Failed: {}", e))?;
-    if broadcast_res.status().is_success() {
-        if let Ok(resp_json) = broadcast_res.json::<Value>().await {
-            if let Some(tx_id) = resp_json.get("transactionId").and_then(|v| v.as_str()) {
-                return Ok(tx_id.to_string());
-            }
-        }
-        Err("Broadcast verification rejected the PSBT payload. No Transaction ID returned.".to_string())
-    } else {
-        let err_text = broadcast_res.text().await.unwrap_or_default();
-        Err(format!("Broadcast verification rejected the PSBT payload: {}", err_text))
+    Ok((deterministic_txid, broadcast_payload))
+}
+
+pub async fn execute_physical_settlement(destination: &str, amount_kas: f64) -> Result<String, String> {
+    let payouts = vec![(destination.to_string(), amount_kas)];
+    execute_mass_physical_settlement(&payouts).await
+}
+
+pub async fn execute_mass_physical_settlement(payouts: &[(String, f64)]) -> Result<String, String> {
+    let (deterministic_txid, broadcast_payload) = assemble_and_sign_mass_settlement(payouts).await?;
+    if deterministic_txid == "TREASURY_HOUSE_ANCHOR_NO_OP" || deterministic_txid == "NO_PAYOUTS_REQUIRED" {
+        return Ok(deterministic_txid);
     }
+    if verify_transaction_on_dag(&deterministic_txid).await.is_some() {
+        return Ok(deterministic_txid);
+    }
+    broadcast_signed_tx_json(&broadcast_payload, &deterministic_txid).await
 }

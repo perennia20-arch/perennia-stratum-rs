@@ -8,6 +8,8 @@ use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 use std::env;
 use sqlx::{PgPool, Row};
+use dashmap::DashSet;
+use lazy_static::lazy_static;
 use crate::kaspad_client::protowire::rpc_client::RpcClient;
 use crate::kaspad_client::protowire::{
     KaspadRequest, GetBlockRewardInfoRequestMessage, GetBlockRequestMessage, BlockColor
@@ -15,6 +17,12 @@ use crate::kaspad_client::protowire::{
 use crate::kaspad_client::protowire::kaspad_request::Payload as RequestPayload;
 use crate::kaspad_client::protowire::kaspad_response::Payload as ResponsePayload;
 use crate::job_manager::{difficulty_from_bits, extract_coinbase_reward_sompi};
+
+const DEFAULT_MIN_ORACLE_QUORUM: usize = 2;
+const MAX_OUTLIER_DEVIATION_RATIO: f64 = 0.12;
+const SPOT_ORACLE_TTL_SECS: u64 = 30;
+const CHANGE_24H_TTL_SECS: u64 = 300;
+const RWA_ORACLE_TTL_SECS: u64 = 60;
 
 pub const ORACLE_SUPPORTED_ASSETS: &[&str] = &[
     "KAS", "USDC", "USDT", "USD", "BTC", "ETH", "SOL", "XRP", "DOGE",
@@ -43,9 +51,27 @@ pub const PYTH_RWA_FEEDS: &[(&str, &str, &str)] = &[
     ("USTB", "0xe393449f6aff8a4b6d3e1165a7c9ebec103685f3b41e60db4277b5b6d10e7326", "TREASURY"),
 ];
 
+lazy_static! {
+    pub static ref DYNAMIC_ORACLE_TICKERS: DashSet<String> = DashSet::new();
+}
+
+pub fn register_dynamic_oracle_ticker(ticker: &str) {
+    let clean: String = ticker
+        .trim()
+        .to_uppercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(12)
+        .collect();
+    if clean.len() >= 2 && !ORACLE_SUPPORTED_ASSETS.iter().any(|&a| a == clean) {
+        DYNAMIC_ORACLE_TICKERS.insert(clean);
+    }
+}
+
 pub fn is_oracle_supported_asset(ticker: &str) -> bool {
     let clean = ticker.trim().to_uppercase();
     ORACLE_SUPPORTED_ASSETS.iter().any(|&a| a == clean)
+        || DYNAMIC_ORACLE_TICKERS.contains(&clean)
 }
 
 pub fn is_pyth_rwa_asset(ticker: &str) -> bool {
@@ -74,6 +100,18 @@ fn record_exchange_quote(
         exchange.to_string(),
         (spot_price, resolved_change, Instant::now()),
     );
+}
+
+fn compute_sorted_median(sorted: &[f64]) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 0 {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    } else {
+        sorted[mid]
+    }
 }
 
 async fn resolve_dynamic_pyth_feed_ids(client: &reqwest::Client) -> HashMap<String, String> {
@@ -123,8 +161,26 @@ async fn resolve_dynamic_pyth_feed_ids(client: &reqwest::Client) -> HashMap<Stri
     feed_map
 }
 
+async fn ensure_rwa_oracle_upsert_constraint(pool: &PgPool) {
+    let _ = sqlx::query(
+        r#"
+        DELETE FROM rwa_oracle_feeds a
+        USING rwa_oracle_feeds b
+        WHERE a.id < b.id AND a.ticker = b.ticker
+        "#,
+    )
+    .execute(pool)
+    .await;
+    let _ = sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_rwa_oracle_feeds_ticker_unique ON rwa_oracle_feeds (ticker)",
+    )
+    .execute(pool)
+    .await;
+}
+
 pub async fn start_pyth_rwa_oracle_daemon(pool: PgPool) {
     tracing::info!("🏛️ Booting Pyth Hermes Institutional RWA & Equity Oracle Daemon (SPY, QQQ, NVDA, AAPL, TSLA, AMD, TSM, AVGO, XLE, XAU, XAG, USTB)...");
+    ensure_rwa_oracle_upsert_constraint(&pool).await;
     let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
     let redis_client = match redis::Client::open(redis_url) {
         Ok(c) => c,
@@ -145,10 +201,8 @@ pub async fn start_pyth_rwa_oracle_daemon(pool: PgPool) {
         .timeout(Duration::from_secs(8))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
-
     let resolved_feed_ids = resolve_dynamic_pyth_feed_ids(&client).await;
     let mut interval = tokio::time::interval(Duration::from_secs(12));
-
     loop {
         interval.tick().await;
         let mut query_parts: Vec<String> = Vec::new();
@@ -160,7 +214,6 @@ pub async fn start_pyth_rwa_oracle_daemon(pool: PgPool) {
             "https://hermes.pyth.network/v2/updates/price/latest?{}",
             query_parts.join("&")
         );
-
         let mut latest_quotes: HashMap<String, (f64, f64, i64)> = HashMap::new();
         if let Ok(res) = client.get(&url).send().await {
             if res.status().is_success() {
@@ -231,13 +284,21 @@ pub async fn start_pyth_rwa_oracle_daemon(pool: PgPool) {
                 }
             }
         }
-
         let mut pipe = redis::pipe();
         let mut rwa_assets_json = Vec::new();
         for &(ticker, _, asset_class) in PYTH_RWA_FEEDS {
             let resolved_entry = if let Some(&(spot_usd, delta_pct, pub_ts)) = latest_quotes.get(ticker) {
                 let _ = sqlx::query(
-                    "INSERT INTO rwa_oracle_feeds (ticker, asset_class, price_usd, change_24h_pct, oracle_source, updated_at) VALUES ($1, $2, $3, $4, 'PYTH_HERMES', CURRENT_TIMESTAMP)"
+                    r#"
+                    INSERT INTO rwa_oracle_feeds (ticker, asset_class, price_usd, change_24h_pct, oracle_source, updated_at)
+                    VALUES ($1, $2, $3, $4, 'PYTH_HERMES', CURRENT_TIMESTAMP)
+                    ON CONFLICT (ticker) DO UPDATE SET
+                        asset_class = EXCLUDED.asset_class,
+                        price_usd = EXCLUDED.price_usd,
+                        change_24h_pct = EXCLUDED.change_24h_pct,
+                        oracle_source = EXCLUDED.oracle_source,
+                        updated_at = CURRENT_TIMESTAMP
+                    "#,
                 )
                 .bind(ticker)
                 .bind(asset_class)
@@ -248,7 +309,15 @@ pub async fn start_pyth_rwa_oracle_daemon(pool: PgPool) {
                 Some((spot_usd, delta_pct, pub_ts))
             } else {
                 sqlx::query(
-                    "SELECT price_usd, change_24h_pct, EXTRACT(EPOCH FROM updated_at)::BIGINT AS pub_ts FROM rwa_oracle_feeds WHERE ticker = $1 AND price_usd > 0 ORDER BY updated_at DESC LIMIT 1"
+                    r#"
+                    SELECT price_usd, change_24h_pct, EXTRACT(EPOCH FROM updated_at)::BIGINT AS pub_ts
+                    FROM rwa_oracle_feeds
+                    WHERE ticker = $1
+                      AND price_usd > 0
+                      AND updated_at >= CURRENT_TIMESTAMP - INTERVAL '15 minutes'
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    "#,
                 )
                 .bind(ticker)
                 .fetch_optional(&pool)
@@ -262,14 +331,15 @@ pub async fn start_pyth_rwa_oracle_daemon(pool: PgPool) {
                     if p > 0.0 { Some((p, d, ts)) } else { None }
                 })
             };
-
             if let Some((spot_usd, delta_pct, pub_ts)) = resolved_entry {
-                pipe.cmd("SET")
+                pipe.cmd("SETEX")
                     .arg(format!("oracle:spot:{}_USDC", ticker))
+                    .arg(RWA_ORACLE_TTL_SECS)
                     .arg(spot_usd.to_string())
                     .ignore();
-                pipe.cmd("SET")
+                pipe.cmd("SETEX")
                     .arg(format!("oracle:change24h:{}_USDC", ticker))
+                    .arg(CHANGE_24H_TTL_SECS)
                     .arg(delta_pct.to_string())
                     .ignore();
                 rwa_assets_json.push(json!({
@@ -285,8 +355,9 @@ pub async fn start_pyth_rwa_oracle_daemon(pool: PgPool) {
             }
         }
         if !rwa_assets_json.is_empty() {
-            pipe.cmd("SET")
+            pipe.cmd("SETEX")
                 .arg("oracle:spot:rwa_prices_json")
+                .arg(RWA_ORACLE_TTL_SECS)
                 .arg(serde_json::to_string(&rwa_assets_json).unwrap_or_else(|_| "[]".to_string()))
                 .ignore();
         }
@@ -297,7 +368,7 @@ pub async fn start_pyth_rwa_oracle_daemon(pool: PgPool) {
 }
 
 pub async fn start_spot_pricing_daemon() {
-    tracing::info!("🌐 Global 7-Node Multi-Asset Sovereign Oracle Daemon Booting...");
+    tracing::info!("🌐 Global 7-Node Multi-Asset Sovereign Oracle Daemon Booting (Multi-Node Quorum + Outlier Rejection + Dynamic Ticker Discovery Armed)...");
     let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
     let redis_client = match redis::Client::open(redis_url) {
         Ok(c) => c,
@@ -313,6 +384,11 @@ pub async fn start_spot_pricing_daemon() {
             return;
         }
     };
+    let min_quorum: usize = env::var("ORACLE_MIN_QUORUM")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&q| (1..=7).contains(&q))
+        .unwrap_or(DEFAULT_MIN_ORACLE_QUORUM);
     let prices: PriceMap = Arc::new(RwLock::new(HashMap::new()));
     let mut last_circuit_breaker_state: HashMap<String, bool> = HashMap::new();
     {
@@ -322,6 +398,7 @@ pub async fn start_spot_pricing_daemon() {
             last_circuit_breaker_state.insert(asset.to_string(), false);
         }
     }
+
     tokio::spawn(bybit_ws(prices.clone()));
     tokio::spawn(gate_ws(prices.clone()));
     tokio::spawn(mexc_ws(prices.clone()));
@@ -330,6 +407,10 @@ pub async fn start_spot_pricing_daemon() {
     tokio::spawn(kucoin_ws(prices.clone()));
     tokio::spawn(kraken_ws(prices.clone()));
     tokio::spawn(coingecko_rest_fallback(prices.clone()));
+    tokio::spawn(dynamic_tickers_rest_poller(
+        prices.clone(),
+        redis_client.clone(),
+    ));
 
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     loop {
@@ -344,13 +425,18 @@ pub async fn start_spot_pricing_daemon() {
         active_changes_24h.insert("USD".to_string(), 0.0);
 
         let now = Instant::now();
+        let dynamic_list: Vec<String> = DYNAMIC_ORACLE_TICKERS
+            .iter()
+            .map(|r| r.key().clone())
+            .collect();
+
         {
             let p_lock = prices.read().await;
             for &asset in ORACLE_VOLATILE_ASSETS {
                 if let Some(exchanges) = p_lock.get(asset) {
-                    let mut vals: Vec<f64> = exchanges
+                    let mut raw_vals: Vec<f64> = exchanges
                         .values()
-                        .filter(|(v, _, ts)| *v > 0.0 && now.duration_since(*ts).as_secs() < 120)
+                        .filter(|(v, _, ts)| *v > 0.0 && v.is_finite() && now.duration_since(*ts).as_secs() < 60)
                         .map(|(v, _, _)| *v)
                         .collect();
                     let mut chg_vals: Vec<f64> = exchanges
@@ -359,46 +445,104 @@ pub async fn start_spot_pricing_daemon() {
                         .filter_map(|(_, chg, _)| *chg)
                         .filter(|c| c.is_finite())
                         .collect();
-                    let active_count = vals.len();
-                    if active_count >= 1 {
-                        vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                        let mid = vals.len() / 2;
-                        let median = if vals.len() % 2 == 0 {
-                            (vals[mid - 1] + vals[mid]) / 2.0
+                    if raw_vals.len() >= min_quorum {
+                        raw_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        let raw_median = compute_sorted_median(&raw_vals);
+                        let filtered_vals: Vec<f64> = if raw_median > 0.0 {
+                            raw_vals
+                                .into_iter()
+                                .filter(|&v| ((v - raw_median).abs() / raw_median) <= MAX_OUTLIER_DEVIATION_RATIO)
+                                .collect()
                         } else {
-                            vals[mid]
+                            Vec::new()
                         };
-                        active_medians.insert(asset.to_string(), median);
-                        let median_chg = if !chg_vals.is_empty() {
-                            chg_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                            let cmid = chg_vals.len() / 2;
-                            if chg_vals.len() % 2 == 0 {
-                                (chg_vals[cmid - 1] + chg_vals[cmid]) / 2.0
+                        let active_count = filtered_vals.len();
+                        if active_count >= min_quorum {
+                            let median = compute_sorted_median(&filtered_vals);
+                            active_medians.insert(asset.to_string(), median);
+                            let median_chg = if !chg_vals.is_empty() {
+                                chg_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                                compute_sorted_median(&chg_vals)
                             } else {
-                                chg_vals[cmid]
+                                0.0
+                            };
+                            active_changes_24h.insert(asset.to_string(), median_chg);
+                            if last_circuit_breaker_state.get(asset) == Some(&true) {
+                                tracing::info!(
+                                    "🟢 [CIRCUIT BREAKER RESOLVED] {} Oracle consensus restored ({} quorum nodes within outlier bounds).",
+                                    asset,
+                                    active_count
+                                );
+                                last_circuit_breaker_state.insert(asset.to_string(), false);
                             }
-                        } else {
-                            0.0
-                        };
-                        active_changes_24h.insert(asset.to_string(), median_chg);
-                        if last_circuit_breaker_state.get(asset) == Some(&true) {
-                            tracing::info!(
-                                "🟢 [CIRCUIT BREAKER RESOLVED] {} Oracle consensus restored ({}/7 nodes active).",
+                        } else if last_circuit_breaker_state.get(asset) == Some(&false) {
+                            tracing::warn!(
+                                "⚠️ [ORACLE OUTLIER BREAKER] {} failed outlier-filtered quorum ({}/{} valid nodes). Expiring cached quote...",
                                 asset,
-                                active_count
+                                active_count,
+                                min_quorum
                             );
-                            last_circuit_breaker_state.insert(asset.to_string(), false);
+                            last_circuit_breaker_state.insert(asset.to_string(), true);
                         }
                     } else if last_circuit_breaker_state.get(asset) == Some(&false) {
                         tracing::debug!(
-                            "⏳ [ORACLE SYNC] Awaiting initial {} feed from exchange array...",
-                            asset
+                            "⏳ [ORACLE QUORUM PENDING] Awaiting {}-node quorum for {} (currently {} active)...",
+                            min_quorum,
+                            asset,
+                            raw_vals.len()
                         );
                         last_circuit_breaker_state.insert(asset.to_string(), true);
                     }
                 }
             }
+
+            for dyn_asset in &dynamic_list {
+                if active_medians.contains_key(dyn_asset) {
+                    continue;
+                }
+                if let Some(exchanges) = p_lock.get(dyn_asset) {
+                    let mut raw_vals: Vec<f64> = exchanges
+                        .values()
+                        .filter(|(v, _, ts)| *v > 0.0 && v.is_finite() && now.duration_since(*ts).as_secs() < 60)
+                        .map(|(v, _, _)| *v)
+                        .collect();
+                    let mut chg_vals: Vec<f64> = exchanges
+                        .values()
+                        .filter(|(v, _, ts)| *v > 0.0 && now.duration_since(*ts).as_secs() < 300)
+                        .filter_map(|(_, chg, _)| *chg)
+                        .filter(|c| c.is_finite())
+                        .collect();
+                    if !raw_vals.is_empty() {
+                        raw_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        let raw_median = compute_sorted_median(&raw_vals);
+                        let filtered_vals: Vec<f64> = if raw_median > 0.0 {
+                            raw_vals
+                                .into_iter()
+                                .filter(|&v| ((v - raw_median).abs() / raw_median) <= MAX_OUTLIER_DEVIATION_RATIO)
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let resolved = if !filtered_vals.is_empty() {
+                            compute_sorted_median(&filtered_vals)
+                        } else {
+                            raw_median
+                        };
+                        if resolved > 0.0 {
+                            active_medians.insert(dyn_asset.clone(), resolved);
+                            let median_chg = if !chg_vals.is_empty() {
+                                chg_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                                compute_sorted_median(&chg_vals)
+                            } else {
+                                0.0
+                            };
+                            active_changes_24h.insert(dyn_asset.clone(), median_chg);
+                        }
+                    }
+                }
+            }
         }
+
         if let Some(&eth_med) = active_medians.get("ETH") {
             active_medians.insert("BASE".to_string(), eth_med);
             active_changes_24h.insert(
@@ -410,46 +554,57 @@ pub async fn start_spot_pricing_daemon() {
         if !active_medians.is_empty() {
             let mut pipeline = redis::pipe();
             let mut json_data = json!({});
-            let supported_vec: Vec<&str> = ORACLE_SUPPORTED_ASSETS.to_vec();
+            let mut supported_vec: Vec<String> = ORACLE_SUPPORTED_ASSETS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+            for dt in &dynamic_list {
+                if !supported_vec.contains(dt) {
+                    supported_vec.push(dt.clone());
+                }
+            }
             pipeline
-                .cmd("SET")
+                .cmd("SETEX")
                 .arg("oracle:spot:supported_assets")
+                .arg(CHANGE_24H_TTL_SECS)
                 .arg(serde_json::to_string(&supported_vec).unwrap_or_else(|_| "[]".to_string()))
                 .ignore();
             for (asset, median) in &active_medians {
                 let pair_id = format!("{}_USDC", asset);
                 let change_24h = active_changes_24h.get(asset).copied().unwrap_or(0.0);
                 pipeline
-                    .cmd("SET")
+                    .cmd("SETEX")
                     .arg(format!("oracle:spot:{}", pair_id))
+                    .arg(SPOT_ORACLE_TTL_SECS)
                     .arg(median.to_string())
                     .ignore();
                 pipeline
-                    .cmd("SET")
+                    .cmd("SETEX")
                     .arg(format!("oracle:change24h:{}", pair_id))
+                    .arg(CHANGE_24H_TTL_SECS)
                     .arg(change_24h.to_string())
                     .ignore();
                 let asset_key = match asset.as_str() {
-                    "KAS" => "kaspa",
-                    "BTC" => "bitcoin",
-                    "ETH" => "ethereum",
-                    "SOL" => "solana",
-                    "XRP" => "ripple",
-                    "DOGE" => "dogecoin",
-                    "TON" => "the-open-network",
-                    "SUI" => "sui",
-                    "ADA" => "cardano",
-                    "AVAX" => "avalanche-2",
-                    "LINK" => "chainlink",
-                    "LTC" => "litecoin",
-                    "POL" => "polygon-ecosystem-token",
-                    "TRX" => "tron",
-                    "ZEC" => "zcash",
-                    "ARB" => "arbitrum",
-                    "USDC" => "usd-coin",
-                    "USDT" => "tether",
-                    "USD" => "usd",
-                    _ => asset.as_str(),
+                    "KAS" => "kaspa".to_string(),
+                    "BTC" => "bitcoin".to_string(),
+                    "ETH" => "ethereum".to_string(),
+                    "SOL" => "solana".to_string(),
+                    "XRP" => "ripple".to_string(),
+                    "DOGE" => "dogecoin".to_string(),
+                    "TON" => "the-open-network".to_string(),
+                    "SUI" => "sui".to_string(),
+                    "ADA" => "cardano".to_string(),
+                    "AVAX" => "avalanche-2".to_string(),
+                    "LINK" => "chainlink".to_string(),
+                    "LTC" => "litecoin".to_string(),
+                    "POL" => "polygon-ecosystem-token".to_string(),
+                    "TRX" => "tron".to_string(),
+                    "ZEC" => "zcash".to_string(),
+                    "ARB" => "arbitrum".to_string(),
+                    "USDC" => "usd-coin".to_string(),
+                    "USDT" => "tether".to_string(),
+                    "USD" => "usd".to_string(),
+                    other => other.to_lowercase(),
                 };
                 json_data[asset_key] = json!({
                     "usd": median,
@@ -462,13 +617,275 @@ pub async fn start_spot_pricing_daemon() {
                 && active_medians.contains_key("SOL")
             {
                 pipeline
-                    .cmd("SET")
+                    .cmd("SETEX")
                     .arg("oracle:spot:prices_json")
+                    .arg(SPOT_ORACLE_TTL_SECS)
                     .arg(json_data.to_string())
                     .ignore();
             }
             if let Err(e) = pipeline.query_async::<_, ()>(&mut redis_conn).await {
                 tracing::error!("Spot Oracle Redis Pipeline Failed: {}", e);
+            }
+        }
+    }
+}
+
+async fn dynamic_tickers_rest_poller(prices: PriceMap, redis_client: redis::Client) {
+    let client = reqwest::Client::builder()
+        .user_agent("Perennia-Dynamic-Oracle/1.0")
+        .timeout(Duration::from_secs(4))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let mut interval = tokio::time::interval(Duration::from_secs(6));
+
+    loop {
+        interval.tick().await;
+        let Ok(mut conn) = redis_client.get_multiplexed_async_connection().await else {
+            continue;
+        };
+        let raw_members: Vec<String> = redis::cmd("SMEMBERS")
+            .arg("oracle:dynamic_tickers")
+            .query_async(&mut conn)
+            .await
+            .unwrap_or_default();
+        if raw_members.is_empty() {
+            continue;
+        }
+
+        let mut active_dynamic = Vec::new();
+        {
+            let mut lock = prices.write().await;
+            for raw in raw_members.into_iter().take(40) {
+                let clean: String = raw
+                    .trim()
+                    .to_uppercase()
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .take(12)
+                    .collect();
+                if clean.len() < 2 || ORACLE_SUPPORTED_ASSETS.iter().any(|&a| a == clean) {
+                    continue;
+                }
+                DYNAMIC_ORACLE_TICKERS.insert(clean.clone());
+                lock.entry(clean.clone()).or_insert_with(HashMap::new);
+                active_dynamic.push(clean);
+            }
+        }
+
+        let kas_usd = {
+            let r_lock = prices.read().await;
+            r_lock
+                .get("KAS")
+                .and_then(|m| m.values().next().map(|(p, _, _)| *p))
+                .unwrap_or(0.0)
+        };
+
+        for ticker in active_dynamic {
+            let mexc_url = format!(
+                "https://api.mexc.com/api/v3/ticker/24hr?symbol={}USDT",
+                ticker
+            );
+            let gate_url = format!(
+                "https://api.gateio.ws/api/v4/spot/tickers?currency_pair={}_USDT",
+                ticker
+            );
+            let kucoin_url = format!(
+                "https://api.kucoin.com/api/v1/market/stats?symbol={}-USDT",
+                ticker
+            );
+            let bitget_url = format!(
+                "https://api.bitget.com/api/v2/spot/market/tickers?symbol={}USDT",
+                ticker
+            );
+            let coinex_url = format!(
+                "https://api.coinex.com/v2/spot/ticker?market={}USDT",
+                ticker
+            );
+            let kasfyi_url = format!(
+                "https://api.kas.fyi/v1/tokens/krc20/{}/market",
+                ticker
+            );
+
+            let (mexc_res, gate_res, kucoin_res, bitget_res, coinex_res, kasfyi_res) = tokio::join!(
+                client.get(&mexc_url).send(),
+                client.get(&gate_url).send(),
+                client.get(&kucoin_url).send(),
+                client.get(&bitget_url).send(),
+                client.get(&coinex_url).send(),
+                client.get(&kasfyi_url).send(),
+            );
+
+            let mut discovered_quotes: Vec<(&str, f64, Option<f64>)> = Vec::new();
+
+            if let Ok(resp) = mexc_res {
+                if resp.status().is_success() {
+                    if let Ok(data) = resp.json::<Value>().await {
+                        if let Some(p) = data
+                            .get("lastPrice")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<f64>().ok())
+                        {
+                            if p > 0.0 {
+                                let chg = data
+                                    .get("priceChangePercent")
+                                    .and_then(|v| v.as_str())
+                                    .and_then(|s| s.parse::<f64>().ok())
+                                    .map(|r| r * 100.0);
+                                discovered_quotes.push(("mexc", p, chg));
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Ok(resp) = gate_res {
+                if resp.status().is_success() {
+                    if let Ok(data) = resp.json::<Value>().await {
+                        let item = if let Some(arr) = data.as_array() {
+                            arr.first().cloned().unwrap_or(Value::Null)
+                        } else {
+                            data
+                        };
+                        if let Some(p) = item
+                            .get("last")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<f64>().ok())
+                        {
+                            if p > 0.0 {
+                                let chg = item
+                                    .get("change_percentage")
+                                    .and_then(|v| v.as_str())
+                                    .and_then(|s| s.parse::<f64>().ok());
+                                discovered_quotes.push(("gate", p, chg));
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Ok(resp) = kucoin_res {
+                if resp.status().is_success() {
+                    if let Ok(data) = resp.json::<Value>().await {
+                        if let Some(p) = data
+                            .pointer("/data/last")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<f64>().ok())
+                        {
+                            if p > 0.0 {
+                                let chg = data
+                                    .pointer("/data/changeRate")
+                                    .and_then(|v| v.as_str())
+                                    .and_then(|s| s.parse::<f64>().ok())
+                                    .map(|r| r * 100.0);
+                                discovered_quotes.push(("kucoin", p, chg));
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Ok(resp) = bitget_res {
+                if resp.status().is_success() {
+                    if let Ok(data) = resp.json::<Value>().await {
+                        if let Some(item) = data
+                            .get("data")
+                            .and_then(|d| d.as_array())
+                            .and_then(|a| a.first())
+                        {
+                            if let Some(p) = item
+                                .get("lastPr")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse::<f64>().ok())
+                            {
+                                if p > 0.0 {
+                                    let chg = item
+                                        .get("change24h")
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|s| s.parse::<f64>().ok())
+                                        .map(|r| r * 100.0);
+                                    discovered_quotes.push(("bitget", p, chg));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Ok(resp) = coinex_res {
+                if resp.status().is_success() {
+                    if let Ok(data) = resp.json::<Value>().await {
+                        if let Some(item) = data
+                            .get("data")
+                            .and_then(|d| d.as_array())
+                            .and_then(|a| a.first())
+                        {
+                            if let Some(p) = item
+                                .get("last")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse::<f64>().ok())
+                            {
+                                if p > 0.0 {
+                                    let open_v = item
+                                        .get("open")
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|s| s.parse::<f64>().ok())
+                                        .unwrap_or(0.0);
+                                    let chg = if open_v > 0.0 {
+                                        Some(((p - open_v) / open_v) * 100.0)
+                                    } else {
+                                        None
+                                    };
+                                    discovered_quotes.push(("coinex", p, chg));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Ok(resp) = kasfyi_res {
+                if resp.status().is_success() {
+                    if let Ok(data) = resp.json::<Value>().await {
+                        let usd_p = data
+                            .pointer("/price/usd")
+                            .or_else(|| data.get("priceUsd"))
+                            .or_else(|| data.get("price"))
+                            .and_then(|v| {
+                                v.as_f64()
+                                    .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                            })
+                            .unwrap_or(0.0);
+                        let kas_p = data
+                            .pointer("/price/kas")
+                            .and_then(|v| {
+                                v.as_f64()
+                                    .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                            })
+                            .unwrap_or(0.0);
+                        let resolved_usd = if usd_p > 0.0 {
+                            usd_p
+                        } else if kas_p > 0.0 && kas_usd > 0.0 {
+                            kas_p * kas_usd
+                        } else {
+                            0.0
+                        };
+                        if resolved_usd > 0.0 {
+                            let chg = data
+                                .get("change24h")
+                                .and_then(|v| v.as_f64());
+                            discovered_quotes.push(("kasfyi", resolved_usd, chg));
+                        }
+                    }
+                }
+            }
+
+            if !discovered_quotes.is_empty() {
+                let mut lock = prices.write().await;
+                if let Some(ex_map) = lock.get_mut(&ticker) {
+                    for (ex_name, spot_val, chg_val) in discovered_quotes {
+                        record_exchange_quote(ex_map, ex_name, spot_val, chg_val);
+                    }
+                }
             }
         }
     }
@@ -865,93 +1282,105 @@ async fn coinex_ws(prices: PriceMap) {
 }
 
 async fn query_kaspad_block_consensus(
-    kaspad_url: &str,
     block_hash: &str,
-) -> Option<(u64, f64, Option<bool>)> {
-    let mut endpoint = kaspad_url.trim().to_string();
-    if !endpoint.starts_with("http") {
-        endpoint = format!("http://{}", endpoint);
-    }
-    let mut client = tokio::time::timeout(Duration::from_secs(3), RpcClient::connect(endpoint))
+) -> Option<(u64, f64, u64, Option<bool>)> {
+    let endpoints = crate::kaspad_client::resolve_local_first_grpc_endpoints();
+    for endpoint in endpoints {
+        let Ok(Ok(mut client)) = tokio::time::timeout(
+            Duration::from_secs(3),
+            RpcClient::connect(endpoint),
+        )
         .await
-        .ok()?
-        .ok()?;
-    let (tx, rx) = mpsc::channel::<KaspadRequest>(4);
-    let response = tokio::time::timeout(Duration::from_secs(3), client.message_stream(ReceiverStream::new(rx)))
+        else {
+            continue;
+        };
+        let (tx, rx) = mpsc::channel::<KaspadRequest>(4);
+        let Ok(Ok(response)) = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.message_stream(ReceiverStream::new(rx)),
+        )
         .await
-        .ok()?
-        .ok()?;
-    let mut stream = response.into_inner();
-    let _ = tx.send(KaspadRequest {
-        id: 1,
-        payload: Some(RequestPayload::GetBlockRewardInfoRequest(GetBlockRewardInfoRequestMessage {
-            hash: block_hash.to_string(),
-        })),
-    }).await;
-    let _ = tx.send(KaspadRequest {
-        id: 2,
-        payload: Some(RequestPayload::GetBlockRequest(GetBlockRequestMessage {
-            hash: block_hash.to_string(),
-            include_transactions: true,
-        })),
-    }).await;
-    let mut resolved_reward_sompi = 0u64;
-    let mut resolved_diff = 0.0f64;
-    let mut is_orphaned_opt: Option<bool> = None;
-    for _ in 0..2 {
-        if let Ok(Ok(Some(msg))) = tokio::time::timeout(Duration::from_secs(2), stream.message()).await {
-            match msg.payload {
-                Some(ResponsePayload::GetBlockRewardInfoResponse(res)) => {
-                    if res.error.is_none() {
-                        if let Some(amt) = res.reward_amount {
-                            if amt > 0 {
-                                resolved_reward_sompi = amt;
-                            }
-                        }
-                        if let Some(hdr) = res.header {
-                            if resolved_diff <= 0.0 {
-                                resolved_diff = difficulty_from_bits(hdr.bits);
-                            }
-                        }
-                        if res.block_color == (BlockColor::Red as i32) {
-                            is_orphaned_opt = Some(true);
-                        } else if res.block_color == (BlockColor::Blue as i32) {
-                            is_orphaned_opt = Some(false);
-                        }
-                    }
-                }
-                Some(ResponsePayload::GetBlockResponse(res)) => {
-                    if res.error.is_none() {
-                        if let Some(block) = res.block {
-                            if let Some(vd) = &block.verbose_data {
-                                if vd.difficulty > 0.0 {
-                                    resolved_diff = vd.difficulty;
+        else {
+            continue;
+        };
+        let mut stream = response.into_inner();
+        let _ = tx.send(KaspadRequest {
+            id: 1,
+            payload: Some(RequestPayload::GetBlockRewardInfoRequest(GetBlockRewardInfoRequestMessage {
+                hash: block_hash.to_string(),
+            })),
+        }).await;
+        let _ = tx.send(KaspadRequest {
+            id: 2,
+            payload: Some(RequestPayload::GetBlockRequest(GetBlockRequestMessage {
+                hash: block_hash.to_string(),
+                include_transactions: true,
+            })),
+        }).await;
+        let mut resolved_reward_sompi = 0u64;
+        let mut resolved_diff = 0.0f64;
+        let mut resolved_daa_score = 0u64;
+        let mut is_orphaned_opt: Option<bool> = None;
+        for _ in 0..2 {
+            if let Ok(Ok(Some(msg))) = tokio::time::timeout(Duration::from_secs(2), stream.message()).await {
+                match msg.payload {
+                    Some(ResponsePayload::GetBlockRewardInfoResponse(res)) => {
+                        if res.error.is_none() {
+                            if let Some(amt) = res.reward_amount {
+                                if amt > 0 {
+                                    resolved_reward_sompi = amt;
                                 }
                             }
-                            if resolved_diff <= 0.0 {
-                                if let Some(hdr) = &block.header {
+                            if let Some(hdr) = res.header {
+                                if resolved_diff <= 0.0 {
                                     resolved_diff = difficulty_from_bits(hdr.bits);
                                 }
+                                if hdr.daa_score > 0 {
+                                    resolved_daa_score = hdr.daa_score;
+                                }
                             }
-                            if resolved_reward_sompi == 0 {
-                                resolved_reward_sompi = extract_coinbase_reward_sompi(&block);
+                            if res.block_color == (BlockColor::Red as i32) {
+                                is_orphaned_opt = Some(true);
+                            } else if res.block_color == (BlockColor::Blue as i32) {
+                                is_orphaned_opt = Some(false);
                             }
                         }
                     }
+                    Some(ResponsePayload::GetBlockResponse(res)) => {
+                        if res.error.is_none() {
+                            if let Some(block) = res.block {
+                                if let Some(vd) = &block.verbose_data {
+                                    if vd.difficulty > 0.0 {
+                                        resolved_diff = vd.difficulty;
+                                    }
+                                }
+                                if let Some(hdr) = &block.header {
+                                    if resolved_diff <= 0.0 {
+                                        resolved_diff = difficulty_from_bits(hdr.bits);
+                                    }
+                                    if resolved_daa_score == 0 && hdr.daa_score > 0 {
+                                        resolved_daa_score = hdr.daa_score;
+                                    }
+                                }
+                                if resolved_reward_sompi == 0 {
+                                    resolved_reward_sompi = extract_coinbase_reward_sompi(&block);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
+        if resolved_reward_sompi > 0 || resolved_diff > 0.0 || resolved_daa_score > 0 || is_orphaned_opt.is_some() {
+            return Some((resolved_reward_sompi, resolved_diff, resolved_daa_score, is_orphaned_opt));
+        }
     }
-    if resolved_reward_sompi > 0 || resolved_diff > 0.0 || is_orphaned_opt.is_some() {
-        Some((resolved_reward_sompi, resolved_diff, is_orphaned_opt))
-    } else {
-        None
-    }
+    None
 }
 
 pub async fn start_oracle_daemon() {
-    tracing::info!("🔮 Yield Oracle Daemon Booting...");
+    tracing::info!("🔮 Yield Oracle & Block Maturity Daemon Booting...");
     let db_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:password@127.0.0.1:5432/perennia".to_string());
     let pool = match sqlx::PgPool::connect(&db_url).await {
@@ -965,6 +1394,9 @@ pub async fn start_oracle_daemon() {
         .execute(&pool)
         .await;
     let _ = sqlx::query("ALTER TABLE network_blocks ADD COLUMN IF NOT EXISTS reward_kas DOUBLE PRECISION NOT NULL DEFAULT 0.0")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE network_blocks ADD COLUMN IF NOT EXISTS daa_score BIGINT NOT NULL DEFAULT 0")
         .execute(&pool)
         .await;
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
@@ -982,10 +1414,6 @@ pub async fn start_oracle_daemon() {
             return;
         }
     };
-    let kaspad_host = crate::config::StratumConfig::load("config.yaml")
-        .ok()
-        .and_then(|c| c.kaspad_addresses.into_iter().next())
-        .unwrap_or_else(|| "127.0.0.1:16110".to_string());
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     loop {
         interval.tick().await;
@@ -1022,12 +1450,21 @@ pub async fn start_oracle_daemon() {
                 .flatten()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0);
+            let fallback_virtual_daa: u64 = redis::cmd("GET")
+                .arg("pool:virtual_daa_score")
+                .query_async::<_, Option<String>>(&mut redis_conn)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
             let mut hashes = Vec::with_capacity(block_events.len());
             let mut workers = Vec::with_capacity(block_events.len());
             let mut nonces = Vec::with_capacity(block_events.len());
             let mut diffs = Vec::with_capacity(block_events.len());
             let mut rewards_sompi = Vec::with_capacity(block_events.len());
             let mut rewards_kas = Vec::with_capacity(block_events.len());
+            let mut daa_scores = Vec::with_capacity(block_events.len());
             for evt in &block_events {
                 if let (Some(hash), Some(worker), Some(nonce)) = (
                     evt["block_hash"].as_str(),
@@ -1036,12 +1473,16 @@ pub async fn start_oracle_daemon() {
                 ) {
                     let mut diff = evt["network_diff"].as_f64().filter(|&d| d > 0.0).unwrap_or(fallback_net_diff);
                     let mut reward_sompi = evt["reward_sompi"].as_u64().filter(|&r| r > 0).unwrap_or(fallback_reward_sompi);
-                    if let Some((node_sompi, node_diff, _)) = query_kaspad_block_consensus(&kaspad_host, hash).await {
+                    let mut daa_score = evt["daa_score"].as_u64().filter(|&d| d > 0).unwrap_or(fallback_virtual_daa);
+                    if let Some((node_sompi, node_diff, node_daa, _)) = query_kaspad_block_consensus(hash).await {
                         if node_sompi > 0 {
                             reward_sompi = node_sompi;
                         }
                         if node_diff > 0.0 {
                             diff = node_diff;
+                        }
+                        if node_daa > 0 {
+                            daa_score = node_daa;
                         }
                     }
                     let reward_kas = (reward_sompi as f64) / 100_000_000.0;
@@ -1051,6 +1492,7 @@ pub async fn start_oracle_daemon() {
                     diffs.push(diff);
                     rewards_sompi.push(reward_sompi as i64);
                     rewards_kas.push(reward_kas);
+                    daa_scores.push(daa_score as i64);
                 }
             }
             if !hashes.is_empty() {
@@ -1063,12 +1505,13 @@ pub async fn start_oracle_daemon() {
                 };
                 let insert_res = sqlx::query(
                     r#"
-                    INSERT INTO network_blocks (block_hash, worker_id, nonce, network_diff, reward_sompi, reward_kas)
-                    SELECT * FROM UNNEST($1::text[], $2::text[], $3::bigint[], $4::float8[], $5::bigint[], $6::float8[])
+                    INSERT INTO network_blocks (block_hash, worker_id, nonce, network_diff, reward_sompi, reward_kas, daa_score)
+                    SELECT * FROM UNNEST($1::text[], $2::text[], $3::bigint[], $4::float8[], $5::bigint[], $6::float8[], $7::bigint[])
                     ON CONFLICT (block_hash) DO UPDATE SET
                         network_diff = CASE WHEN EXCLUDED.network_diff > 0 THEN EXCLUDED.network_diff ELSE network_blocks.network_diff END,
                         reward_sompi = CASE WHEN EXCLUDED.reward_sompi > 0 THEN EXCLUDED.reward_sompi ELSE network_blocks.reward_sompi END,
-                        reward_kas = CASE WHEN EXCLUDED.reward_kas > 0 THEN EXCLUDED.reward_kas ELSE network_blocks.reward_kas END
+                        reward_kas = CASE WHEN EXCLUDED.reward_kas > 0 THEN EXCLUDED.reward_kas ELSE network_blocks.reward_kas END,
+                        daa_score = CASE WHEN EXCLUDED.daa_score > 0 THEN EXCLUDED.daa_score ELSE network_blocks.daa_score END
                     "#
                 )
                 .bind(&hashes)
@@ -1077,6 +1520,7 @@ pub async fn start_oracle_daemon() {
                 .bind(&diffs)
                 .bind(&rewards_sompi)
                 .bind(&rewards_kas)
+                .bind(&daa_scores)
                 .execute(&mut *tx_blocks)
                 .await;
                 if let Err(e) = insert_res {
@@ -1089,7 +1533,7 @@ pub async fn start_oracle_daemon() {
             }
         }
         if let Ok(pending_rows) = sqlx::query(
-            "SELECT block_hash, reward_sompi, network_diff FROM network_blocks WHERE (reward_sompi = 0 OR discovered_at > CURRENT_TIMESTAMP - INTERVAL '10 minutes') ORDER BY discovered_at DESC LIMIT 20"
+            "SELECT block_hash, reward_sompi, network_diff, COALESCE(daa_score, 0) AS daa_score FROM network_blocks WHERE (reward_sompi = 0 OR daa_score = 0 OR discovered_at > CURRENT_TIMESTAMP - INTERVAL '10 minutes') ORDER BY discovered_at DESC LIMIT 20"
         )
         .fetch_all(&pool)
         .await
@@ -1099,30 +1543,34 @@ pub async fn start_oracle_daemon() {
                 if block_hash.is_empty() {
                     continue;
                 }
-                if let Some((node_sompi, node_diff, is_orphaned_opt)) = query_kaspad_block_consensus(&kaspad_host, &block_hash).await {
+                if let Some((node_sompi, node_diff, node_daa, is_orphaned_opt)) = query_kaspad_block_consensus(&block_hash).await {
                     let current_sompi: i64 = row.try_get("reward_sompi").unwrap_or(0);
                     let current_diff: f64 = row.try_get("network_diff").unwrap_or(0.0);
+                    let current_daa: i64 = row.try_get("daa_score").unwrap_or(0);
                     let final_sompi = if node_sompi > 0 { node_sompi as i64 } else { current_sompi };
                     let final_kas = (final_sompi as f64) / 100_000_000.0;
                     let final_diff = if node_diff > 0.0 { node_diff } else { current_diff };
+                    let final_daa = if node_daa > 0 { node_daa as i64 } else { current_daa };
                     if let Some(is_orphaned) = is_orphaned_opt {
                         let _ = sqlx::query(
-                            "UPDATE network_blocks SET reward_sompi = $1, reward_kas = $2, network_diff = $3, is_orphaned = $4 WHERE block_hash = $5"
+                            "UPDATE network_blocks SET reward_sompi = $1, reward_kas = $2, network_diff = $3, daa_score = $4, is_orphaned = $5 WHERE block_hash = $6"
                         )
                         .bind(final_sompi)
                         .bind(final_kas)
                         .bind(final_diff)
+                        .bind(final_daa)
                         .bind(is_orphaned)
                         .bind(&block_hash)
                         .execute(&pool)
                         .await;
-                    } else if final_sompi != current_sompi || (final_diff - current_diff).abs() > 1.0 {
+                    } else if final_sompi != current_sompi || (final_diff - current_diff).abs() > 1.0 || final_daa != current_daa {
                         let _ = sqlx::query(
-                            "UPDATE network_blocks SET reward_sompi = $1, reward_kas = $2, network_diff = $3 WHERE block_hash = $4"
+                            "UPDATE network_blocks SET reward_sompi = $1, reward_kas = $2, network_diff = $3, daa_score = $4 WHERE block_hash = $5"
                         )
                         .bind(final_sompi)
                         .bind(final_kas)
                         .bind(final_diff)
+                        .bind(final_daa)
                         .bind(&block_hash)
                         .execute(&pool)
                         .await;
