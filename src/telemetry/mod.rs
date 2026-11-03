@@ -5,12 +5,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use std::collections::{HashMap, VecDeque};
 use serde_json::{json, Value};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::env;
 use sqlx::Row;
 
 const KASPA_DIFF_CONSTANT: f64 = 4_294_967_296.0;
 const DEFAULT_FPPS_MAX_HOUSE_FLOAT_KAS: f64 = 50.0;
+const DEFAULT_COINBASE_MATURITY_DAA: i64 = 1_000;
+const LAYOUT_CACHE_TTL: Duration = Duration::from_secs(5);
 
 lazy_static! {
     pub static ref REGISTRY: Registry = Registry::new();
@@ -78,6 +80,11 @@ struct WorkerDbSnapshot {
     status: String,
 }
 
+struct CachedSectorLayout {
+    layout_state: Value,
+    fetched_at: Instant,
+}
+
 pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String, f64, bool)>) {
     tracing::info!("🏦 Institutional Accounting & Elastic Solvency-Gated FPPS Engine Booted. Awaiting verified shares...");
     let redis_url = env::var("REDIS_URL").map(|s| s.trim().to_string()).unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
@@ -107,12 +114,18 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
         .and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|&v| v > 0.0)
         .unwrap_or(DEFAULT_FPPS_MAX_HOUSE_FLOAT_KAS);
+    let coinbase_maturity_daa: i64 = env::var("COINBASE_MATURITY_DAA")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|&v| v >= 100)
+        .unwrap_or(DEFAULT_COINBASE_MATURITY_DAA);
     let corp_kas_clean = crate::chronos::resolve_master_treasury_address();
-    let mut flush_interval = tokio::time::interval(tokio::time::Duration::from_millis(1000));
+    let mut flush_interval = tokio::time::interval(Duration::from_millis(1000));
     let mut worker_states: HashMap<String, WorkerState> = HashMap::new();
+    let mut sector_layout_cache: HashMap<String, CachedSectorLayout> = HashMap::new();
     let mut cached_l1_blocks_won_kas: f64 = 0.0;
+    let mut cached_immature_blocks_kas: f64 = 0.0;
     let mut tick_counter: u64 = 0;
-
     loop {
         tokio::select! {
             Some((full_worker_name, difficulty, is_network_block)) = valid_share_rx.recv() => {
@@ -152,16 +165,51 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                 let net_diff = net_diff_str.and_then(|s| s.parse::<f64>().ok()).filter(|&v| v > 0.0).unwrap_or(0.0);
                 let reward_str: Option<String> = redis::cmd("GET").arg("pool:block_reward").query_async(&mut redis_conn).await.unwrap_or(None);
                 let block_reward = reward_str.and_then(|s| s.parse::<f64>().ok()).filter(|&v| v > 0.0).unwrap_or(0.0);
+                let virtual_daa_str: Option<String> = redis::cmd("GET")
+                    .arg("pool:virtual_daa_score")
+                    .query_async(&mut redis_conn)
+                    .await
+                    .unwrap_or(None);
+                let current_virtual_daa = virtual_daa_str
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(0);
 
                 if tick_counter % 5 == 1 {
                     if let Ok(row) = sqlx::query(
-                        "SELECT COALESCE(SUM(reward_kas), 0.0) AS total_blocks_kas FROM network_blocks WHERE COALESCE(is_orphaned, false) = false"
+                        r#"
+                        SELECT
+                            COALESCE(SUM(CASE
+                                WHEN (
+                                    ($1 > $2 AND COALESCE(daa_score, 0) > 0 AND ($1 - COALESCE(daa_score, 0)) >= $2)
+                                    OR (COALESCE(daa_score, 0) = 0 AND discovered_at <= CURRENT_TIMESTAMP - INTERVAL '120 seconds')
+                                    OR ($1 <= $2 AND discovered_at <= CURRENT_TIMESTAMP - INTERVAL '120 seconds')
+                                ) THEN reward_kas
+                                ELSE 0.0
+                            END), 0.0) AS matured_blocks_kas,
+                            COALESCE(SUM(CASE
+                                WHEN NOT (
+                                    ($1 > $2 AND COALESCE(daa_score, 0) > 0 AND ($1 - COALESCE(daa_score, 0)) >= $2)
+                                    OR (COALESCE(daa_score, 0) = 0 AND discovered_at <= CURRENT_TIMESTAMP - INTERVAL '120 seconds')
+                                    OR ($1 <= $2 AND discovered_at <= CURRENT_TIMESTAMP - INTERVAL '120 seconds')
+                                ) THEN reward_kas
+                                ELSE 0.0
+                            END), 0.0) AS immature_blocks_kas
+                        FROM network_blocks
+                        WHERE COALESCE(is_orphaned, false) = false
+                        "#
                     )
+                    .bind(current_virtual_daa)
+                    .bind(coinbase_maturity_daa)
                     .fetch_one(&pg_pool)
                     .await
                     {
-                        cached_l1_blocks_won_kas = row.try_get::<f64, _>("total_blocks_kas").unwrap_or(0.0).max(0.0);
+                        cached_l1_blocks_won_kas = row.try_get::<f64, _>("matured_blocks_kas").unwrap_or(0.0).max(0.0);
+                        cached_immature_blocks_kas = row.try_get::<f64, _>("immature_blocks_kas").unwrap_or(0.0).max(0.0);
                     }
+                }
+
+                if tick_counter % 60 == 0 {
+                    sector_layout_cache.retain(|_, entry| entry.fetched_at.elapsed() < Duration::from_secs(60));
                 }
 
                 let ext_streamed_str: Option<String> = redis::cmd("GET")
@@ -181,7 +229,6 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                 } else {
                     (available_headroom_kas / soft_knee_kas).clamp(0.0, 1.0)
                 };
-
                 let epoch_telemetry_raw: Option<String> = redis::cmd("GET")
                     .arg("perennia:settlement:epoch_telemetry")
                     .query_async(&mut redis_conn)
@@ -194,22 +241,21 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                     crate::chronos::compute_jerusalem_epoch_window(now_secs);
                 if let Some(obj) = epoch_telemetry_val.as_object_mut() {
                     obj.insert("anchorUtcHour".to_string(), json!(22));
-                    obj.insert("anchorLabel".to_string(), json!("22:00 UTC (00:00 JST / 16:00 CT)"));
+                    obj.insert("anchorLabel".to_string(), json!("22:00 UTC Global Settlement"));
                     obj.insert("currentEpochBellTs".to_string(), json!(current_epoch_bell_ts));
                     obj.insert("nextEpochBellTs".to_string(), json!(next_epoch_bell_ts));
                     obj.insert("secondsRemaining".to_string(), json!(seconds_remaining));
                 }
-
                 let can_calculate_yields = net_diff > 0.0 && block_reward > 0.0;
                 let mut pipeline = redis::pipe();
                 let mut total_hashrate = 0.0;
                 let mut workers_array = Vec::new();
                 let mut keys_to_remove = Vec::new();
                 let mut yield_updates_to_publish = Vec::new();
+                let mut streamed_kas_by_wallet: HashMap<String, f64> = HashMap::new();
                 let mut db_worker_snapshots: Vec<WorkerDbSnapshot> = Vec::new();
                 let cutoff_300s = now.saturating_sub(300_000);
                 let cutoff_60s = now.saturating_sub(60_000);
-
                 if !worker_states.is_empty() {
                     for (full_worker, state) in worker_states.iter_mut() {
                         let dt_idle = (now.saturating_sub(state.last_share_ts)) as f64 / 1000.0;
@@ -241,18 +287,15 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                         let hr_60s = work_60s / elapsed_60s;
                         let current_hashrate = (hr_60s * 0.4) + (hr_300s * 0.6);
                         let is_online = current_hashrate > 0.0 || dt_idle < 60.0;
-
                         let total_attempts = state.valid_share_count + state.rejected_share_count;
                         let acceptance_pct = if total_attempts > 0 {
                             ((state.valid_share_count as f64 / total_attempts as f64) * 100.0).clamp(0.0, 100.0)
                         } else {
                             100.0
                         };
-
                         let parts: Vec<&str> = full_worker.split('.').collect();
                         let wallet_address = if !parts.is_empty() { parts[0] } else { full_worker.as_str() };
                         let worker_name = if parts.len() > 1 { parts[1..].join(".") } else { full_worker.to_string() };
-
                         if !is_online {
                             keys_to_remove.push(full_worker.clone());
                             pipeline.cmd("SET").arg(format!("worker:{}:hashrate", full_worker)).arg(0.0).ignore();
@@ -280,10 +323,8 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                             pipeline.cmd("SET").arg(format!("worker:{}:acceptance_pct", full_worker)).arg(acceptance_pct).ignore();
                             pipeline.cmd("SET").arg(format!("worker:{}:last_share_ts", full_worker)).arg(state.last_share_ts).ignore();
                             pipeline.cmd("SADD").arg("pool:workers").arg(full_worker.clone()).ignore();
-
                             if can_calculate_yields && state.unflushed_difficulty > 0.0 {
                                 let clean_wallet = wallet_address.to_lowercase().replace("kaspa:", "").trim().to_string();
-                                let prefixed_wallet = format!("kaspa:{}", clean_wallet);
                                 let is_house_anchor = !corp_kas_clean.is_empty() && clean_wallet == corp_kas_clean;
                                 let work_hashes = state.unflushed_difficulty * KASPA_DIFF_CONSTANT;
                                 let expected_block_hashes = net_diff * 2.0;
@@ -330,6 +371,7 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                                         .arg(format!("worker:{}:unpaid_yield", full_worker))
                                         .arg(streamed_kas_now)
                                         .ignore();
+                                    *streamed_kas_by_wallet.entry(clean_wallet).or_insert(0.0) += streamed_kas_now;
                                 }
                                 if pool_fee_kas > 0.0 {
                                     let fee_scaled = if is_house_anchor {
@@ -347,37 +389,11 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                                             .ignore();
                                     }
                                 }
-                                if streamed_kas_now > 0.0 {
-                                    let row_res = sqlx::query("SELECT layout_state FROM user_command_centers WHERE wallet_address = $1 OR wallet_address = $2")
-                                        .bind(&prefixed_wallet)
-                                        .bind(&clean_wallet)
-                                        .fetch_optional(&pg_pool)
-                                        .await;
-                                    if let Ok(Some(row)) = row_res {
-                                        if let Ok(mut layout_state) = row.try_get::<serde_json::Value, _>("layout_state") {
-                                            if let Some(sectors_array) = layout_state.get_mut("sectors").and_then(|s| s.as_array_mut()) {
-                                                for sector in sectors_array.iter_mut() {
-                                                    if let Some(pct) = sector.get("allocationPercentage").and_then(|v| v.as_f64()) {
-                                                        let projected_micro_yield = streamed_kas_now * (pct / 100.0);
-                                                        let current_pending = sector.get("pendingKaspa").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                                        sector["pendingKaspa"] = json!(current_pending + projected_micro_yield);
-                                                    }
-                                                }
-                                                yield_updates_to_publish.push(json!({
-                                                    "wallet": clean_wallet,
-                                                    "yield_update": true,
-                                                    "sectors": layout_state.get("sectors").unwrap()
-                                                }));
-                                            }
-                                        }
-                                    }
-                                }
                                 state.unflushed_difficulty = 0.0;
                             }
                             if state.unflushed_blocks > 0 {
                                 state.unflushed_blocks = 0;
                             }
-
                             db_worker_snapshots.push(WorkerDbSnapshot {
                                 full_identity: full_worker.clone(),
                                 wallet_address: wallet_address.to_string(),
@@ -390,7 +406,6 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                                 last_share_ts: state.last_share_ts as i64,
                                 status: "online".to_string(),
                             });
-
                             workers_array.push(json!({
                                 "fullIdentity": full_worker,
                                 "walletAddress": wallet_address,
@@ -410,7 +425,58 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                         worker_states.remove(&key);
                     }
                 }
-
+                for (clean_wallet, wallet_streamed_kas) in streamed_kas_by_wallet {
+                    if wallet_streamed_kas <= 0.0 {
+                        continue;
+                    }
+                    let prefixed_wallet = format!("kaspa:{}", clean_wallet);
+                    let needs_db_refresh = match sector_layout_cache.get(&clean_wallet) {
+                        Some(cached) => cached.fetched_at.elapsed() >= LAYOUT_CACHE_TTL,
+                        None => true,
+                    };
+                    if needs_db_refresh {
+                        if let Ok(Some(row)) = sqlx::query(
+                            "SELECT layout_state FROM user_command_centers WHERE wallet_address = $1 OR wallet_address = $2 LIMIT 1"
+                        )
+                        .bind(&prefixed_wallet)
+                        .bind(&clean_wallet)
+                        .fetch_optional(&pg_pool)
+                        .await
+                        {
+                            if let Ok(layout_state) = row.try_get::<Value, _>("layout_state") {
+                                sector_layout_cache.insert(
+                                    clean_wallet.clone(),
+                                    CachedSectorLayout {
+                                        layout_state,
+                                        fetched_at: Instant::now(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    if let Some(cached) = sector_layout_cache.get_mut(&clean_wallet) {
+                        if let Some(sectors_array) = cached
+                            .layout_state
+                            .get_mut("sectors")
+                            .and_then(|s| s.as_array_mut())
+                        {
+                            for sector in sectors_array.iter_mut() {
+                                if let Some(pct) = sector.get("allocationPercentage").and_then(|v| v.as_f64()) {
+                                    let projected_micro_yield = wallet_streamed_kas * (pct / 100.0);
+                                    let current_pending = sector.get("pendingKaspa").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                    sector["pendingKaspa"] = json!(current_pending + projected_micro_yield);
+                                }
+                            }
+                            if let Some(sectors_val) = cached.layout_state.get("sectors") {
+                                yield_updates_to_publish.push(json!({
+                                    "wallet": clean_wallet,
+                                    "yield_update": true,
+                                    "sectors": sectors_val
+                                }));
+                            }
+                        }
+                    }
+                }
                 if tick_counter % 30 == 0 && !db_worker_snapshots.is_empty() {
                     let pool_bg = pg_pool.clone();
                     tokio::spawn(async move {
@@ -448,10 +514,11 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                         }
                     });
                 }
-
                 let solvency_telemetry = json!({
                     "maxHouseFloatKas": max_house_float_kas,
                     "l1BlocksWonKas": cached_l1_blocks_won_kas,
+                    "immatureBlocksKas": cached_immature_blocks_kas,
+                    "coinbaseMaturityDaa": coinbase_maturity_daa,
                     "solvencyCeilingKas": total_solvency_ceiling_kas,
                     "externalStreamedKas": total_external_streamed_kas,
                     "availableHeadroomKas": available_headroom_kas,
@@ -460,7 +527,6 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                 });
                 pipeline.cmd("SET").arg("perennia:pool:fpps_solvency").arg(solvency_telemetry.to_string()).ignore();
                 pipeline.cmd("SET").arg("pool:hashrate").arg(total_hashrate).ignore();
-
                 let telemetry_payload = json!({
                     "totalHashrate": total_hashrate,
                     "networkDifficulty": net_diff,
@@ -477,7 +543,7 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                 }
                 if let Err(e) = pipeline.query_async::<_, ()>(&mut redis_conn).await {
                     tracing::error!("🚨 CRITICAL LEDGER FAILURE: {}", e);
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                     if let Ok(new_conn) = redis_client.get_multiplexed_async_connection().await {
                         redis_conn = new_conn;
                     }

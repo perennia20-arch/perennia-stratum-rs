@@ -7,7 +7,7 @@ kaspad_addresses:
 
   - "127.0.0.1:16110"
 
-  - "192.168.1.100:16110"
+  - "192.168.50.100:16110"
 
   - "api.kaspa.org:16110"
 
@@ -15,7 +15,7 @@ kaspad_addresses:
 
 # Central Pool Wallet (Matched to Master Admin Treasury)
 
-mining_address: "kaspa:qrc3ezl770p2cjlfc3tjp6vqlldt6lgh3e80d6rm4rchtt0yrrpgzqave8579"
+mining_address: "kaspa:qpra0t9ul8hd7m7pw4td6ax3unlf2vyc2fzit9p9yulhsnk7quakmpj4lpw7"
 
 
 
@@ -45,4 +45,4 @@ print_stats: true
 
 default_unassigned_settlement_threshold: 50.0
 
-coinbase_maturity_daa_confirmations: 500
+coinbase_maturity_daa_confirmations: 5000

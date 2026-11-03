@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
 use std::env;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Deserialize)]
 struct ShieldActionReq {
@@ -175,6 +175,11 @@ async fn get_table_data(
         "forge_vesting_schedules",
         "forge_monetary_policies",
         "forge_mineable_vaults",
+        "idempotent_payout_batches",
+        "client_cold_vault_registry",
+        "treasury_airlock_sweeps",
+        "hifo_tax_lots",
+        "hifo_disposal_matches",
     ];
     if !allowed_tables.contains(&table.as_str()) {
         return Err((
@@ -211,8 +216,8 @@ async fn get_shield_status(
         let ip = entry.key().clone();
         let banned_at = *entry.value();
         let elapsed = banned_at.elapsed();
-        if elapsed < Duration::from_secs(600) {
-            let remaining_secs = 600u64.saturating_sub(elapsed.as_secs());
+        if elapsed < Duration::from_secs(crate::stratum_tcp::BAN_DURATION_SECS) {
+            let remaining_secs = crate::stratum_tcp::BAN_DURATION_SECS.saturating_sub(elapsed.as_secs());
             banned.push(json!({
                 "ip": ip,
                 "elapsedSeconds": elapsed.as_secs(),
@@ -224,10 +229,23 @@ async fn get_shield_status(
     }
     for ip in expired {
         crate::stratum_tcp::BANNED_IPS.remove(&ip);
+        crate::stratum_tcp::STRIKE_COUNTERS.remove(&ip);
     }
+
+    let mut active_strikes = Vec::new();
+    for entry in crate::stratum_tcp::STRIKE_COUNTERS.iter() {
+        active_strikes.push(json!({
+            "key": entry.key(),
+            "strikes": *entry.value(),
+            "maxStrikes": crate::stratum_tcp::MAX_CONSECUTIVE_STRIKES
+        }));
+    }
+
     Ok(Json(json!({
         "bannedIps": banned,
-        "count": banned.len()
+        "count": banned.len(),
+        "activeStrikeCounters": active_strikes,
+        "maxConsecutiveStrikes": crate::stratum_tcp::MAX_CONSECUTIVE_STRIKES
     })))
 }
 
@@ -246,6 +264,7 @@ async fn modify_shield_ip(
     let action = req.action.unwrap_or_else(|| "BAN".to_string()).to_uppercase();
     if action == "UNBAN" || action == "REMOVE" {
         crate::stratum_tcp::BANNED_IPS.remove(&clean_ip);
+        crate::stratum_tcp::STRIKE_COUNTERS.remove(&clean_ip);
         Ok(Json(json!({
             "success": true,
             "action": "UNBANNED",
@@ -253,6 +272,7 @@ async fn modify_shield_ip(
         })))
     } else {
         crate::stratum_tcp::BANNED_IPS.insert(clean_ip.clone(), Instant::now());
+        crate::stratum_tcp::STRIKE_COUNTERS.remove(&clean_ip);
         Ok(Json(json!({
             "success": true,
             "action": "BANNED",
@@ -639,8 +659,23 @@ async fn handle_passthrough_action(
         .or(req.spotPrice)
         .unwrap_or(0.0)
         .max(0.0);
+    let kas_spot_str: Option<String> = redis::cmd("GET")
+        .arg("oracle:spot:KAS_USDC")
+        .query_async(&mut redis_conn)
+        .await
+        .unwrap_or(None);
+    let live_kas_spot = kas_spot_str
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|&v| v > 0.0)
+        .unwrap_or(0.0);
     let mode = req.action.trim().to_uppercase();
     if mode == "CONFIRM_PASSTHROUGH_FILL" {
+        if spot_price <= 0.0 && live_kas_spot <= 0.0 {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "ORACLE_HALT: Live KAS/USDC spot price is unavailable and no execution spot price was provided."})),
+            ));
+        }
         let resolved_tx = req
             .txHash
             .as_deref()
@@ -661,17 +696,34 @@ async fn handle_passthrough_action(
         let gross_usd = if spot_price > 0.0 && estimated_output > 0.0 {
             estimated_output * spot_price
         } else {
-            gross_kas * 0.12
+            gross_kas * live_kas_spot
         };
+        let resolved_unit_spot = if spot_price > 0.0 {
+            spot_price
+        } else if estimated_output > 0.0 {
+            gross_usd / estimated_output
+        } else {
+            live_kas_spot
+        };
+        crate::sor::record_hifo_acquisition_lot(
+            &pool,
+            &clean_wallet,
+            &target_asset,
+            estimated_output,
+            resolved_unit_spot,
+            "PASSTHROUGH_SETTLED",
+            Some(&resolved_tx),
+        )
+        .await;
         let _ = sqlx::query(
-            "INSERT INTO tax_ledger_events (wallet_address, asset_ticker, event_type, gross_proceeds_usd, amount_tokens, spot_price_at_execution, tx_hash)
-             VALUES ($1, $2, 'PASSTHROUGH_SETTLED', $3, $4, $5, $6)",
+            "INSERT INTO tax_ledger_events (wallet_address, asset_ticker, event_type, gross_proceeds_usd, amount_tokens, spot_price_at_execution, tx_hash, cost_basis_usd, realized_gain_loss_usd, holding_period)
+             VALUES ($1, $2, 'PASSTHROUGH_SETTLED', $3, $4, $5, $6, $3, 0.0, 'SHORT_TERM')",
         )
         .bind(&clean_wallet)
         .bind(&target_asset)
         .bind(gross_usd)
         .bind(estimated_output)
-        .bind(spot_price)
+        .bind(resolved_unit_spot)
         .bind(&resolved_tx)
         .execute(&pool)
         .await;
@@ -725,22 +777,15 @@ async fn handle_passthrough_action(
                 .query_async(&mut redis_conn)
                 .await;
         }
-        let kas_spot_str: Option<String> = redis::cmd("GET")
-            .arg("oracle:spot:KAS_USDC")
-            .query_async(&mut redis_conn)
-            .await
-            .unwrap_or(None);
-        let kas_spot = kas_spot_str
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.12);
+        let refund_kas_spot = if live_kas_spot > 0.0 { live_kas_spot } else { spot_price };
         let _ = sqlx::query(
             "INSERT INTO tax_ledger_events (wallet_address, asset_ticker, event_type, gross_proceeds_usd, amount_tokens, spot_price_at_execution)
              VALUES ($1, 'KAS', 'PASSTHROUGH_REFUND', $2, $3, $4)",
         )
         .bind(&clean_wallet)
-        .bind(gross_kas * kas_spot)
+        .bind(gross_kas * refund_kas_spot)
         .bind(gross_kas)
-        .bind(kas_spot)
+        .bind(refund_kas_spot)
         .execute(&pool)
         .await;
         let sse_event = json!({
@@ -1098,7 +1143,7 @@ async fn handle_fiat_action(
         let fiat_amount_usd: f64 = row.try_get("fiat_amount_usd").unwrap_or(0.0);
         let fee_usd: f64 = row.try_get("fee_usd").unwrap_or(0.0);
         let net_usd_converted: f64 = row.try_get("net_usd_converted").unwrap_or(0.0);
-        let locked_spot_price: f64 = row.try_get("locked_spot_price").unwrap_or(0.12);
+        let locked_spot_price: f64 = row.try_get("locked_spot_price").unwrap_or(0.0);
         let live_spot_str: Option<String> = redis::cmd("GET")
             .arg("oracle:spot:KAS_USDC")
             .query_async(&mut redis_conn)
@@ -1107,7 +1152,13 @@ async fn handle_fiat_action(
         let execution_spot = live_spot_str
             .and_then(|s| s.parse::<f64>().ok())
             .filter(|&v| v > 0.0)
-            .unwrap_or_else(|| if locked_spot_price > 0.0 { locked_spot_price } else { 0.12 });
+            .unwrap_or(locked_spot_price);
+        if execution_spot <= 0.0 {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "ORACLE_HALT: Live KAS/USDC spot price is unavailable and order has no valid locked spot price."})),
+            ));
+        }
         let delivered_kas = ((net_usd_converted / execution_spot) * 10000.0).round() / 10000.0;
         let settlement_target = req
             .settlementTarget
@@ -1123,7 +1174,13 @@ async fn handle_fiat_action(
             .map(|s| s.to_string())
             .unwrap_or_default();
         if settlement_target == "L1_KAS" {
-            match crate::sor::execute_physical_settlement(&prefixed_wallet, delivered_kas).await {
+            let idemp_key = format!(
+                "FIAT-ONRAMP-L1-{}-{}",
+                order_id,
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() / 60
+            );
+            let payouts_vec = vec![(prefixed_wallet.clone(), delivered_kas)];
+            match crate::sor::execute_idempotent_mass_physical_settlement(&pool, &idemp_key, &payouts_vec).await {
                 Ok(tx_id) => {
                     resolved_tx_hash = tx_id;
                 }
@@ -1170,9 +1227,24 @@ async fn handle_fiat_action(
                 Json(json!({"error": format!("Failed to finalize on-ramp order: {}", e)})),
             )
         })?;
+        let effective_unit_basis = if delivered_kas > 0.0 {
+            fiat_amount_usd / delivered_kas
+        } else {
+            execution_spot
+        };
+        crate::sor::record_hifo_acquisition_lot(
+            &pool,
+            &clean_wallet,
+            "KAS",
+            delivered_kas,
+            effective_unit_basis,
+            "FIAT_ONRAMP",
+            Some(&resolved_tx_hash),
+        )
+        .await;
         let _ = sqlx::query(
-            "INSERT INTO tax_ledger_events (wallet_address, asset_ticker, event_type, gross_proceeds_usd, amount_tokens, spot_price_at_execution, tx_hash)
-             VALUES ($1, 'KAS', 'FIAT_ONRAMP', $2, $3, $4, $5)",
+            "INSERT INTO tax_ledger_events (wallet_address, asset_ticker, event_type, gross_proceeds_usd, amount_tokens, spot_price_at_execution, tx_hash, cost_basis_usd, realized_gain_loss_usd, holding_period)
+             VALUES ($1, 'KAS', 'FIAT_ONRAMP', $2, $3, $4, $5, $2, 0.0, 'SHORT_TERM')",
         )
         .bind(&clean_wallet)
         .bind(fiat_amount_usd)

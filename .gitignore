@@ -10,3 +10,10 @@ kaspa-keygen/
 db/
 setup.js
 test-wrpc.js
+
+.env*
+*.log
+*.pem
+*.key
+kaspa-keygen/
+repomix*.xml
