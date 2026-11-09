@@ -122,7 +122,6 @@ fn record_socket_strike(peer_ip: &str, worker_identity: &str, reason: &str) -> (
         *ip_entry = ip_entry.saturating_add(1);
         *ip_entry
     };
-
     let mut worker_strikes = 0u32;
     if !worker_identity.is_empty() {
         let worker_key = format!("worker:{}", worker_identity);
@@ -130,7 +129,6 @@ fn record_socket_strike(peer_ip: &str, worker_identity: &str, reason: &str) -> (
         *w_entry = w_entry.saturating_add(1);
         worker_strikes = *w_entry;
     }
-
     let effective_strikes = current_ip_strikes.max(worker_strikes);
     tracing::warn!(
         "⚠️ [STRATUM SHIELD STRIKE {}/{}] IP: {} | Worker: {} | Reason: {}",
@@ -140,7 +138,6 @@ fn record_socket_strike(peer_ip: &str, worker_identity: &str, reason: &str) -> (
         if worker_identity.is_empty() { "unauthenticated" } else { worker_identity },
         reason
     );
-
     if effective_strikes >= MAX_CONSECUTIVE_STRIKES {
         STRIKE_COUNTERS.remove(peer_ip);
         if !worker_identity.is_empty() {
@@ -248,7 +245,7 @@ pub async fn start_stratum_server(
     let listener = TcpListener::bind(&bind_addr).await?;
     let connection_limit = Arc::new(Semaphore::new(5000));
     tracing::info!(
-        "🛡️ STRATUM TIER ACTIVE ON {} (Diff: {}, Throttle: {}ms, 10-Strike Shield Armed)",
+        "🛡️ STRATUM TIER ACTIVE ON {} (Diff: {}, Throttle: {}ms, 10-Strike Shield + Security Firewall Armed)",
         bind_addr,
         difficulty,
         throttle_ms
@@ -330,7 +327,6 @@ async fn handle_worker_connection(
     let mut last_diff_change_time = Instant::now();
     let connected_at = Instant::now();
     let mut has_submitted_first_share = false;
-
     let (read_half, mut write_half) = socket.into_split();
     let mut reader = FramedRead::new(read_half, LinesCodec::new_with_max_length(4096));
     let mut handshake_state = 0;
@@ -398,7 +394,6 @@ async fn handle_worker_connection(
             Ok(req) => {
                 let method = req.method.unwrap_or_else(|| "unknown".to_string());
                 let req_id = req.id.clone().unwrap_or(serde_json::Value::Null);
-
                 if method == "mining.subscribe" {
                     let sub_json = json!({
                         "id": req_id,
@@ -476,6 +471,43 @@ async fn handle_worker_connection(
                                     );
                                     anyhow::bail!("Invalid Kaspa wallet address format.");
                                 }
+
+                                // Check Director Zone 5 Security Firewall Blacklist
+                                let is_blacklisted: Option<i32> = sqlx::query_scalar(
+                                    r#"
+                                    SELECT 1
+                                    FROM security_firewall_blacklist
+                                    WHERE active = TRUE
+                                      AND (
+                                          LOWER(target_value) = $1
+                                          OR LOWER(target_value) = $2
+                                          OR LOWER(target_value) = $3
+                                          OR LOWER(target_value) = $4
+                                      )
+                                    LIMIT 1
+                                    "#,
+                                )
+                                .bind(&clean_wallet)
+                                .bind(&prefixed_wallet)
+                                .bind(auth_name.to_lowercase())
+                                .bind(peer_addr.to_lowercase())
+                                .fetch_optional(&pg_pool)
+                                .await
+                                .ok()
+                                .flatten();
+
+                                if is_blacklisted.is_some() {
+                                    if !is_exempt_local_or_lan_ip(&peer_addr) {
+                                        BANNED_IPS.insert(peer_addr.clone(), Instant::now());
+                                    }
+                                    tracing::warn!(
+                                        "🔨 [FIREWALL BLACKLIST] Dropping Stratum connection from {} ({})",
+                                        peer_addr,
+                                        auth_name
+                                    );
+                                    anyhow::bail!("Miner wallet, worker, or IP is blocked by the Perennia Security Firewall.");
+                                }
+
                                 if closed_beta_mode {
                                     let is_authorized: Option<i32> = sqlx::query_scalar(
                                         r#"
@@ -609,7 +641,6 @@ async fn handle_worker_connection(
     if !initial_job.ends_with(b"\n") {
         write_half.write_all(b"\n").await?;
     }
-
     let safe_throttle = if throttle_ms == 0 { 10 } else { throttle_ms };
     let mut throttle_interval = tokio::time::interval(Duration::from_millis(safe_throttle));
     throttle_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

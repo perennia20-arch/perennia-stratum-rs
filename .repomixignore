@@ -1,0 +1,35 @@
+# Environment & Secret Configs
+.env
+.env.*
+*.env
+!.env.example
+
+# Cryptographic Keys, Wallets & Seeds
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.wallet
+*.seed
+*.mnemonic
+*.kdbx
+*secret*
+*credentials*
+id_rsa*
+id_ed25519*
+
+# Database Dumps & Local State
+*.sql.gz
+*.dump
+*.db
+*.sqlite
+*.sqlite3
+*.rdb
+
+# Build Artifacts, Locks & Repomix Outputs
+target/
+Cargo.lock
+node_modules/
+*.log
+repomix*

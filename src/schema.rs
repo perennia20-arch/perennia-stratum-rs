@@ -276,12 +276,22 @@ pub async fn ensure_database_schema(pool: &PgPool) -> anyhow::Result<()> {
         CREATE TABLE IF NOT EXISTS fiat_onramp_orders (
             order_id VARCHAR(80) PRIMARY KEY,
             wallet_address VARCHAR(255) NOT NULL,
-            payment_rail VARCHAR(64) NOT NULL DEFAULT 'SOVEREIGN_WIRE_ACH',
+            payment_rail VARCHAR(64) NOT NULL DEFAULT 'STRIPE_ACH_DIRECT_DEBIT',
+            payment_method VARCHAR(32) NOT NULL DEFAULT 'ach',
+            tier_name VARCHAR(32) NOT NULL DEFAULT 'RETAIL',
+            tier_bps INTEGER NOT NULL DEFAULT 85,
             settlement_target VARCHAR(64) NOT NULL DEFAULT 'LEDGER_KAS',
             target_asset VARCHAR(32) NOT NULL DEFAULT 'KAS',
             target_spot_price DOUBLE PRECISION NOT NULL DEFAULT 0.0,
             estimated_tokens DOUBLE PRECISION NOT NULL DEFAULT 0.0,
             auto_stake_silo BOOLEAN NOT NULL DEFAULT FALSE,
+            quoted_principal_cents BIGINT NOT NULL DEFAULT 0,
+            perennia_fee_cents BIGINT NOT NULL DEFAULT 250,
+            stripe_gateway_fee_cents BIGINT NOT NULL DEFAULT 0,
+            gross_charge_cents BIGINT NOT NULL DEFAULT 0,
+            settled_net_cents BIGINT,
+            fulfilled_principal_cents BIGINT,
+            quarantine_reason TEXT,
             fiat_amount_usd DOUBLE PRECISION NOT NULL,
             fee_usd DOUBLE PRECISION NOT NULL,
             hard_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0.0,
@@ -298,6 +308,13 @@ pub async fn ensure_database_schema(pool: &PgPool) -> anyhow::Result<()> {
             wholesale_withdraw_id VARCHAR(96),
             changenow_exchange_id VARCHAR(128),
             payin_address VARCHAR(255),
+            stripe_payment_intent_id VARCHAR(128),
+            stripe_onramp_session_id VARCHAR(128),
+            bridge_virtual_account_id VARCHAR(128),
+            bridge_wire_routing VARCHAR(64),
+            bridge_wire_account VARCHAR(64),
+            bank_last4 VARCHAR(10),
+            master_treasury_fee_usdc DOUBLE PRECISION NOT NULL DEFAULT 0.0,
             post_trade_sweep_json JSONB DEFAULT '{}'::jsonb,
             tx_hash VARCHAR(255),
             status VARCHAR(64) NOT NULL DEFAULT 'AWAITING_WIRE_RECEIPT',
@@ -308,10 +325,20 @@ pub async fn ensure_database_schema(pool: &PgPool) -> anyhow::Result<()> {
         "ALTER TABLE fiat_onramp_orders ALTER COLUMN payment_rail TYPE VARCHAR(64)",
         "ALTER TABLE fiat_onramp_orders ALTER COLUMN settlement_target TYPE VARCHAR(64)",
         "ALTER TABLE fiat_onramp_orders ALTER COLUMN status TYPE VARCHAR(64)",
+        "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS payment_method VARCHAR(32) NOT NULL DEFAULT 'ach'",
+        "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS tier_name VARCHAR(32) NOT NULL DEFAULT 'RETAIL'",
+        "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS tier_bps INTEGER NOT NULL DEFAULT 85",
         "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS target_asset VARCHAR(32) NOT NULL DEFAULT 'KAS'",
         "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS target_spot_price DOUBLE PRECISION NOT NULL DEFAULT 0.0",
         "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS estimated_tokens DOUBLE PRECISION NOT NULL DEFAULT 0.0",
         "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS auto_stake_silo BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS quoted_principal_cents BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS perennia_fee_cents BIGINT NOT NULL DEFAULT 250",
+        "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS stripe_gateway_fee_cents BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS gross_charge_cents BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS settled_net_cents BIGINT",
+        "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS fulfilled_principal_cents BIGINT",
+        "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS quarantine_reason TEXT",
         "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS hard_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0.0",
         "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS guaranteed_profit_usd DOUBLE PRECISION NOT NULL DEFAULT 0.0",
         "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS competitor_fee_usd DOUBLE PRECISION NOT NULL DEFAULT 0.0",
@@ -321,6 +348,13 @@ pub async fn ensure_database_schema(pool: &PgPool) -> anyhow::Result<()> {
         "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS wholesale_withdraw_id VARCHAR(96)",
         "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS changenow_exchange_id VARCHAR(128)",
         "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS payin_address VARCHAR(255)",
+        "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS stripe_payment_intent_id VARCHAR(128)",
+        "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS stripe_onramp_session_id VARCHAR(128)",
+        "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS bridge_virtual_account_id VARCHAR(128)",
+        "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS bridge_wire_routing VARCHAR(64)",
+        "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS bridge_wire_account VARCHAR(64)",
+        "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS bank_last4 VARCHAR(10)",
+        "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS master_treasury_fee_usdc DOUBLE PRECISION NOT NULL DEFAULT 0.0",
         "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS post_trade_sweep_json JSONB DEFAULT '{}'::jsonb",
         "CREATE INDEX IF NOT EXISTS idx_fiat_onramp_wallet ON fiat_onramp_orders (wallet_address, created_at DESC)",
         r#"
@@ -334,9 +368,13 @@ pub async fn ensure_database_schema(pool: &PgPool) -> anyhow::Result<()> {
             commercial_checking_cleared_usd DOUBLE PRECISION NOT NULL DEFAULT 1500.0,
             llc_tax_escrow_reserve_usd DOUBLE PRECISION NOT NULL DEFAULT 0.0,
             dark_pool_lp_vault_usd DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+            master_treasury_usdc_reserve DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+            phase2_ach_target_usd DOUBLE PRECISION NOT NULL DEFAULT 250000.0,
             updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         )
         "#,
+        "ALTER TABLE fiat_float_ledger ADD COLUMN IF NOT EXISTS master_treasury_usdc_reserve DOUBLE PRECISION NOT NULL DEFAULT 0.0",
+        "ALTER TABLE fiat_float_ledger ADD COLUMN IF NOT EXISTS phase2_ach_target_usd DOUBLE PRECISION NOT NULL DEFAULT 250000.0",
         r#"
         CREATE TABLE IF NOT EXISTS fiat_post_trade_sweeps (
             sweep_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -379,6 +417,8 @@ pub async fn ensure_database_schema(pool: &PgPool) -> anyhow::Result<()> {
             acceptance_pct DOUBLE PRECISION NOT NULL DEFAULT 100.0,
             blocks_found BIGINT NOT NULL DEFAULT 0,
             last_share_ts BIGINT NOT NULL DEFAULT 0,
+            streak_started_ts BIGINT NOT NULL DEFAULT 0,
+            effective_fee_rate DOUBLE PRECISION NOT NULL DEFAULT 0.01,
             status VARCHAR(32) NOT NULL DEFAULT 'online',
             updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         )
@@ -391,6 +431,8 @@ pub async fn ensure_database_schema(pool: &PgPool) -> anyhow::Result<()> {
         "ALTER TABLE worker_profiles ADD COLUMN IF NOT EXISTS acceptance_pct DOUBLE PRECISION NOT NULL DEFAULT 100.0",
         "ALTER TABLE worker_profiles ADD COLUMN IF NOT EXISTS blocks_found BIGINT NOT NULL DEFAULT 0",
         "ALTER TABLE worker_profiles ADD COLUMN IF NOT EXISTS last_share_ts BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE worker_profiles ADD COLUMN IF NOT EXISTS streak_started_ts BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE worker_profiles ADD COLUMN IF NOT EXISTS effective_fee_rate DOUBLE PRECISION NOT NULL DEFAULT 0.01",
         "ALTER TABLE worker_profiles ADD COLUMN IF NOT EXISTS status VARCHAR(32) NOT NULL DEFAULT 'online'",
         "ALTER TABLE worker_profiles ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP",
         r#"
@@ -596,6 +638,71 @@ pub async fn ensure_database_schema(pool: &PgPool) -> anyhow::Result<()> {
         )
         "#,
         "CREATE INDEX IF NOT EXISTS idx_hifo_disposals_wallet ON hifo_disposal_matches (wallet_address, disposed_at DESC)",
+        r#"
+        CREATE TABLE IF NOT EXISTS token_steering_matrix (
+            ticker VARCHAR(32) PRIMARY KEY,
+            asset_name VARCHAR(128) NOT NULL DEFAULT '',
+            network VARCHAR(32) NOT NULL DEFAULT 'KAS',
+            contract_address VARCHAR(255) NOT NULL DEFAULT '',
+            steering_state VARCHAR(32) NOT NULL DEFAULT 'AUTO_BALANCE',
+            is_whitelisted BOOLEAN NOT NULL DEFAULT TRUE,
+            target_weight_pct DOUBLE PRECISION NOT NULL DEFAULT 10.0,
+            actual_weight_pct DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+            accumulated_fee_tokens DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+            accumulated_fee_usd DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+            updated_by VARCHAR(255) NOT NULL DEFAULT 'SYSTEM_BOOT',
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
+        r#"
+        CREATE TABLE IF NOT EXISTS security_firewall_blacklist (
+            entry_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            entity_type VARCHAR(32) NOT NULL DEFAULT 'WALLET',
+            target_value VARCHAR(255) UNIQUE NOT NULL,
+            reason TEXT NOT NULL DEFAULT 'Director Firewall Block',
+            active BOOLEAN NOT NULL DEFAULT TRUE,
+            added_by VARCHAR(255) NOT NULL DEFAULT 'DIRECTOR',
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
+        "CREATE INDEX IF NOT EXISTS idx_security_firewall_active ON security_firewall_blacklist (active, entity_type)",
+        r#"
+        CREATE TABLE IF NOT EXISTS director_audit_log (
+            audit_id BIGSERIAL PRIMARY KEY,
+            director_wallet VARCHAR(255) NOT NULL,
+            zone VARCHAR(64) NOT NULL DEFAULT 'ZONE_5',
+            action_type VARCHAR(96) NOT NULL,
+            target_entity VARCHAR(255) NOT NULL DEFAULT '',
+            details_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
+        "CREATE INDEX IF NOT EXISTS idx_director_audit_created ON director_audit_log (created_at DESC)",
+        r#"
+        CREATE TABLE IF NOT EXISTS corporate_expense_vouchers (
+            voucher_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            category VARCHAR(64) NOT NULL DEFAULT 'INFRASTRUCTURE',
+            vendor_label VARCHAR(128) NOT NULL DEFAULT '',
+            amount_usd DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+            payment_source VARCHAR(64) NOT NULL DEFAULT 'MERCURY_9901',
+            tx_reference VARCHAR(128),
+            recorded_by VARCHAR(255) NOT NULL DEFAULT 'DIRECTOR',
+            recorded_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
+        r#"
+        CREATE TABLE IF NOT EXISTS corporate_owner_draws (
+            draw_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            director_wallet VARCHAR(255) NOT NULL,
+            asset_ticker VARCHAR(32) NOT NULL DEFAULT 'USD',
+            amount_tokens DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+            amount_usd DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+            destination_rail VARCHAR(128) NOT NULL DEFAULT 'MERCURY_9901',
+            tx_hash VARCHAR(255),
+            recorded_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
     ];
 
     for stmt in ddl_statements {
@@ -604,29 +711,52 @@ pub async fn ensure_database_schema(pool: &PgPool) -> anyhow::Result<()> {
         }
     }
 
+    let default_whitelist_rows: &[(&str, &str, &str, f64)] = &[
+        ("KAS", "Kaspa Native L1", "KAS", 35.0),
+        ("USDC", "USD Coin Reserve", "ETH", 20.0),
+        ("USDT", "Tether USD Reserve", "ETH", 10.0),
+        ("BTC", "Bitcoin L1 Reserve", "BTC", 15.0),
+        ("ETH", "Ethereum L1 Reserve", "ETH", 10.0),
+        ("SOL", "Solana L1 Reserve", "SOL", 5.0),
+        ("SILO", "Perennia Silo Utility (KRC-20)", "KAS", 5.0),
+    ];
+
+    for &(ticker, name, net, weight) in default_whitelist_rows {
+        let _ = sqlx::query(
+            r#"
+            INSERT INTO token_steering_matrix (
+                ticker, asset_name, network, steering_state, is_whitelisted, target_weight_pct
+            ) VALUES ($1, $2, $3, 'AUTO_BALANCE', TRUE, $4)
+            ON CONFLICT (ticker) DO NOTHING
+            "#,
+        )
+        .bind(ticker)
+        .bind(name)
+        .bind(net)
+        .bind(weight)
+        .execute(pool)
+        .await;
+    }
+
     let default_cold_kas = env::var("PERENNIA_MASTER_TREASURY_KAS")
         .or_else(|_| env::var("MASTER_ADMIN_ADDRESS"))
         .or_else(|_| env::var("PERENNIA_COLD_KAS_ADDRESS"))
         .unwrap_or_default();
-
     let default_hot_ceiling = env::var("PERENNIA_HOT_CEILING_KAS")
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|&v| v > 0.0)
         .unwrap_or(5000.0);
-
     let default_min_runway = env::var("PERENNIA_MIN_RUNWAY_KAS")
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|&v| v >= 0.0)
         .unwrap_or(250.0);
-
     let default_fpps_float = env::var("FPPS_MAX_FLOAT_KAS")
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|&v| v > 0.0)
         .unwrap_or(50.0);
-
     let default_pool_fee = env::var("POOL_FEE_RATE")
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
@@ -664,8 +794,24 @@ pub async fn ensure_database_schema(pool: &PgPool) -> anyhow::Result<()> {
     .execute(pool)
     .await;
 
+    if let Ok(seed_invite_code) = env::var("MASTER_BETA_INVITE_CODE") {
+        let clean_code = seed_invite_code.trim();
+        if !clean_code.is_empty() {
+            let _ = sqlx::query(
+                r#"
+                INSERT INTO invite_codes (code, is_used)
+                VALUES ($1, FALSE)
+                ON CONFLICT (code) DO NOTHING
+                "#,
+            )
+            .bind(clean_code)
+            .execute(pool)
+            .await;
+        }
+    }
+
     tracing::info!(
-        "✅ PostgreSQL Schema Bootstrapper Verified (System Config, Per-Token Cold Vault Rules, HMAC Invariants & HIFO Tables Ready)."
+        "✅ PostgreSQL Schema Bootstrapper Verified (System Config, 5-State Token Steering Matrix, Security Firewall, Gross-Up Fiat Columns, HMAC Invariants & HIFO Tables Ready)."
     );
     Ok(())
 }

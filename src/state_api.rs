@@ -4,11 +4,9 @@ pub mod silverscript;
 pub mod l1_dispatcher;
 #[path = "forge_queries.rs"]
 pub mod forge_queries;
-
 pub use forge_queries::*;
 pub use l1_dispatcher::*;
 pub use silverscript::*;
-
 use axum::{
     extract::State,
     http::StatusCode,
@@ -18,6 +16,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
 use std::env;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Deserialize)]
 pub struct StateActionRequest {
@@ -40,14 +39,123 @@ fn normalize_wallet_pair(raw: &str) -> (String, String) {
 
 fn compute_silo_fee_tier(staked: f64) -> (f64, &'static str) {
     if staked >= 1_000_000.0 {
-        (0.0025, "SILO Whale Tier (0.25% Fee)")
+        (0.001, "SILO Whale Tier (0.10% Wholesale Floor)")
     } else if staked >= 100_000.0 {
-        (0.005, "SILO Institutional Tier (0.50% Fee)")
+        (0.0025, "SILO Sovereign Tier (0.25% Fee)")
     } else if staked >= 10_000.0 {
         (0.0075, "SILO Staker Tier (0.75% Fee)")
     } else {
-        (0.015, "1.50% Standard Tier")
+        (0.0015, "0.15% Standard Public Tier")
     }
+}
+
+async fn query_wallet_miner_loyalty_telemetry(
+    pool: &PgPool,
+    clean_wallet: &str,
+    prefixed_wallet: &str,
+) -> Value {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let grace_cutoff_ms = now_ms.saturating_sub(crate::telemetry::DISCONNECT_GRACE_WINDOW_MS) as i64;
+    let grace_cutoff_secs = (now_ms / 1000)
+        .saturating_sub(crate::telemetry::DISCONNECT_GRACE_WINDOW_SECS) as i64;
+
+    if let Ok(redis_url) = env::var("REDIS_URL") {
+        if let Ok(client) = redis::Client::open(redis_url) {
+            if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
+                if let Ok(Some(cached_json)) = redis::cmd("GET")
+                    .arg(format!("perennia:miner:loyalty:{}", clean_wallet))
+                    .query_async::<_, Option<String>>(&mut conn)
+                    .await
+                {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&cached_json) {
+                        return parsed;
+                    }
+                }
+            }
+        }
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT status, last_share_ts,
+               COALESCE(streak_started_ts, 0) AS streak_started_ts,
+               COALESCE(effective_fee_rate, 0.01) AS effective_fee_rate
+        FROM worker_profiles
+        WHERE (LOWER(REPLACE(TRIM(wallet_address), 'kaspa:', '')) = $1 OR wallet_address = $2)
+          AND (
+              status IN ('online', 'grace_period')
+              OR (last_share_ts > 10000000000 AND last_share_ts >= $3)
+              OR (last_share_ts > 0 AND last_share_ts <= 10000000000 AND last_share_ts >= $4)
+          )
+        ORDER BY effective_fee_rate ASC, streak_started_ts ASC
+        "#,
+    )
+    .bind(clean_wallet)
+    .bind(prefixed_wallet)
+    .bind(grace_cutoff_ms)
+    .bind(grace_cutoff_secs)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    if rows.is_empty() {
+        return json!({
+            "wallet": prefixed_wallet,
+            "activeMiner": false,
+            "isOnline": false,
+            "inGraceWindow": false,
+            "streakStartedTs": 0,
+            "consecutiveWeeks": 0,
+            "effectivePoolFeeRate": crate::telemetry::BASE_POOL_FEE_RATE,
+            "effectivePoolFeePct": 1.0,
+            "unlockedSwapFeeFloorRate": crate::fiat_rails::STANDARD_PUBLIC_SWAP_FEE_PCT,
+            "unlockedSwapFeeFloorPct": 0.15,
+            "graceWindowSecsRemaining": 0
+        });
+    }
+
+    let best = &rows[0];
+    let status: String = best.try_get("status").unwrap_or_else(|_| "online".to_string());
+    let raw_last_ts: i64 = best.try_get("last_share_ts").unwrap_or(0);
+    let last_ms = if raw_last_ts > 0 && (raw_last_ts as u64) < 10_000_000_000 {
+        (raw_last_ts as u64) * 1000
+    } else {
+        raw_last_ts.max(0) as u64
+    };
+    let raw_streak_ts: i64 = best.try_get("streak_started_ts").unwrap_or(raw_last_ts);
+    let streak_ms = if raw_streak_ts > 0 && (raw_streak_ts as u64) < 10_000_000_000 {
+        (raw_streak_ts as u64) * 1000
+    } else if raw_streak_ts > 0 {
+        raw_streak_ts as u64
+    } else {
+        last_ms
+    };
+
+    let (consecutive_weeks, eff_pool_fee_rate) = crate::telemetry::compute_miner_loyalty_fee_rate(
+        streak_ms,
+        now_ms,
+        crate::telemetry::BASE_POOL_FEE_RATE,
+    );
+    let idle_secs = now_ms.saturating_sub(last_ms) / 1000;
+    let grace_rem = crate::telemetry::DISCONNECT_GRACE_WINDOW_SECS.saturating_sub(idle_secs);
+    let is_online = status == "online" && idle_secs < 60;
+
+    json!({
+        "wallet": prefixed_wallet,
+        "activeMiner": true,
+        "isOnline": is_online,
+        "inGraceWindow": !is_online && grace_rem > 0,
+        "streakStartedTs": streak_ms,
+        "consecutiveWeeks": consecutive_weeks,
+        "effectivePoolFeeRate": eff_pool_fee_rate,
+        "effectivePoolFeePct": (eff_pool_fee_rate * 10000.0).round() / 100.0,
+        "unlockedSwapFeeFloorRate": crate::telemetry::MINER_PERK_SWAP_FEE_FLOOR_RATE,
+        "unlockedSwapFeeFloorPct": 0.10,
+        "graceWindowSecsRemaining": grace_rem
+    })
 }
 
 fn lock_multiplier_for_days(days: i32) -> f64 {
@@ -67,7 +175,6 @@ pub async fn resolve_strict_spot_price(pool: &PgPool, asset_ticker: &str) -> Res
     if clean == "USD" || clean == "USDC" || clean == "USDT" {
         return Ok(1.0);
     }
-
     if let Ok(redis_url) = env::var("REDIS_URL") {
         if let Ok(client) = redis::Client::open(redis_url) {
             if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
@@ -85,7 +192,6 @@ pub async fn resolve_strict_spot_price(pool: &PgPool, asset_ticker: &str) -> Res
             }
         }
     }
-
     if let Ok(Some(row)) = sqlx::query(
         r#"
         SELECT price_usd
@@ -107,7 +213,6 @@ pub async fn resolve_strict_spot_price(pool: &PgPool, asset_ticker: &str) -> Res
             }
         }
     }
-
     if clean == "SILO" {
         if let Ok(kas_spot) = Box::pin(resolve_strict_spot_price(pool, "KAS")).await {
             if kas_spot > 0.0 {
@@ -115,7 +220,6 @@ pub async fn resolve_strict_spot_price(pool: &PgPool, asset_ticker: &str) -> Res
             }
         }
     }
-
     Err(format!(
         "ORACLE_HALT: Live oracle spot price for {} is offline. Failing closed (503).",
         clean
@@ -133,7 +237,6 @@ pub async fn debit_user_token_balance(
         return Err("Debit amount must be greater than 0.".to_string());
     }
     let clean_ticker = ticker.trim().to_uppercase();
-
     if clean_ticker == "KAS" {
         if crate::chronos::upsert_signed_yield_reservoir_kas(
             pool,
@@ -171,7 +274,6 @@ pub async fn debit_user_token_balance(
             return Ok(());
         }
     }
-
     if let Ok(redis_url) = env::var("REDIS_URL") {
         if let Ok(client) = redis::Client::open(redis_url) {
             if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
@@ -198,7 +300,6 @@ pub async fn debit_user_token_balance(
             }
         }
     }
-
     let row_opt = sqlx::query(
         r#"
         SELECT wallet_address, streaming_balance_kas, total_yield_kas,
@@ -214,25 +315,21 @@ pub async fn debit_user_token_balance(
     .fetch_optional(pool)
     .await
     .map_err(|e| format!("DB lookup failed: {}", e))?;
-
     let Some(row) = row_opt else {
         return Err(format!(
             "INSUFFICIENT_BALANCE: 0.0000 {} available for {}.",
             clean_ticker, prefixed_wallet
         ));
     };
-
     if row.try_get::<bool, _>("quarantined").unwrap_or(false) {
         return Err(format!("Wallet {} is quarantined.", prefixed_wallet));
     }
-
     let streaming_kas: f64 = row.try_get("streaming_balance_kas").unwrap_or(0.0);
     let total_yield_kas: f64 = row.try_get("total_yield_kas").unwrap_or(0.0);
     let mut lp_tokens: Value = row.try_get("lp_tokens").unwrap_or_else(|_| json!({}));
     let target_pk: String = row
         .try_get("wallet_address")
         .unwrap_or_else(|_| prefixed_wallet.to_string());
-
     let cur_tok = lp_tokens
         .get(&clean_ticker)
         .and_then(|v| {
@@ -240,22 +337,18 @@ pub async fn debit_user_token_balance(
                 .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
         })
         .unwrap_or(0.0);
-
     if cur_tok + 1e-8 < amount {
         return Err(format!(
             "INSUFFICIENT_BALANCE: Requested {:.4} {}, available {:.4} {}.",
             amount, clean_ticker, cur_tok, clean_ticker
         ));
     }
-
     let next_tok = (cur_tok - amount).max(0.0);
     if let Some(obj) = lp_tokens.as_object_mut() {
         obj.insert(clean_ticker.clone(), json!(next_tok));
     }
-
     let new_hmac =
         crate::chronos::compute_reservoir_hmac(prefixed_wallet, streaming_kas, total_yield_kas, &lp_tokens)?;
-
     sqlx::query(
         r#"
         UPDATE yield_reservoirs
@@ -271,7 +364,6 @@ pub async fn debit_user_token_balance(
     .execute(pool)
     .await
     .map_err(|e| format!("Failed to update token reservoir balance: {}", e))?;
-
     Ok(())
 }
 
@@ -287,7 +379,6 @@ pub async fn credit_user_token_balance(
         return Ok(());
     }
     let clean_ticker = ticker.trim().to_uppercase();
-
     if clean_ticker == "KAS" {
         let yield_add = if is_verified_yield { amount } else { 0.0 };
         crate::chronos::upsert_signed_yield_reservoir_kas(
@@ -313,7 +404,6 @@ pub async fn credit_user_token_balance(
         .fetch_optional(pool)
         .await
         .map_err(|e| format!("DB lookup failed: {}", e))?;
-
         let (streaming_kas, total_yield_kas, mut lp_tokens, target_pk) =
             if let Some(r) = existing_opt {
                 (
@@ -327,7 +417,6 @@ pub async fn credit_user_token_balance(
             } else {
                 (0.0, 0.0, json!({}), prefixed_wallet.to_string())
             };
-
         let cur_tok = lp_tokens
             .get(&clean_ticker)
             .and_then(|v| {
@@ -340,14 +429,12 @@ pub async fn credit_user_token_balance(
         } else {
             lp_tokens = json!({ clean_ticker.clone(): cur_tok + amount });
         }
-
         let new_hmac = crate::chronos::compute_reservoir_hmac(
             prefixed_wallet,
             streaming_kas,
             total_yield_kas,
             &lp_tokens,
         )?;
-
         sqlx::query(
             r#"
             INSERT INTO yield_reservoirs (
@@ -369,7 +456,6 @@ pub async fn credit_user_token_balance(
         .await
         .map_err(|e| format!("Failed to credit token reservoir: {}", e))?;
     }
-
     if let Ok(redis_url) = env::var("REDIS_URL") {
         if let Ok(client) = redis::Client::open(redis_url) {
             if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
@@ -383,7 +469,6 @@ pub async fn credit_user_token_balance(
             }
         }
     }
-
     Ok(())
 }
 
@@ -391,7 +476,6 @@ pub async fn build_live_node_airlock_telemetry(pool: &PgPool) -> Value {
     let sys_cfg = crate::chronos::load_system_treasury_config(pool).await;
     let hot_signer_address = crate::chronos::resolve_hot_dispatcher_address()
         .unwrap_or_else(|| sys_cfg.cold_kas_address.clone());
-
     let hot_balance_kas = if !hot_signer_address.trim().is_empty() {
         match crate::kaspad_client::get_balance_by_address_grpc(&hot_signer_address).await {
             Ok(sompi) => (sompi as f64) / 100_000_000.0,
@@ -400,7 +484,6 @@ pub async fn build_live_node_airlock_telemetry(pool: &PgPool) -> Value {
     } else {
         0.0
     };
-
     let trailing_24h_outflow_kas: f64 = sqlx::query_scalar(
         r#"
         SELECT COALESCE(SUM(amount_tokens), 0.0)
@@ -413,7 +496,6 @@ pub async fn build_live_node_airlock_telemetry(pool: &PgPool) -> Value {
     .fetch_one(pool)
     .await
     .unwrap_or(0.0);
-
     let hourly_burn_kas = (trailing_24h_outflow_kas / 24.0).max(0.0);
     let runway_hours_remaining = if hourly_burn_kas > 0.01 {
         ((hot_balance_kas / hourly_burn_kas) * 10.0).round() / 10.0
@@ -422,12 +504,10 @@ pub async fn build_live_node_airlock_telemetry(pool: &PgPool) -> Value {
     } else {
         0.0
     };
-
     let low_runway_tripped = sys_cfg.outflow_breaker_tripped
         || (sys_cfg.min_runway_kas > 0.0
             && hot_balance_kas > 0.0
             && hot_balance_kas < sys_cfg.min_runway_kas);
-
     let last_sweep_txid: Option<String> = sqlx::query_scalar(
         r#"
         SELECT tx_id
@@ -440,7 +520,6 @@ pub async fn build_live_node_airlock_telemetry(pool: &PgPool) -> Value {
     .await
     .ok()
     .flatten();
-
     let status = if sys_cfg.outflow_breaker_tripped {
         "PAUSED_BY_DIRECTOR"
     } else if low_runway_tripped {
@@ -448,7 +527,6 @@ pub async fn build_live_node_airlock_telemetry(pool: &PgPool) -> Value {
     } else {
         "ARMED_NOMINAL"
     };
-
     json!({
         "hotSignerAddress": hot_signer_address,
         "coldVaultAddress": sys_cfg.cold_kas_address,
@@ -479,7 +557,6 @@ pub async fn handle_state_action(
     let (clean_wallet, wallet) = normalize_wallet_pair(raw_wallet);
     let action = req.action.trim().to_uppercase();
     let payload = &req.payload;
-
     match action.as_str() {
         "GET_STATE" => {
             let row_opt = sqlx::query(
@@ -497,6 +574,27 @@ pub async fn handle_state_action(
             (
                 StatusCode::OK,
                 Json(json!({ "success": true, "data": state_json })),
+            )
+        }
+        "GET_MINER_LOYALTY" => {
+            let loyalty =
+                query_wallet_miner_loyalty_telemetry(&pool, &clean_wallet, &wallet).await;
+            (
+                StatusCode::OK,
+                Json(json!({ "success": true, "data": loyalty })),
+            )
+        }
+        "GET_LIVE_BUCKET_THRESHOLDS" => {
+            let kas_spot = crate::fiat_rails::resolve_live_spot_price(&pool, "KAS")
+                .await
+                .unwrap_or(0.15);
+            let epoch_state =
+                crate::chronos::publish_live_epoch_bucket_telemetry(&pool, kas_spot)
+                    .await
+                    .unwrap_or_else(|_| json!({}));
+            (
+                StatusCode::OK,
+                Json(json!({ "success": true, "data": epoch_state })),
             )
         }
         "SYNC_LAYOUT"
@@ -523,7 +621,6 @@ pub async fn handle_state_action(
             let mut layout = existing_opt
                 .and_then(|r| r.try_get::<Value, _>("layout_state").ok())
                 .unwrap_or_else(|| json!({ "workers": [], "sectors": [], "customTokens": [] }));
-
             if action == "SYNC_LAYOUT" {
                 layout = payload.clone();
             } else if action == "ADD_WORKER" {
@@ -646,7 +743,6 @@ pub async fn handle_state_action(
                     });
                 }
             }
-
             let _ = sqlx::query(
                 r#"
                 INSERT INTO user_command_centers (wallet_address, layout_state, last_updated)
@@ -660,6 +756,13 @@ pub async fn handle_state_action(
             .bind(&layout)
             .execute(&pool)
             .await;
+
+            if action.contains("SECTOR") || action == "UPDATE_SETTLEMENT" {
+                let pool_bg = pool.clone();
+                tokio::spawn(async move {
+                    let _ = crate::chronos::publish_live_epoch_bucket_telemetry(&pool_bg, 0.0).await;
+                });
+            }
 
             (
                 StatusCode::OK,
@@ -678,7 +781,6 @@ pub async fn handle_state_action(
                 .unwrap_or("")
                 .trim()
                 .to_uppercase();
-
             let row_opt = sqlx::query(
                 "SELECT wallet_address, layout_state FROM user_command_centers WHERE wallet_address = $1 OR wallet_address = $2 LIMIT 1",
             )
@@ -688,9 +790,7 @@ pub async fn handle_state_action(
             .await
             .ok()
             .flatten();
-
             let mut verified_claimed_kas = 0.0_f64;
-
             if let Some(row) = row_opt {
                 let db_pk: String = row
                     .try_get("wallet_address")
@@ -698,7 +798,6 @@ pub async fn handle_state_action(
                 let mut layout: Value = row
                     .try_get("layout_state")
                     .unwrap_or_else(|_| json!({ "workers": [], "sectors": [] }));
-
                 if let Some(sectors) = layout.get_mut("sectors").and_then(|v| v.as_array_mut()) {
                     for sec in sectors.iter_mut() {
                         let pending = sec
@@ -717,17 +816,14 @@ pub async fn handle_state_action(
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_uppercase();
-
                         let matched = (!target_sector_id.is_empty() && sec_id == target_sector_id)
                             || (!target_asset.is_empty() && sec_ticker == target_asset);
-
                         if matched {
                             verified_claimed_kas += pending;
                             sec["pendingKaspa"] = json!(0.0);
                         }
                     }
                 }
-
                 if verified_claimed_kas > 0.0 {
                     let _ = sqlx::query(
                         "UPDATE user_command_centers SET layout_state = $2, last_updated = CURRENT_TIMESTAMP WHERE wallet_address = $1",
@@ -736,7 +832,6 @@ pub async fn handle_state_action(
                     .bind(&layout)
                     .execute(&pool)
                     .await;
-
                     if let Err(e) = credit_user_token_balance(
                         &pool,
                         &clean_wallet,
@@ -752,9 +847,13 @@ pub async fn handle_state_action(
                             Json(json!({ "success": false, "error": e })),
                         );
                     }
+                    let pool_bg = pool.clone();
+                    tokio::spawn(async move {
+                        let _ =
+                            crate::chronos::publish_live_epoch_bucket_telemetry(&pool_bg, 0.0).await;
+                    });
                 }
             }
-
             (
                 StatusCode::OK,
                 Json(json!({
@@ -780,14 +879,12 @@ pub async fn handle_state_action(
                 .get("lockDurationDays")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0) as i32;
-
             if amount_a <= 0.0 || amount_b <= 0.0 {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(json!({ "success": false, "error": "LP stake amounts must be > 0." })),
                 );
             }
-
             if let Err(e) =
                 debit_user_token_balance(&pool, &clean_wallet, &wallet, "KAS", amount_a).await
             {
@@ -796,7 +893,6 @@ pub async fn handle_state_action(
                     Json(json!({ "success": false, "error": e })),
                 );
             }
-
             let weights_json = payload
                 .get("weights")
                 .cloned()
@@ -805,7 +901,6 @@ pub async fn handle_state_action(
                 .get("reserves")
                 .cloned()
                 .unwrap_or_else(|| json!({ "KAS": amount_a, "USDC": amount_b }));
-
             let res = sqlx::query(
                 r#"
                 INSERT INTO liquidity_providers (
@@ -828,7 +923,6 @@ pub async fn handle_state_action(
             .bind(lock_days)
             .fetch_one(&pool)
             .await;
-
             match res {
                 Ok(row) => {
                     let lp_id: String = row.try_get("lp_id").unwrap_or_default();
@@ -880,7 +974,6 @@ pub async fn handle_state_action(
             .fetch_all(&pool)
             .await
             .unwrap_or_default();
-
             let list: Vec<Value> = rows
                 .into_iter()
                 .map(|r| {
@@ -938,14 +1031,12 @@ pub async fn handle_state_action(
             .await
             .ok()
             .flatten();
-
             let Some(row) = row_opt else {
                 return (
                     StatusCode::NOT_FOUND,
                     Json(json!({ "success": false, "error": "LP position not found." })),
                 );
             };
-
             let is_unlocked: bool = row.try_get("is_unlocked").unwrap_or(false);
             if !is_unlocked {
                 return (
@@ -953,7 +1044,6 @@ pub async fn handle_state_action(
                     Json(json!({ "success": false, "error": "LP position timelock is still active." })),
                 );
             }
-
             let amt_a: f64 = row.try_get("staked_asset_a").unwrap_or(0.0);
             let amt_b: f64 = row.try_get("staked_asset_b").unwrap_or(0.0);
             let pair: String = row
@@ -961,7 +1051,6 @@ pub async fn handle_state_action(
                 .unwrap_or_else(|_| "KAS/USDC".to_string());
             let parts: Vec<&str> = pair.split('/').collect();
             let token_b = parts.get(1).copied().unwrap_or("USDC");
-
             let _ = sqlx::query(
                 "DELETE FROM liquidity_providers WHERE lp_id::text = $1 AND (wallet_address = $2 OR wallet_address = $3)",
             )
@@ -970,7 +1059,6 @@ pub async fn handle_state_action(
             .bind(&clean_wallet)
             .execute(&pool)
             .await;
-
             if amt_a > 0.0 {
                 let _ =
                     credit_user_token_balance(&pool, &clean_wallet, &wallet, "KAS", amt_a, false)
@@ -987,7 +1075,6 @@ pub async fn handle_state_action(
                 )
                 .await;
             }
-
             (
                 StatusCode::OK,
                 Json(json!({ "success": true, "data": { "withdrawnLpId": lp_id } })),
@@ -1010,7 +1097,6 @@ pub async fn handle_state_action(
                     Json(json!({ "success": false, "error": "Stake amount must be > 0" })),
                 );
             }
-
             if let Err(e) =
                 debit_user_token_balance(&pool, &clean_wallet, &wallet, &ticker, amount).await
             {
@@ -1019,7 +1105,6 @@ pub async fn handle_state_action(
                     Json(json!({ "success": false, "error": e })),
                 );
             }
-
             let row_res = sqlx::query(
                 r#"
                 INSERT INTO silo_staking_positions (wallet_address, token_ticker, amount_staked, status)
@@ -1032,7 +1117,6 @@ pub async fn handle_state_action(
             .bind(amount)
             .fetch_one(&pool)
             .await;
-
             match row_res {
                 Ok(r) => {
                     let stake_id: String = r.try_get("stake_id").unwrap_or_default();
@@ -1122,14 +1206,12 @@ pub async fn handle_state_action(
             .await
             .ok()
             .flatten();
-
             let Some(row) = row_opt else {
                 return (
                     StatusCode::NOT_FOUND,
                     Json(json!({ "success": false, "error": "Staking position not found." })),
                 );
             };
-
             let is_matured: bool = row.try_get("is_matured").unwrap_or(false);
             if !is_matured {
                 return (
@@ -1137,12 +1219,10 @@ pub async fn handle_state_action(
                     Json(json!({ "success": false, "error": "7-day unbonding cooldown is still active." })),
                 );
             }
-
             let ticker: String = row
                 .try_get("token_ticker")
                 .unwrap_or_else(|_| "SILO".to_string());
             let amt: f64 = row.try_get("amount_staked").unwrap_or(0.0);
-
             let _ = sqlx::query(
                 "DELETE FROM silo_staking_positions WHERE stake_id::text = $1 AND (wallet_address = $2 OR wallet_address = $3)",
             )
@@ -1151,7 +1231,6 @@ pub async fn handle_state_action(
             .bind(&clean_wallet)
             .execute(&pool)
             .await;
-
             if amt > 0.0 {
                 let _ = credit_user_token_balance(
                     &pool,
@@ -1163,7 +1242,6 @@ pub async fn handle_state_action(
                 )
                 .await;
             }
-
             (
                 StatusCode::OK,
                 Json(json!({ "success": true, "data": { "claimedStakeId": stake_id, "claimedAmount": amt } })),
@@ -1209,7 +1287,30 @@ pub async fn handle_state_action(
                     "isMatured": r.try_get::<bool, _>("is_matured").unwrap_or(false)
                 }));
             }
-            let (fee_cap, tier_label) = compute_silo_fee_tier(active_staked);
+            let (silo_fee_cap, silo_tier_label) = compute_silo_fee_tier(active_staked);
+            let miner_loyalty =
+                query_wallet_miner_loyalty_telemetry(&pool, &clean_wallet, &wallet).await;
+            let is_active_miner = miner_loyalty
+                .get("activeMiner")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let (wallet_floor_rate, wallet_floor_label, has_wholesale_perk) =
+                crate::fiat_rails::resolve_wallet_swap_fee_floor_pct(&pool, &wallet).await;
+
+            let (effective_fee_cap, effective_tier_label) =
+                if is_active_miner || has_wholesale_perk {
+                    (
+                        wallet_floor_rate.min(silo_fee_cap),
+                        if is_active_miner {
+                            "0.10% Active Stratum Miner Wholesale Floor"
+                        } else {
+                            wallet_floor_label
+                        },
+                    )
+                } else {
+                    (silo_fee_cap, silo_tier_label)
+                };
+
             (
                 StatusCode::OK,
                 Json(json!({
@@ -1219,8 +1320,9 @@ pub async fn handle_state_action(
                         "activeStaked": active_staked,
                         "cooldownStaked": cooldown_staked,
                         "combinedEligibleStaked": active_staked,
-                        "feeRateCap": fee_cap,
-                        "tierLabel": tier_label,
+                        "feeRateCap": effective_fee_cap,
+                        "tierLabel": effective_tier_label,
+                        "minerLoyalty": miner_loyalty,
                         "positions": positions
                     }
                 })),
@@ -1289,7 +1391,6 @@ pub async fn handle_state_action(
             .fetch_all(&pool)
             .await
             .unwrap_or_default();
-
             let mut rules_map = serde_json::Map::new();
             let mut rules_list = Vec::with_capacity(rows.len());
             for r in rows {
@@ -1312,10 +1413,8 @@ pub async fn handle_state_action(
                 rules_map.insert(ticker, entry.clone());
                 rules_list.push(entry);
             }
-
             let kas_rule = rules_map.get("KAS").cloned().unwrap_or(Value::Null);
             let node_airlock = build_live_node_airlock_telemetry(&pool).await;
-
             (
                 StatusCode::OK,
                 Json(json!({
@@ -1370,7 +1469,6 @@ pub async fn handle_state_action(
                     })),
                 );
             }
-
             let vault_label = payload
                 .get("vaultLabel")
                 .or_else(|| payload.get("cardLabel"))
@@ -1388,7 +1486,6 @@ pub async fn handle_state_action(
                 .get("autoSweepEnabled")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
-
             let res = sqlx::query(
                 r#"
                 INSERT INTO user_cold_vault_rules (
@@ -1413,7 +1510,6 @@ pub async fn handle_state_action(
             .bind(auto_sweep_enabled)
             .execute(&pool)
             .await;
-
             if ticker == "KAS" {
                 let _ = sqlx::query(
                     r#"
@@ -1437,7 +1533,6 @@ pub async fn handle_state_action(
                 .execute(&pool)
                 .await;
             }
-
             match res {
                 Ok(_) => (
                     StatusCode::OK,
@@ -1494,14 +1589,12 @@ pub async fn handle_state_action(
                 .or_else(|| payload.get("amountKas"))
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0);
-
             if amount <= 0.0 {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(json!({ "success": false, "error": "Sweep amount must be greater than 0." })),
                 );
             }
-
             let mut cold_dest = payload
                 .get("coldDestinationAddress")
                 .or_else(|| payload.get("coldKaspaAddress"))
@@ -1509,7 +1602,6 @@ pub async fn handle_state_action(
                 .unwrap_or("")
                 .trim()
                 .to_string();
-
             if cold_dest.is_empty() {
                 cold_dest = sqlx::query_scalar(
                     "SELECT cold_destination_address FROM user_cold_vault_rules WHERE (wallet_address = $1 OR wallet_address = $2) AND asset_ticker = $3 LIMIT 1",
@@ -1523,7 +1615,6 @@ pub async fn handle_state_action(
                 .flatten()
                 .unwrap_or_default();
             }
-
             if cold_dest.is_empty() {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -1533,7 +1624,6 @@ pub async fn handle_state_action(
                     })),
                 );
             }
-
             let spot_price = match resolve_strict_spot_price(&pool, &ticker).await {
                 Ok(p) => p,
                 Err(e) => {
@@ -1543,7 +1633,6 @@ pub async fn handle_state_action(
                     );
                 }
             };
-
             if let Err(e) =
                 debit_user_token_balance(&pool, &clean_wallet, &wallet, &ticker, amount).await
             {
@@ -1552,7 +1641,6 @@ pub async fn handle_state_action(
                     Json(json!({ "success": false, "error": e })),
                 );
             }
-
             let network = resolve_network_for_asset(&ticker);
             match dispatch_or_queue_l1_payout(
                 &pool,
@@ -1589,7 +1677,6 @@ pub async fn handle_state_action(
                     .bind(&ticker)
                     .execute(&pool)
                     .await;
-
                     let _ = sqlx::query(
                         r#"
                         INSERT INTO treasury_airlock_sweeps (
@@ -1604,7 +1691,6 @@ pub async fn handle_state_action(
                     .bind(&tx_hash)
                     .execute(&pool)
                     .await;
-
                     (
                         StatusCode::OK,
                         Json(json!({
@@ -1650,14 +1736,12 @@ pub async fn handle_state_action(
                 .or_else(|| payload.get("amountTokens"))
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0);
-
             if amt <= 0.0 {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(json!({ "success": false, "error": "Withdrawal amount must be > 0." })),
                 );
             }
-
             let spot = match resolve_strict_spot_price(&pool, &ticker).await {
                 Ok(p) => p,
                 Err(e) => {
@@ -1667,7 +1751,6 @@ pub async fn handle_state_action(
                     );
                 }
             };
-
             if let Err(e) =
                 debit_user_token_balance(&pool, &clean_wallet, &wallet, &ticker, amt).await
             {
@@ -1676,7 +1759,6 @@ pub async fn handle_state_action(
                     Json(json!({ "success": false, "error": e })),
                 );
             }
-
             match dispatch_or_queue_l1_payout(
                 &pool,
                 &wallet,
@@ -1739,14 +1821,12 @@ pub async fn handle_state_action(
                 .or_else(|| payload.get("amountTokens"))
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0);
-
             if dest.is_empty() || amt <= 0.0 {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(json!({ "success": false, "error": "Invalid destination or amount for DISPATCH_OTC_UTXOS." })),
                 );
             }
-
             let spot = match resolve_strict_spot_price(&pool, &ticker).await {
                 Ok(p) => p,
                 Err(e) => {
@@ -1756,7 +1836,6 @@ pub async fn handle_state_action(
                     );
                 }
             };
-
             match dispatch_or_queue_l1_payout(
                 &pool,
                 "kaspa:treasury_master",

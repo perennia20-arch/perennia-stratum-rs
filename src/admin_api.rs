@@ -47,6 +47,12 @@ struct FiatAdminReq {
     batchTracePrefix: Option<String>,
     settlementTarget: Option<String>,
     txHash: Option<String>,
+    ticker: Option<String>,
+    steeringState: Option<String>,
+    targetWeightPct: Option<f64>,
+    subsystem: Option<String>,
+    paused: Option<bool>,
+    enabled: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -154,6 +160,8 @@ async fn get_table_data(
 ) -> Result<Json<Vec<Value>>, (StatusCode, Json<Value>)> {
     verify_internal_admin_headers(&headers)?;
     let allowed_tables = vec![
+        "system_treasury_config",
+        "user_cold_vault_rules",
         "worker_profiles",
         "yield_reservoirs",
         "micro_shares",
@@ -170,6 +178,8 @@ async fn get_table_data(
         "fiat_payout_queue",
         "fiat_bank_rails",
         "fiat_onramp_orders",
+        "fiat_float_ledger",
+        "fiat_post_trade_sweeps",
         "l1_payout_queue",
         "rwa_oracle_feeds",
         "forge_vesting_schedules",
@@ -180,6 +190,11 @@ async fn get_table_data(
         "treasury_airlock_sweeps",
         "hifo_tax_lots",
         "hifo_disposal_matches",
+        "token_steering_matrix",
+        "security_firewall_blacklist",
+        "director_audit_log",
+        "corporate_expense_vouchers",
+        "corporate_owner_draws",
     ];
     if !allowed_tables.contains(&table.as_str()) {
         return Err((
@@ -217,7 +232,8 @@ async fn get_shield_status(
         let banned_at = *entry.value();
         let elapsed = banned_at.elapsed();
         if elapsed < Duration::from_secs(crate::stratum_tcp::BAN_DURATION_SECS) {
-            let remaining_secs = crate::stratum_tcp::BAN_DURATION_SECS.saturating_sub(elapsed.as_secs());
+            let remaining_secs =
+                crate::stratum_tcp::BAN_DURATION_SECS.saturating_sub(elapsed.as_secs());
             banned.push(json!({
                 "ip": ip,
                 "elapsedSeconds": elapsed.as_secs(),
@@ -231,7 +247,6 @@ async fn get_shield_status(
         crate::stratum_tcp::BANNED_IPS.remove(&ip);
         crate::stratum_tcp::STRIKE_COUNTERS.remove(&ip);
     }
-
     let mut active_strikes = Vec::new();
     for entry in crate::stratum_tcp::STRIKE_COUNTERS.iter() {
         active_strikes.push(json!({
@@ -240,7 +255,6 @@ async fn get_shield_status(
             "maxStrikes": crate::stratum_tcp::MAX_CONSECUTIVE_STRIKES
         }));
     }
-
     Ok(Json(json!({
         "bannedIps": banned,
         "count": banned.len(),
@@ -251,6 +265,7 @@ async fn get_shield_status(
 
 async fn modify_shield_ip(
     headers: HeaderMap,
+    State(pool): State<PgPool>,
     Json(req): Json<ShieldActionReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     verify_internal_admin_headers(&headers)?;
@@ -265,6 +280,12 @@ async fn modify_shield_ip(
     if action == "UNBAN" || action == "REMOVE" {
         crate::stratum_tcp::BANNED_IPS.remove(&clean_ip);
         crate::stratum_tcp::STRIKE_COUNTERS.remove(&clean_ip);
+        let _ = sqlx::query(
+            "UPDATE security_firewall_blacklist SET active = FALSE, updated_at = CURRENT_TIMESTAMP WHERE LOWER(target_value) = LOWER($1)",
+        )
+        .bind(&clean_ip)
+        .execute(&pool)
+        .await;
         Ok(Json(json!({
             "success": true,
             "action": "UNBANNED",
@@ -273,6 +294,16 @@ async fn modify_shield_ip(
     } else {
         crate::stratum_tcp::BANNED_IPS.insert(clean_ip.clone(), Instant::now());
         crate::stratum_tcp::STRIKE_COUNTERS.remove(&clean_ip);
+        let _ = sqlx::query(
+            r#"
+            INSERT INTO security_firewall_blacklist (entity_type, target_value, reason, active, added_by)
+            VALUES ('IP', $1, 'Director Stratum Shield Ban', TRUE, 'DIRECTOR')
+            ON CONFLICT (target_value) DO UPDATE SET active = TRUE, updated_at = CURRENT_TIMESTAMP
+            "#,
+        )
+        .bind(&clean_ip)
+        .execute(&pool)
+        .await;
         Ok(Json(json!({
             "success": true,
             "action": "BANNED",
@@ -417,7 +448,8 @@ async fn handle_l1_payout_action(
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("0x{}", uuid::Uuid::new_v4().simple()));
-        let explorer_url = crate::state_api::build_explorer_tx_url(&asset_ticker, &resolved_tx_hash);
+        let explorer_url =
+            crate::state_api::build_explorer_tx_url(&asset_ticker, &resolved_tx_hash);
         let _ = sqlx::query(
             "UPDATE l1_payout_queue SET status = 'DISPATCHED_ONCHAIN', tx_hash = $2, explorer_url = $3, updated_at = CURRENT_TIMESTAMP WHERE payout_id = $1",
         )
@@ -705,7 +737,7 @@ async fn handle_passthrough_action(
         } else {
             live_kas_spot
         };
-        crate::sor::record_hifo_acquisition_lot(
+        let _ = crate::sor::record_hifo_acquisition_lot(
             &pool,
             &clean_wallet,
             &target_asset,
@@ -777,7 +809,11 @@ async fn handle_passthrough_action(
                 .query_async(&mut redis_conn)
                 .await;
         }
-        let refund_kas_spot = if live_kas_spot > 0.0 { live_kas_spot } else { spot_price };
+        let refund_kas_spot = if live_kas_spot > 0.0 {
+            live_kas_spot
+        } else {
+            spot_price
+        };
         let _ = sqlx::query(
             "INSERT INTO tax_ledger_events (wallet_address, asset_ticker, event_type, gross_proceeds_usd, amount_tokens, spot_price_at_execution)
              VALUES ($1, 'KAS', 'PASSTHROUGH_REFUND', $2, $3, $4)",
@@ -841,6 +877,98 @@ async fn handle_fiat_action(
                 Json(json!({"error": e.to_string()})),
             )
         })?;
+
+    if mode == "SET_TOKEN_STEERING_STATE" || mode == "UPSERT_STEERING_TOKEN" {
+        let ticker = req
+            .ticker
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_uppercase();
+        let next_state = req
+            .steeringState
+            .as_deref()
+            .unwrap_or("AUTO_BALANCE")
+            .trim()
+            .to_uppercase();
+        if ticker.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "ticker is required for SET_TOKEN_STEERING_STATE"})),
+            ));
+        }
+        let is_whitelisted = next_state == "AUTO_BALANCE"
+            || next_state == "ACCUMULATE"
+            || next_state == "FREEZE";
+        let target_weight = req.targetWeightPct.unwrap_or(5.0).clamp(0.0, 100.0);
+        let _ = sqlx::query(
+            r#"
+            INSERT INTO token_steering_matrix (ticker, asset_name, steering_state, is_whitelisted, target_weight_pct, updated_at)
+            VALUES ($1, $1, $2, $3, $4, CURRENT_TIMESTAMP)
+            ON CONFLICT (ticker) DO UPDATE SET
+                steering_state = EXCLUDED.steering_state,
+                is_whitelisted = EXCLUDED.is_whitelisted,
+                target_weight_pct = EXCLUDED.target_weight_pct,
+                updated_at = CURRENT_TIMESTAMP
+            "#,
+        )
+        .bind(&ticker)
+        .bind(&next_state)
+        .bind(is_whitelisted)
+        .bind(target_weight)
+        .execute(&pool)
+        .await;
+        let _: redis::RedisResult<()> = redis::cmd("HSET")
+            .arg("perennia:steering:token_states")
+            .arg(&ticker)
+            .arg(&next_state)
+            .query_async(&mut redis_conn)
+            .await;
+        return Ok(Json(json!({
+            "success": true,
+            "action": "SET_TOKEN_STEERING_STATE",
+            "ticker": ticker,
+            "steeringState": next_state,
+            "isWhitelisted": is_whitelisted
+        })));
+    }
+
+    if mode == "TOGGLE_MAINTENANCE_GRACE_SHIELD" {
+        let next_enabled = req.enabled.unwrap_or(true);
+        let _: redis::RedisResult<()> = redis::cmd("SET")
+            .arg("perennia:stratum:maintenance_grace_shield")
+            .arg(if next_enabled { "1" } else { "0" })
+            .query_async(&mut redis_conn)
+            .await;
+        return Ok(Json(json!({
+            "success": true,
+            "action": "TOGGLE_MAINTENANCE_GRACE_SHIELD",
+            "maintenanceGraceShield": next_enabled
+        })));
+    }
+
+    if mode == "TOGGLE_SUBSYSTEM_KILLSWITCH" {
+        let sub = req
+            .subsystem
+            .as_deref()
+            .unwrap_or("fiat_onramp")
+            .trim()
+            .to_lowercase();
+        let paused = req.paused.unwrap_or(true);
+        let key = format!("perennia:killswitch:{}", sub);
+        let _: redis::RedisResult<()> = redis::cmd("SET")
+            .arg(&key)
+            .arg(if paused { "1" } else { "0" })
+            .query_async(&mut redis_conn)
+            .await;
+        return Ok(Json(json!({
+            "success": true,
+            "action": "TOGGLE_SUBSYSTEM_KILLSWITCH",
+            "subsystem": sub,
+            "paused": paused
+        })));
+    }
+
     if mode == "BULK_SETTLE_FIAT_PAYOUTS" {
         let prefix = req
             .batchTracePrefix
@@ -854,7 +982,7 @@ async fn handle_fiat_action(
                 format!("ACH-BATCH-{}-{}", date_str, short_hex)
             });
         let pending_rows = sqlx::query(
-            "SELECT payout_id, wallet_address, net_fiat_usd FROM fiat_payout_queue WHERE status = 'QUEUED_FOR_TREASURY_DISPATCH' ORDER BY created_at ASC"
+            "SELECT payout_id, wallet_address, net_fiat_usd FROM fiat_payout_queue WHERE status = 'QUEUED_FOR_TREASURY_DISPATCH' ORDER BY created_at ASC",
         )
         .fetch_all(&pool)
         .await
@@ -872,7 +1000,7 @@ async fn handle_fiat_action(
             let net_usd: f64 = r.try_get("net_fiat_usd").unwrap_or(0.0);
             let trace_id = format!("{}-{:03}", prefix, idx + 1);
             let res = sqlx::query(
-                "UPDATE fiat_payout_queue SET status = 'DISPATCHED_BY_DIRECTOR', trace_id = $2, updated_at = CURRENT_TIMESTAMP WHERE payout_id = $1 AND status = 'QUEUED_FOR_TREASURY_DISPATCH'"
+                "UPDATE fiat_payout_queue SET status = 'DISPATCHED_BY_DIRECTOR', trace_id = $2, updated_at = CURRENT_TIMESTAMP WHERE payout_id = $1 AND status = 'QUEUED_FOR_TREASURY_DISPATCH'",
             )
             .bind(&pid)
             .bind(&trace_id)
@@ -906,6 +1034,7 @@ async fn handle_fiat_action(
             "batchTracePrefix": prefix
         })));
     }
+
     if mode == "SETTLE_FIAT_PAYOUT" {
         let payout_id = req.payoutId.as_deref().unwrap_or("").trim().to_string();
         if payout_id.is_empty() {
@@ -970,6 +1099,7 @@ async fn handle_fiat_action(
             "status": "DISPATCHED_BY_DIRECTOR"
         })));
     }
+
     if mode == "REFUND_FIAT_PAYOUT" {
         let payout_id = req.payoutId.as_deref().unwrap_or("").trim().to_string();
         if payout_id.is_empty() {
@@ -1088,7 +1218,13 @@ async fn handle_fiat_action(
             "refundedAmount": amount_crypto
         })));
     }
-    if mode == "FULFILL_FIAT_ONRAMP" || mode == "CANCEL_FIAT_ONRAMP" {
+
+    if mode == "FULFILL_FIAT_ONRAMP"
+        || mode == "CONFIRM_INSTITUTIONAL_WIRE"
+        || mode == "RELEASE_QUARANTINED_STRIPE_ORDER"
+        || mode == "REFUND_QUARANTINED_STRIPE_ORDER"
+        || mode == "CANCEL_FIAT_ONRAMP"
+    {
         let order_id = req.orderId.as_deref().unwrap_or("").trim().to_string();
         if order_id.is_empty() {
             return Err((
@@ -1097,10 +1233,16 @@ async fn handle_fiat_action(
             ));
         }
         let row_opt = sqlx::query(
-            "SELECT wallet_address, settlement_target, fiat_amount_usd, fee_usd, net_usd_converted, locked_spot_price, estimated_kas, status
-             FROM fiat_onramp_orders
-             WHERE order_id = $1
-             LIMIT 1",
+            r#"
+            SELECT wallet_address, settlement_target, COALESCE(target_asset, 'KAS') AS target_asset,
+                   fiat_amount_usd, fee_usd, net_usd_converted, locked_spot_price, estimated_kas,
+                   COALESCE(quoted_principal_cents, 0) AS quoted_principal_cents,
+                   COALESCE(perennia_fee_cents, 250) AS perennia_fee_cents,
+                   settled_net_cents, status
+            FROM fiat_onramp_orders
+            WHERE order_id = $1
+            LIMIT 1
+            "#,
         )
         .bind(&order_id)
         .fetch_optional(&pool)
@@ -1127,39 +1269,79 @@ async fn handle_fiat_action(
         let wallet_address: String = row.try_get("wallet_address").unwrap_or_default();
         let clean_wallet = wallet_address.trim().to_lowercase().replace("kaspa:", "");
         let prefixed_wallet = format!("kaspa:{}", clean_wallet);
-        if mode == "CANCEL_FIAT_ONRAMP" {
+
+        if mode == "CANCEL_FIAT_ONRAMP" || mode == "REFUND_QUARANTINED_STRIPE_ORDER" {
+            let new_st = if mode == "REFUND_QUARANTINED_STRIPE_ORDER" {
+                "REFUNDED_BY_DIRECTOR"
+            } else {
+                "CANCELLED"
+            };
             let _ = sqlx::query(
-                "UPDATE fiat_onramp_orders SET status = 'CANCELLED', updated_at = CURRENT_TIMESTAMP WHERE order_id = $1",
+                "UPDATE fiat_onramp_orders SET status = $2, updated_at = CURRENT_TIMESTAMP WHERE order_id = $1",
             )
             .bind(&order_id)
+            .bind(new_st)
             .execute(&pool)
             .await;
             return Ok(Json(json!({
                 "success": true,
                 "orderId": order_id,
-                "status": "CANCELLED"
+                "status": new_st
             })));
         }
+
+        let target_asset: String = row
+            .try_get("target_asset")
+            .unwrap_or_else(|_| "KAS".to_string())
+            .to_uppercase();
         let fiat_amount_usd: f64 = row.try_get("fiat_amount_usd").unwrap_or(0.0);
         let fee_usd: f64 = row.try_get("fee_usd").unwrap_or(0.0);
-        let net_usd_converted: f64 = row.try_get("net_usd_converted").unwrap_or(0.0);
+        let raw_net_usd: f64 = row.try_get("net_usd_converted").unwrap_or(0.0);
         let locked_spot_price: f64 = row.try_get("locked_spot_price").unwrap_or(0.0);
+        let quoted_principal_cents: i64 = row.try_get("quoted_principal_cents").unwrap_or(0);
+        let perennia_fee_cents: i64 = row.try_get("perennia_fee_cents").unwrap_or(250).max(250);
+        let settled_net_cents_opt: Option<i64> = row.try_get("settled_net_cents").ok().flatten();
+
+        let net_usd_converted = if let Some(settled_net) = settled_net_cents_opt {
+            let qp = if quoted_principal_cents > 0 {
+                quoted_principal_cents
+            } else {
+                (raw_net_usd * 100.0).round() as i64
+            };
+            let capped = qp.min((settled_net - perennia_fee_cents).max(0));
+            (capped as f64) / 100.0
+        } else {
+            raw_net_usd
+        };
+
+        if net_usd_converted <= 0.0 {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error": "ZERO_LOSS_LOCK: Safe fulfilled principal after locking Perennia fee is $0.00."})),
+            ));
+        }
+
         let live_spot_str: Option<String> = redis::cmd("GET")
-            .arg("oracle:spot:KAS_USDC")
+            .arg(format!("oracle:spot:{}_USDC", target_asset))
             .query_async(&mut redis_conn)
             .await
             .unwrap_or(None);
-        let execution_spot = live_spot_str
-            .and_then(|s| s.parse::<f64>().ok())
-            .filter(|&v| v > 0.0)
-            .unwrap_or(locked_spot_price);
+        let execution_spot = if target_asset == "USDC" || target_asset == "USDT" {
+            1.0
+        } else {
+            live_spot_str
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|&v| v > 0.0)
+                .unwrap_or(locked_spot_price)
+        };
         if execution_spot <= 0.0 {
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "ORACLE_HALT: Live KAS/USDC spot price is unavailable and order has no valid locked spot price."})),
+                Json(json!({"error": format!("ORACLE_HALT: Live {}/USDC spot price is unavailable and order has no valid locked spot price.", target_asset)})),
             ));
         }
-        let delivered_kas = ((net_usd_converted / execution_spot) * 10000.0).round() / 10000.0;
+        let delivered_tokens =
+            ((net_usd_converted / execution_spot) * 10000.0).round() / 10000.0;
         let settlement_target = req
             .settlementTarget
             .clone()
@@ -1173,14 +1355,24 @@ async fn handle_fiat_action(
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
             .unwrap_or_default();
-        if settlement_target == "L1_KAS" {
+        if settlement_target == "L1_KAS" && target_asset == "KAS" {
             let idemp_key = format!(
                 "FIAT-ONRAMP-L1-{}-{}",
                 order_id,
-                SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() / 60
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    / 60
             );
-            let payouts_vec = vec![(prefixed_wallet.clone(), delivered_kas)];
-            match crate::sor::execute_idempotent_mass_physical_settlement(&pool, &idemp_key, &payouts_vec).await {
+            let payouts_vec = vec![(prefixed_wallet.clone(), delivered_tokens)];
+            match crate::sor::execute_idempotent_mass_physical_settlement(
+                &pool,
+                &idemp_key,
+                &payouts_vec,
+            )
+            .await
+            {
                 Ok(tx_id) => {
                     resolved_tx_hash = tx_id;
                 }
@@ -1192,19 +1384,15 @@ async fn handle_fiat_action(
                 }
             }
         } else {
-            let user_ledger_key = format!("dev:sor:treasury:balances:{}", clean_wallet);
-            let _: () = redis::cmd("HINCRBYFLOAT")
-                .arg(&user_ledger_key)
-                .arg("KAS")
-                .arg(delivered_kas)
-                .query_async(&mut redis_conn)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": format!("Failed to credit user ledger: {}", e)})),
-                    )
-                })?;
+            let _ = crate::state_api::credit_user_token_balance(
+                &pool,
+                &clean_wallet,
+                &prefixed_wallet,
+                &target_asset,
+                delivered_tokens,
+                false,
+            )
+            .await;
             if resolved_tx_hash.is_empty() {
                 let hex_str = uuid::Uuid::new_v4().simple().to_string().to_uppercase();
                 resolved_tx_hash = format!("LEDGER-ONRAMP-{}", &hex_str[..10]);
@@ -1212,11 +1400,11 @@ async fn handle_fiat_action(
         }
         sqlx::query(
             "UPDATE fiat_onramp_orders
-             SET status = 'COMPLETED', delivered_kas = $2, tx_hash = $3, settlement_target = $4, updated_at = CURRENT_TIMESTAMP
+             SET status = 'COMPLETED', delivered_kas = $2, estimated_tokens = $2, tx_hash = $3, settlement_target = $4, updated_at = CURRENT_TIMESTAMP
              WHERE order_id = $1",
         )
         .bind(&order_id)
-        .bind(delivered_kas)
+        .bind(delivered_tokens)
         .bind(&resolved_tx_hash)
         .bind(&settlement_target)
         .execute(&pool)
@@ -1227,16 +1415,16 @@ async fn handle_fiat_action(
                 Json(json!({"error": format!("Failed to finalize on-ramp order: {}", e)})),
             )
         })?;
-        let effective_unit_basis = if delivered_kas > 0.0 {
-            fiat_amount_usd / delivered_kas
+        let effective_unit_basis = if delivered_tokens > 0.0 {
+            fiat_amount_usd / delivered_tokens
         } else {
             execution_spot
         };
-        crate::sor::record_hifo_acquisition_lot(
+        let _ = crate::sor::record_hifo_acquisition_lot(
             &pool,
             &clean_wallet,
-            "KAS",
-            delivered_kas,
+            &target_asset,
+            delivered_tokens,
             effective_unit_basis,
             "FIAT_ONRAMP",
             Some(&resolved_tx_hash),
@@ -1244,11 +1432,12 @@ async fn handle_fiat_action(
         .await;
         let _ = sqlx::query(
             "INSERT INTO tax_ledger_events (wallet_address, asset_ticker, event_type, gross_proceeds_usd, amount_tokens, spot_price_at_execution, tx_hash, cost_basis_usd, realized_gain_loss_usd, holding_period)
-             VALUES ($1, 'KAS', 'FIAT_ONRAMP', $2, $3, $4, $5, $2, 0.0, 'SHORT_TERM')",
+             VALUES ($1, $2, 'FIAT_ONRAMP', $3, $4, $5, $6, $3, 0.0, 'SHORT_TERM')",
         )
         .bind(&clean_wallet)
+        .bind(&target_asset)
         .bind(fiat_amount_usd)
-        .bind(delivered_kas)
+        .bind(delivered_tokens)
         .bind(execution_spot)
         .bind(&resolved_tx_hash)
         .execute(&pool)
@@ -1256,11 +1445,11 @@ async fn handle_fiat_action(
         let netting_order = json!({
             "wallet": "kaspa:treasury_onramp_credit",
             "direction": "BUY_KAS",
-            "amount_kas": delivered_kas,
+            "amount_kas": delivered_tokens,
             "spot_price": execution_spot,
             "fee_captured_usd": fee_usd,
             "target_asset": "USD",
-            "estimated_output": delivered_kas
+            "estimated_output": delivered_tokens
         });
         let _: () = redis::cmd("RPUSH")
             .arg("perennia:sor:netting_queue")
@@ -1274,8 +1463,8 @@ async fn handle_fiat_action(
             "status": "COMPLETED",
             "wallet": clean_wallet,
             "sessionId": order_id,
-            "assetTicker": "KAS",
-            "amountTokens": delivered_kas,
+            "assetTicker": target_asset,
+            "amountTokens": delivered_tokens,
             "fiatAmountUsd": fiat_amount_usd,
             "spotPrice": execution_spot,
             "txHash": resolved_tx_hash
@@ -1290,10 +1479,13 @@ async fn handle_fiat_action(
             "success": true,
             "orderId": order_id,
             "status": "COMPLETED",
-            "deliveredKas": delivered_kas,
+            "deliveredKas": delivered_tokens,
+            "deliveredTokens": delivered_tokens,
+            "targetAsset": target_asset,
             "txHash": resolved_tx_hash
         })));
     }
+
     Err((
         StatusCode::BAD_REQUEST,
         Json(json!({"error": format!("Unsupported fiat action: {}", mode)})),

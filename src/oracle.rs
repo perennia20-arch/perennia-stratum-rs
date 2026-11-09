@@ -1,3 +1,4 @@
+// UBUNTU (BACKEND): ~/perennia-v5-backend/src/oracle.rs
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tokio_stream::wrappers::ReceiverStream;
@@ -20,9 +21,16 @@ use crate::job_manager::{difficulty_from_bits, extract_coinbase_reward_sompi};
 
 const DEFAULT_MIN_ORACLE_QUORUM: usize = 2;
 const MAX_OUTLIER_DEVIATION_RATIO: f64 = 0.12;
+const MAX_CANONICAL_DEVIATION_RATIO: f64 = 0.08;
+const MIN_CEX_24H_VOLUME_USD: f64 = 25_000.0;
+const MAX_CEX_SPREAD_RATIO: f64 = 0.05;
 const SPOT_ORACLE_TTL_SECS: u64 = 30;
 const CHANGE_24H_TTL_SECS: u64 = 300;
-const RWA_ORACLE_TTL_SECS: u64 = 60;
+const RWA_ORACLE_TTL_SECS: u64 = 120;
+
+const KNOWN_KRC20_ECOSYSTEM_TICKERS: &[&str] = &[
+    "SILO", "NACHO", "BEDRCK", "PERX", "KASPY", "KASPER", "KANGO", "GHOAD", "KEKE"
+];
 
 pub const ORACLE_SUPPORTED_ASSETS: &[&str] = &[
     "KAS", "USDC", "USDT", "USD", "BTC", "ETH", "SOL", "XRP", "DOGE",
@@ -114,14 +122,170 @@ fn compute_sorted_median(sorted: &[f64]) -> f64 {
     }
 }
 
+async fn resolve_canonical_coingecko_anchor(
+    client: &reqwest::Client,
+    redis_conn: &mut redis::aio::MultiplexedConnection,
+    ticker: &str,
+) -> Option<(String, Option<u64>, f64, Option<f64>)> {
+    let clean_ticker = ticker.trim().to_uppercase();
+    if clean_ticker.len() < 2 {
+        return None;
+    }
+
+    let cg_id_key = format!("oracle:cg_id:{}", clean_ticker);
+    let cached_id: Option<String> = redis::cmd("GET")
+        .arg(&cg_id_key)
+        .query_async(redis_conn)
+        .await
+        .ok()
+        .flatten();
+
+    let mut resolved_id = cached_id.unwrap_or_default();
+    let mut resolved_rank: Option<u64> = None;
+
+    if resolved_id.is_empty() {
+        let search_url = format!(
+            "https://api.coingecko.com/api/v3/search?query={}",
+            urlencoding::encode(&clean_ticker)
+        );
+        if let Ok(resp) = client.get(&search_url).send().await {
+            if resp.status().is_success() {
+                if let Ok(search_json) = resp.json::<Value>().await {
+                    if let Some(coins) = search_json.get("coins").and_then(|v| v.as_array()) {
+                        let mut exact: Vec<&Value> = coins
+                            .iter()
+                            .filter(|c| {
+                                c.get("symbol")
+                                    .and_then(|s| s.as_str())
+                                    .map(|s| s.trim().eq_ignore_ascii_case(&clean_ticker))
+                                    .unwrap_or(false)
+                            })
+                            .collect();
+                        if exact.is_empty() {
+                            exact = coins.iter().collect();
+                        }
+                        exact.sort_by_key(|c| {
+                            c.get("market_cap_rank")
+                                .and_then(|r| r.as_u64())
+                                .filter(|&r| r > 0)
+                                .unwrap_or(999_999)
+                        });
+                        if let Some(best) = exact.first() {
+                            if let Some(id_str) = best.get("id").and_then(|v| v.as_str()) {
+                                resolved_id = id_str.trim().to_string();
+                                resolved_rank = best
+                                    .get("market_cap_rank")
+                                    .and_then(|r| r.as_u64())
+                                    .filter(|&r| r > 0);
+                                if !resolved_id.is_empty() {
+     let _: redis::RedisResult<()> = redis::cmd("SETEX")
+                                        .arg(&cg_id_key)
+                                        .arg(86_400u64)
+                                        .arg(&resolved_id)
+                                        .query_async(redis_conn)
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if resolved_id.is_empty() {
+        return None;
+    }
+
+    let price_url = format!(
+        "https://api.coingecko.com/api/v3/simple/price?ids={}&vs_currencies=usd&include_24hr_change=true",
+        urlencoding::encode(&resolved_id)
+    );
+    if let Ok(resp) = client.get(&price_url).send().await {
+        if resp.status().is_success() {
+            if let Ok(price_json) = resp.json::<Value>().await {
+                if let Some(obj) = price_json.get(&resolved_id) {
+                    let usd = obj.get("usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    if usd > 0.0 && usd.is_finite() {
+                        let chg = obj.get("usd_24h_change").and_then(|v| v.as_f64());
+                        return Some((resolved_id, resolved_rank, usd, chg));
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn yahoo_symbol_for_rwa_ticker(ticker: &str) -> &'static str {
+    match ticker.trim().to_uppercase().as_str() {
+        "SPY" => "SPY",
+        "QQQ" => "QQQ",
+        "NVDA" => "NVDA",
+        "AAPL" => "AAPL",
+        "TSLA" => "TSLA",
+        "AMD" => "AMD",
+        "TSM" => "TSM",
+        "AVGO" => "AVGO",
+        "XLE" => "XLE",
+        "XAU" => "GC=F",
+        "XAG" => "SI=F",
+        "USTB" => "SGOV",
+        _ => "SPY",
+    }
+}
+
+async fn fetch_yahoo_finance_rwa_quote(
+    client: &reqwest::Client,
+    ticker: &str,
+) -> Option<(f64, f64, i64)> {
+    let yahoo_sym = yahoo_symbol_for_rwa_ticker(ticker);
+    let url = format!(
+        "https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=1d&range=5d",
+        urlencoding::encode(yahoo_sym)
+    );
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data: Value = resp.json().await.ok()?;
+    let meta = data.pointer("/chart/result/0/meta")?;
+
+    let regular_price = meta
+        .get("regularMarketPrice")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    if !regular_price.is_finite() || regular_price <= 0.0 {
+        return None;
+    }
+
+    let prev_close = meta
+        .get("chartPreviousClose")
+        .or_else(|| meta.get("previousClose"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(regular_price);
+
+    let delta_pct = if prev_close > 0.0 && (regular_price - prev_close).abs() > 1e-9 {
+        (((regular_price - prev_close) / prev_close) * 100.0).clamp(-35.0, 35.0)
+    } else {
+        0.0
+    };
+
+    let pub_ts = meta
+        .get("regularMarketTime")
+        .and_then(|v| v.as_i64())
+        .filter(|&t| t > 0)
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+
+    Some((regular_price, delta_pct, pub_ts))
+}
+
 async fn resolve_dynamic_pyth_feed_ids(client: &reqwest::Client) -> HashMap<String, String> {
     let mut feed_map: HashMap<String, String> = HashMap::new();
-    for &(ticker, default_id, _) in PYTH_RWA_FEEDS {
-        feed_map.insert(ticker.to_string(), default_id.to_string());
-    }
     for &(ticker, _, _) in PYTH_RWA_FEEDS {
         let query_symbol = match ticker {
-            "USTB" => "IB01",
+            "USTB" => "SHY",
             other => other,
         };
         let url = format!(
@@ -136,17 +300,26 @@ async fn resolve_dynamic_pyth_feed_ids(client: &reqwest::Client) -> HashMap<Stri
                             .pointer("/attributes/base")
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
+                            .trim()
+                            .to_uppercase();
+                        let sym = entry
+                            .pointer("/attributes/symbol")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim()
                             .to_uppercase();
                         let quote = entry
                             .pointer("/attributes/quote_currency")
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
+                            .trim()
                             .to_uppercase();
                         let id_str = entry.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                        if !id_str.is_empty()
-                            && quote == "USD"
-                            && (base == ticker || (ticker == "USTB" && (base == "USTB" || base == "IB01" || base == "SHY")))
-                        {
+                        let base_matches = base == ticker
+                            || sym.ends_with(&format!(".{}/USD", ticker))
+                            || (ticker == "USTB"
+                                && (base == "USTB" || base == "SHY" || base == "SGOV"));
+                        if !id_str.is_empty() && quote == "USD" && base_matches {
                             feed_map.insert(
                                 ticker.to_string(),
                                 format!("0x{}", normalize_hex_feed_id(id_str)),
@@ -179,7 +352,7 @@ async fn ensure_rwa_oracle_upsert_constraint(pool: &PgPool) {
 }
 
 pub async fn start_pyth_rwa_oracle_daemon(pool: PgPool) {
-    tracing::info!("🏛️ Booting Pyth Hermes Institutional RWA & Equity Oracle Daemon (SPY, QQQ, NVDA, AAPL, TSLA, AMD, TSM, AVGO, XLE, XAU, XAG, USTB)...");
+    tracing::info!("🏛️ Booting Pyth Hermes + Yahoo Finance Institutional RWA & Equity Oracle Daemon (SPY, QQQ, NVDA, AAPL, TSLA, AMD, TSM, AVGO, XLE, XAU, XAG, USTB)...");
     ensure_rwa_oracle_upsert_constraint(&pool).await;
     let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
     let redis_client = match redis::Client::open(redis_url) {
@@ -197,140 +370,199 @@ pub async fn start_pyth_rwa_oracle_daemon(pool: PgPool) {
         }
     };
     let client = reqwest::Client::builder()
-        .user_agent("Perennia-Pyth-Hermes-Oracle/4.0")
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Perennia-RWA-Oracle/5.0")
         .timeout(Duration::from_secs(8))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
     let resolved_feed_ids = resolve_dynamic_pyth_feed_ids(&client).await;
+    tracing::info!(
+        "🏛️ [RWA ORACLE] Verified {} live Pyth Hermes v2 feed IDs; Yahoo Finance v8 active for all 12 RWA & Equity feeds.",
+        resolved_feed_ids.len()
+    );
+
     let mut interval = tokio::time::interval(Duration::from_secs(12));
     loop {
         interval.tick().await;
-        let mut query_parts: Vec<String> = Vec::new();
-        for feed_id in resolved_feed_ids.values() {
-            query_parts.push(format!("ids[]={}", feed_id));
-        }
-        query_parts.push("ignore_invalid_price_ids=true".to_string());
-        let url = format!(
-            "https://hermes.pyth.network/v2/updates/price/latest?{}",
-            query_parts.join("&")
-        );
-        let mut latest_quotes: HashMap<String, (f64, f64, i64)> = HashMap::new();
-        if let Ok(res) = client.get(&url).send().await {
-            if res.status().is_success() {
-                if let Ok(data) = res.json::<Value>().await {
-                    if let Some(parsed_arr) = data.get("parsed").and_then(|v| v.as_array()) {
-                        for item in parsed_arr {
-                            let feed_id_norm = item
-                                .get("id")
-                                .and_then(|v| v.as_str())
-                                .map(normalize_hex_feed_id)
-                                .unwrap_or_default();
-                            if feed_id_norm.is_empty() {
-                                continue;
-                            }
-                            let matched_ticker = resolved_feed_ids.iter().find_map(|(t, fid)| {
-                                if normalize_hex_feed_id(fid) == feed_id_norm {
-                                    Some(t.clone())
-                                } else {
-                                    None
+        let mut latest_quotes: HashMap<String, (f64, f64, i64, &'static str)> = HashMap::new();
+
+        if !resolved_feed_ids.is_empty() {
+            let mut query_parts: Vec<String> = Vec::new();
+            for feed_id in resolved_feed_ids.values() {
+                query_parts.push(format!("ids[]={}", feed_id));
+            }
+            query_parts.push("ignore_invalid_price_ids=true".to_string());
+            let url = format!(
+                "https://hermes.pyth.network/v2/updates/price/latest?{}",
+                query_parts.join("&")
+            );
+            if let Ok(res) = client.get(&url).send().await {
+                if res.status().is_success() {
+                    if let Ok(data) = res.json::<Value>().await {
+                        if let Some(parsed_arr) = data.get("parsed").and_then(|v| v.as_array()) {
+                            for item in parsed_arr {
+                                let feed_id_norm = item
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .map(normalize_hex_feed_id)
+                                    .unwrap_or_default();
+                                if feed_id_norm.is_empty() {
+                                    continue;
                                 }
-                            });
-                            let Some(ticker) = matched_ticker else {
-                                continue;
-                            };
-                            let raw_spot = item
-                                .pointer("/price/price")
-                                .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| v.as_f64()))
-                                .unwrap_or(0.0);
-                            let spot_expo = item
-                                .pointer("/price/expo")
-                                .and_then(|v| v.as_i64())
-                                .unwrap_or(0) as i32;
-                            let raw_ema = item
-                                .pointer("/ema_price/price")
-                                .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| v.as_f64()))
-                                .unwrap_or(0.0);
-                            let ema_expo = item
-                                .pointer("/ema_price/expo")
-                                .and_then(|v| v.as_i64())
-                                .unwrap_or(0) as i32;
-                            let spot_usd = if raw_spot > 0.0 {
-                                raw_spot * 10.0_f64.powi(spot_expo)
-                            } else if raw_ema > 0.0 {
-                                raw_ema * 10.0_f64.powi(ema_expo)
-                            } else {
-                                0.0
-                            };
-                            let ema_usd = if raw_ema > 0.0 {
-                                raw_ema * 10.0_f64.powi(ema_expo)
-                            } else {
-                                spot_usd
-                            };
-                            let delta_pct = if ema_usd > 0.0 && spot_usd > 0.0 {
-                                (((spot_usd - ema_usd) / ema_usd) * 100.0).clamp(-25.0, 25.0)
-                            } else {
-                                0.0
-                            };
-                            let pub_ts = item
-                                .pointer("/price/publish_time")
-                                .or_else(|| item.pointer("/ema_price/publish_time"))
-                                .and_then(|v| v.as_i64())
-                                .unwrap_or_else(|| chrono::Utc::now().timestamp());
-                            if spot_usd > 0.0 {
-                                latest_quotes.insert(ticker, (spot_usd, delta_pct, pub_ts));
+                                let matched_ticker =
+                                    resolved_feed_ids.iter().find_map(|(t, fid)| {
+                                        if normalize_hex_feed_id(fid) == feed_id_norm {
+                                            Some(t.clone())
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                let Some(ticker) = matched_ticker else {
+                                    continue;
+                                };
+                                let raw_spot = item
+                                    .pointer("/price/price")
+                                    .and_then(|v| {
+                                        v.as_str()
+                                            .and_then(|s| s.parse::<f64>().ok())
+                                            .or_else(|| v.as_f64())
+                                    })
+                                    .unwrap_or(0.0);
+                                let spot_expo = item
+                                    .pointer("/price/expo")
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(0)
+                                    as i32;
+                                let raw_ema = item
+                                    .pointer("/ema_price/price")
+                                    .and_then(|v| {
+                                        v.as_str()
+                                            .and_then(|s| s.parse::<f64>().ok())
+                                            .or_else(|| v.as_f64())
+                                    })
+                                    .unwrap_or(0.0);
+                                let ema_expo = item
+                                    .pointer("/ema_price/expo")
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(0)
+                                    as i32;
+                                let spot_usd = if raw_spot > 0.0 {
+                                    raw_spot * 10.0_f64.powi(spot_expo)
+                                } else if raw_ema > 0.0 {
+                                    raw_ema * 10.0_f64.powi(ema_expo)
+                                } else {
+                                    0.0
+                                };
+                                let ema_usd = if raw_ema > 0.0 {
+                                    raw_ema * 10.0_f64.powi(ema_expo)
+                                } else {
+                                    spot_usd
+                                };
+                                let delta_pct = if ema_usd > 0.0 && spot_usd > 0.0 {
+                                    (((spot_usd - ema_usd) / ema_usd) * 100.0).clamp(-25.0, 25.0)
+                                } else {
+                                    0.0
+                                };
+                                let pub_ts = item
+                                    .pointer("/price/publish_time")
+                                    .or_else(|| item.pointer("/ema_price/publish_time"))
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or_else(|| chrono::Utc::now().timestamp());
+                                if spot_usd > 0.0 && spot_usd.is_finite() {
+                                    latest_quotes.insert(
+                                        ticker,
+                                        (spot_usd, delta_pct, pub_ts, "PYTH_HERMES"),
+                                    );
+                                }
                             }
                         }
                     }
                 }
             }
         }
+
+        // For any RWA / Public Equity ticker not returned by Pyth (or when equity markets are closed / 0), fetch live quote from Yahoo Finance v8
+        for &(ticker, _, _) in PYTH_RWA_FEEDS {
+            let needs_yahoo = match latest_quotes.get(ticker) {
+                Some((spot, chg, _, _)) => *spot <= 0.0 || (*chg == 0.0 && ticker != "USTB"),
+                None => true,
+            };
+            if needs_yahoo {
+                if let Some((yf_spot, yf_chg, yf_ts)) =
+                    fetch_yahoo_finance_rwa_quote(&client, ticker).await
+                {
+                    if let Some((existing_spot, _, existing_ts, _)) = latest_quotes.get(ticker) {
+                        let merged_spot = if *existing_spot > 0.0 {
+                            *existing_spot
+                        } else {
+                            yf_spot
+                        };
+                        latest_quotes.insert(
+                            ticker.to_string(),
+                            (merged_spot, yf_chg, *existing_ts.max(&yf_ts), "PYTH_HERMES"),
+                        );
+                    } else {
+                        latest_quotes.insert(
+                            ticker.to_string(),
+                            (yf_spot, yf_chg, yf_ts, "YAHOO_FINANCE_V8"),
+                        );
+                    }
+                }
+            }
+        }
+
         let mut pipe = redis::pipe();
         let mut rwa_assets_json = Vec::new();
         for &(ticker, _, asset_class) in PYTH_RWA_FEEDS {
-            let resolved_entry = if let Some(&(spot_usd, delta_pct, pub_ts)) = latest_quotes.get(ticker) {
-                let _ = sqlx::query(
-                    r#"
-                    INSERT INTO rwa_oracle_feeds (ticker, asset_class, price_usd, change_24h_pct, oracle_source, updated_at)
-                    VALUES ($1, $2, $3, $4, 'PYTH_HERMES', CURRENT_TIMESTAMP)
-                    ON CONFLICT (ticker) DO UPDATE SET
-                        asset_class = EXCLUDED.asset_class,
-                        price_usd = EXCLUDED.price_usd,
-                        change_24h_pct = EXCLUDED.change_24h_pct,
-                        oracle_source = EXCLUDED.oracle_source,
-                        updated_at = CURRENT_TIMESTAMP
-                    "#,
-                )
-                .bind(ticker)
-                .bind(asset_class)
-                .bind(spot_usd)
-                .bind(delta_pct)
-                .execute(&pool)
-                .await;
-                Some((spot_usd, delta_pct, pub_ts))
-            } else {
-                sqlx::query(
-                    r#"
-                    SELECT price_usd, change_24h_pct, EXTRACT(EPOCH FROM updated_at)::BIGINT AS pub_ts
-                    FROM rwa_oracle_feeds
-                    WHERE ticker = $1
-                      AND price_usd > 0
-                      AND updated_at >= CURRENT_TIMESTAMP - INTERVAL '15 minutes'
-                    ORDER BY updated_at DESC
-                    LIMIT 1
-                    "#,
-                )
-                .bind(ticker)
-                .fetch_optional(&pool)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|row| {
-                    let p = row.try_get::<f64, _>("price_usd").unwrap_or(0.0);
-                    let d = row.try_get::<f64, _>("change_24h_pct").unwrap_or(0.0);
-                    let ts = row.try_get::<i64, _>("pub_ts").unwrap_or(0);
-                    if p > 0.0 { Some((p, d, ts)) } else { None }
-                })
-            };
+            let resolved_entry =
+                if let Some(&(spot_usd, delta_pct, pub_ts, source_label)) = latest_quotes.get(ticker)
+                {
+                    let _ = sqlx::query(
+                        r#"
+                        INSERT INTO rwa_oracle_feeds (ticker, asset_class, price_usd, change_24h_pct, oracle_source, updated_at)
+                        VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+                        ON CONFLICT (ticker) DO UPDATE SET
+                            asset_class = EXCLUDED.asset_class,
+                            price_usd = EXCLUDED.price_usd,
+                            change_24h_pct = EXCLUDED.change_24h_pct,
+                            oracle_source = EXCLUDED.oracle_source,
+                            updated_at = CURRENT_TIMESTAMP
+                        "#,
+                    )
+                    .bind(ticker)
+                    .bind(asset_class)
+                    .bind(spot_usd)
+                    .bind(delta_pct)
+                    .bind(source_label)
+                    .execute(&pool)
+                    .await;
+                    Some((spot_usd, delta_pct, pub_ts))
+                } else {
+                    sqlx::query(
+                        r#"
+                        SELECT price_usd, change_24h_pct, EXTRACT(EPOCH FROM updated_at)::BIGINT AS pub_ts
+                        FROM rwa_oracle_feeds
+                        WHERE ticker = $1
+                          AND price_usd > 0
+                        ORDER BY updated_at DESC
+                        LIMIT 1
+                        "#,
+                    )
+                    .bind(ticker)
+                    .fetch_optional(&pool)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|row| {
+                        let p = row.try_get::<f64, _>("price_usd").unwrap_or(0.0);
+                        let d = row.try_get::<f64, _>("change_24h_pct").unwrap_or(0.0);
+                        let ts = row.try_get::<i64, _>("pub_ts").unwrap_or(0);
+                        if p > 0.0 {
+                            Some((p, d, ts))
+                        } else {
+                            None
+                        }
+                    })
+                };
             if let Some((spot_usd, delta_pct, pub_ts)) = resolved_entry {
                 pipe.cmd("SETEX")
                     .arg(format!("oracle:spot:{}_USDC", ticker))
@@ -501,10 +733,22 @@ pub async fn start_spot_pricing_daemon() {
                     continue;
                 }
                 if let Some(exchanges) = p_lock.get(dyn_asset) {
+                    let canonical_cg_opt = exchanges
+                        .get("coingecko")
+                        .filter(|(v, _, ts)| *v > 0.0 && v.is_finite() && now.duration_since(*ts).as_secs() < 60)
+                        .map(|(v, _, _)| *v);
+
                     let mut raw_vals: Vec<f64> = exchanges
                         .values()
                         .filter(|(v, _, ts)| *v > 0.0 && v.is_finite() && now.duration_since(*ts).as_secs() < 60)
                         .map(|(v, _, _)| *v)
+                        .filter(|&v| {
+                            if let Some(cg_anchor) = canonical_cg_opt {
+                                ((v - cg_anchor).abs() / cg_anchor) <= MAX_CANONICAL_DEVIATION_RATIO
+                            } else {
+                                true
+                            }
+                        })
                         .collect();
                     let mut chg_vals: Vec<f64> = exchanges
                         .values()
@@ -514,11 +758,16 @@ pub async fn start_spot_pricing_daemon() {
                         .collect();
                     if !raw_vals.is_empty() {
                         raw_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                        let raw_median = compute_sorted_median(&raw_vals);
+                        let raw_median = canonical_cg_opt.unwrap_or_else(|| compute_sorted_median(&raw_vals));
+                        let deviation_bound = if canonical_cg_opt.is_some() {
+                            MAX_CANONICAL_DEVIATION_RATIO
+                        } else {
+                            MAX_OUTLIER_DEVIATION_RATIO
+                        };
                         let filtered_vals: Vec<f64> = if raw_median > 0.0 {
                             raw_vals
                                 .into_iter()
-                                .filter(|&v| ((v - raw_median).abs() / raw_median) <= MAX_OUTLIER_DEVIATION_RATIO)
+                                .filter(|&v| ((v - raw_median).abs() / raw_median) <= deviation_bound)
                                 .collect()
                         } else {
                             Vec::new()
@@ -549,6 +798,36 @@ pub async fn start_spot_pricing_daemon() {
                 "BASE".to_string(),
                 active_changes_24h.get("ETH").copied().unwrap_or(0.0),
             );
+        }
+
+        // Also include cached RWA / Public Equity feeds in prices_json so any consumer reading oracle:spot:prices_json sees all 12 RWA tickers
+        if let Ok(Some(rwa_raw)) = redis::cmd("GET")
+            .arg("oracle:spot:rwa_prices_json")
+            .query_async::<_, Option<String>>(&mut redis_conn)
+            .await
+        {
+            if let Ok(rwa_arr) = serde_json::from_str::<Vec<Value>>(&rwa_raw) {
+                for item in rwa_arr {
+                    let t = item
+                        .get("ticker")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_uppercase();
+                    let p = item
+                        .get("spotPrice")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let c = item
+                        .get("change24h")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    if !t.is_empty() && p > 0.0 {
+                        active_medians.insert(t.clone(), p);
+                        active_changes_24h.insert(t, c);
+                    }
+                }
+            }
         }
 
         if !active_medians.is_empty() {
@@ -632,10 +911,16 @@ pub async fn start_spot_pricing_daemon() {
 
 async fn dynamic_tickers_rest_poller(prices: PriceMap, redis_client: redis::Client) {
     let client = reqwest::Client::builder()
-        .user_agent("Perennia-Dynamic-Oracle/1.0")
+        .user_agent("Perennia-Dynamic-Oracle/2.0")
         .timeout(Duration::from_secs(4))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
+
+    let pg_pool_opt = match env::var("DATABASE_URL") {
+        Ok(db_url) if !db_url.trim().is_empty() => PgPool::connect(&db_url).await.ok(),
+        _ => None,
+    };
+
     let mut interval = tokio::time::interval(Duration::from_secs(6));
 
     loop {
@@ -648,7 +933,7 @@ async fn dynamic_tickers_rest_poller(prices: PriceMap, redis_client: redis::Clie
             .query_async(&mut conn)
             .await
             .unwrap_or_default();
-        if raw_members.is_empty() {
+        if raw_members.is_empty() && DYNAMIC_ORACLE_TICKERS.is_empty() {
             continue;
         }
 
@@ -668,7 +953,16 @@ async fn dynamic_tickers_rest_poller(prices: PriceMap, redis_client: redis::Clie
                 }
                 DYNAMIC_ORACLE_TICKERS.insert(clean.clone());
                 lock.entry(clean.clone()).or_insert_with(HashMap::new);
-                active_dynamic.push(clean);
+                if !active_dynamic.contains(&clean) {
+                    active_dynamic.push(clean);
+                }
+            }
+            for item in DYNAMIC_ORACLE_TICKERS.iter() {
+                let clean = item.key().clone();
+                if !active_dynamic.contains(&clean) && active_dynamic.len() < 40 {
+                    lock.entry(clean.clone()).or_insert_with(HashMap::new);
+                    active_dynamic.push(clean);
+                }
             }
         }
 
@@ -681,6 +975,15 @@ async fn dynamic_tickers_rest_poller(prices: PriceMap, redis_client: redis::Clie
         };
 
         for ticker in active_dynamic {
+            let cg_anchor =
+                resolve_canonical_coingecko_anchor(&client, &mut conn, &ticker).await;
+            let canonical_price_usd = cg_anchor.as_ref().map(|(_, _, p, _)| *p).unwrap_or(0.0);
+            let is_top_canonical_rank = cg_anchor
+                .as_ref()
+                .and_then(|(_, rank, _, _)| *rank)
+                .map(|r| r <= 500)
+                .unwrap_or(false);
+
             let mexc_url = format!(
                 "https://api.mexc.com/api/v3/ticker/24hr?symbol={}USDT",
                 ticker
@@ -716,22 +1019,52 @@ async fn dynamic_tickers_rest_poller(prices: PriceMap, redis_client: redis::Clie
             );
 
             let mut discovered_quotes: Vec<(&str, f64, Option<f64>)> = Vec::new();
+            if let Some((_, _, cg_usd, cg_chg)) = cg_anchor.as_ref() {
+                if *cg_usd > 0.0 {
+                    discovered_quotes.push(("coingecko", *cg_usd, *cg_chg));
+                }
+            }
 
             if let Ok(resp) = mexc_res {
                 if resp.status().is_success() {
                     if let Ok(data) = resp.json::<Value>().await {
-                        if let Some(p) = data
-                            .get("lastPrice")
+                        let quote_vol = data
+                            .get("quoteVolume")
                             .and_then(|v| v.as_str())
                             .and_then(|s| s.parse::<f64>().ok())
-                        {
-                            if p > 0.0 {
-                                let chg = data
-                                    .get("priceChangePercent")
-                                    .and_then(|v| v.as_str())
-                                    .and_then(|s| s.parse::<f64>().ok())
-                                    .map(|r| r * 100.0);
-                                discovered_quotes.push(("mexc", p, chg));
+                            .unwrap_or(0.0);
+                        let bid_pr = data
+                            .get("bidPrice")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        let ask_pr = data
+                            .get("askPrice")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        let spread_ok = if bid_pr > 0.0 && ask_pr >= bid_pr {
+                            ((ask_pr - bid_pr) / ask_pr) <= MAX_CEX_SPREAD_RATIO
+                        } else {
+                            true
+                        };
+                        if quote_vol >= MIN_CEX_24H_VOLUME_USD && spread_ok {
+                            if let Some(p) = data
+                                .get("lastPrice")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse::<f64>().ok())
+                            {
+                                let canonical_ok = canonical_price_usd <= 0.0
+                                    || ((p - canonical_price_usd).abs() / canonical_price_usd)
+                                        <= MAX_CANONICAL_DEVIATION_RATIO;
+                                if p > 0.0 && canonical_ok {
+                                    let chg = data
+                                        .get("priceChangePercent")
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|s| s.parse::<f64>().ok())
+                                        .map(|r| if r.abs() <= 1.5 { r * 100.0 } else { r });
+                                    discovered_quotes.push(("mexc", p, chg));
+                                }
                             }
                         }
                     }
@@ -746,17 +1079,42 @@ async fn dynamic_tickers_rest_poller(prices: PriceMap, redis_client: redis::Clie
                         } else {
                             data
                         };
-                        if let Some(p) = item
-                            .get("last")
+                        let quote_vol = item
+                            .get("quote_volume")
                             .and_then(|v| v.as_str())
                             .and_then(|s| s.parse::<f64>().ok())
-                        {
-                            if p > 0.0 {
-                                let chg = item
-                                    .get("change_percentage")
-                                    .and_then(|v| v.as_str())
-                                    .and_then(|s| s.parse::<f64>().ok());
-                                discovered_quotes.push(("gate", p, chg));
+                            .unwrap_or(0.0);
+                        let bid_pr = item
+                            .get("highest_bid")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        let ask_pr = item
+                            .get("lowest_ask")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        let spread_ok = if bid_pr > 0.0 && ask_pr >= bid_pr {
+                            ((ask_pr - bid_pr) / ask_pr) <= MAX_CEX_SPREAD_RATIO
+                        } else {
+                            true
+                        };
+                        if quote_vol >= MIN_CEX_24H_VOLUME_USD && spread_ok {
+                            if let Some(p) = item
+                                .get("last")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse::<f64>().ok())
+                            {
+                                let canonical_ok = canonical_price_usd <= 0.0
+                                    || ((p - canonical_price_usd).abs() / canonical_price_usd)
+                                        <= MAX_CANONICAL_DEVIATION_RATIO;
+                                if p > 0.0 && canonical_ok {
+                                    let chg = item
+                                        .get("change_percentage")
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|s| s.parse::<f64>().ok());
+                                    discovered_quotes.push(("gate", p, chg));
+                                }
                             }
                         }
                     }
@@ -766,18 +1124,43 @@ async fn dynamic_tickers_rest_poller(prices: PriceMap, redis_client: redis::Clie
             if let Ok(resp) = kucoin_res {
                 if resp.status().is_success() {
                     if let Ok(data) = resp.json::<Value>().await {
-                        if let Some(p) = data
-                            .pointer("/data/last")
+                        let vol_value = data
+                            .pointer("/data/volValue")
                             .and_then(|v| v.as_str())
                             .and_then(|s| s.parse::<f64>().ok())
-                        {
-                            if p > 0.0 {
-                                let chg = data
-                                    .pointer("/data/changeRate")
-                                    .and_then(|v| v.as_str())
-                                    .and_then(|s| s.parse::<f64>().ok())
-                                    .map(|r| r * 100.0);
-                                discovered_quotes.push(("kucoin", p, chg));
+                            .unwrap_or(0.0);
+                        let buy_bid = data
+                            .pointer("/data/buy")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        let sell_ask = data
+                            .pointer("/data/sell")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        let spread_ok = if buy_bid > 0.0 && sell_ask >= buy_bid {
+                            ((sell_ask - buy_bid) / sell_ask) <= MAX_CEX_SPREAD_RATIO
+                        } else {
+                            true
+                        };
+                        if vol_value >= MIN_CEX_24H_VOLUME_USD && spread_ok {
+                            if let Some(p) = data
+                                .pointer("/data/last")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse::<f64>().ok())
+                            {
+                                let canonical_ok = canonical_price_usd <= 0.0
+                                    || ((p - canonical_price_usd).abs() / canonical_price_usd)
+                                        <= MAX_CANONICAL_DEVIATION_RATIO;
+                                if p > 0.0 && canonical_ok {
+                                    let chg = data
+                                        .pointer("/data/changeRate")
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|s| s.parse::<f64>().ok())
+                                        .map(|r| r * 100.0);
+                                    discovered_quotes.push(("kucoin", p, chg));
+                                }
                             }
                         }
                     }
@@ -792,18 +1175,44 @@ async fn dynamic_tickers_rest_poller(prices: PriceMap, redis_client: redis::Clie
                             .and_then(|d| d.as_array())
                             .and_then(|a| a.first())
                         {
-                            if let Some(p) = item
-                                .get("lastPr")
+                            let usdt_vol = item
+                                .get("usdtVolume")
+                                .or_else(|| item.get("quoteVolume"))
                                 .and_then(|v| v.as_str())
                                 .and_then(|s| s.parse::<f64>().ok())
-                            {
-                                if p > 0.0 {
-                                    let chg = item
-                                        .get("change24h")
-                                        .and_then(|v| v.as_str())
-                                        .and_then(|s| s.parse::<f64>().ok())
-                                        .map(|r| r * 100.0);
-                                    discovered_quotes.push(("bitget", p, chg));
+                                .unwrap_or(0.0);
+                            let bid_pr = item
+                                .get("bidPr")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(0.0);
+                            let ask_pr = item
+                                .get("askPr")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(0.0);
+                            let spread_ok = if bid_pr > 0.0 && ask_pr >= bid_pr {
+                                ((ask_pr - bid_pr) / ask_pr) <= MAX_CEX_SPREAD_RATIO
+                            } else {
+                                true
+                            };
+                            if usdt_vol >= MIN_CEX_24H_VOLUME_USD && spread_ok {
+                                if let Some(p) = item
+                                    .get("lastPr")
+                                    .and_then(|v| v.as_str())
+                                    .and_then(|s| s.parse::<f64>().ok())
+                                {
+                                    let canonical_ok = canonical_price_usd <= 0.0
+                                        || ((p - canonical_price_usd).abs() / canonical_price_usd)
+                                            <= MAX_CANONICAL_DEVIATION_RATIO;
+                                    if p > 0.0 && canonical_ok {
+                                        let chg = item
+                                            .get("change24h")
+                                            .and_then(|v| v.as_str())
+                                            .and_then(|s| s.parse::<f64>().ok())
+                                            .map(|r| r * 100.0);
+                                        discovered_quotes.push(("bitget", p, chg));
+                                    }
                                 }
                             }
                         }
@@ -819,23 +1228,33 @@ async fn dynamic_tickers_rest_poller(prices: PriceMap, redis_client: redis::Clie
                             .and_then(|d| d.as_array())
                             .and_then(|a| a.first())
                         {
-                            if let Some(p) = item
-                                .get("last")
+                            let quote_val = item
+                                .get("value")
                                 .and_then(|v| v.as_str())
                                 .and_then(|s| s.parse::<f64>().ok())
-                            {
-                                if p > 0.0 {
-                                    let open_v = item
-                                        .get("open")
-                                        .and_then(|v| v.as_str())
-                                        .and_then(|s| s.parse::<f64>().ok())
-                                        .unwrap_or(0.0);
-                                    let chg = if open_v > 0.0 {
-                                        Some(((p - open_v) / open_v) * 100.0)
-                                    } else {
-                                        None
-                                    };
-                                    discovered_quotes.push(("coinex", p, chg));
+                                .unwrap_or(0.0);
+                            if quote_val >= MIN_CEX_24H_VOLUME_USD {
+                                if let Some(p) = item
+                                    .get("last")
+                                    .and_then(|v| v.as_str())
+                                    .and_then(|s| s.parse::<f64>().ok())
+                                {
+                                    let canonical_ok = canonical_price_usd <= 0.0
+                                        || ((p - canonical_price_usd).abs() / canonical_price_usd)
+                                            <= MAX_CANONICAL_DEVIATION_RATIO;
+                                    if p > 0.0 && canonical_ok {
+                                        let open_v = item
+                                            .get("open")
+                                            .and_then(|v| v.as_str())
+                                            .and_then(|s| s.parse::<f64>().ok())
+                                            .unwrap_or(0.0);
+                                        let chg = if open_v > 0.0 {
+                                            Some(((p - open_v) / open_v) * 100.0)
+                                        } else {
+                                            None
+                                        };
+                                        discovered_quotes.push(("coinex", p, chg));
+                                    }
                                 }
                             }
                         }
@@ -843,47 +1262,108 @@ async fn dynamic_tickers_rest_poller(prices: PriceMap, redis_client: redis::Clie
                 }
             }
 
-            if let Ok(resp) = kasfyi_res {
-                if resp.status().is_success() {
-                    if let Ok(data) = resp.json::<Value>().await {
-                        let usd_p = data
-                            .pointer("/price/usd")
-                            .or_else(|| data.get("priceUsd"))
-                            .or_else(|| data.get("price"))
-                            .and_then(|v| {
-                                v.as_f64()
-                                    .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
-                            })
-                            .unwrap_or(0.0);
-                        let kas_p = data
-                            .pointer("/price/kas")
-                            .and_then(|v| {
-                                v.as_f64()
-                                    .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
-                            })
-                            .unwrap_or(0.0);
-                        let resolved_usd = if usd_p > 0.0 {
-                            usd_p
-                        } else if kas_p > 0.0 && kas_usd > 0.0 {
-                            kas_p * kas_usd
-                        } else {
-                            0.0
-                        };
-                        if resolved_usd > 0.0 {
-                            let chg = data
-                                .get("change24h")
-                                .and_then(|v| v.as_f64());
-                            discovered_quotes.push(("kasfyi", resolved_usd, chg));
+            let is_known_krc20 = KNOWN_KRC20_ECOSYSTEM_TICKERS.iter().any(|&k| k == ticker);
+            if !is_top_canonical_rank || is_known_krc20 {
+                if let Ok(resp) = kasfyi_res {
+                    if resp.status().is_success() {
+                        if let Ok(data) = resp.json::<Value>().await {
+                            let usd_p = data
+                                .pointer("/price/usd")
+                                .or_else(|| data.get("priceUsd"))
+                                .or_else(|| data.get("price"))
+                                .and_then(|v| {
+                                    v.as_f64()
+                                        .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                                })
+                                .unwrap_or(0.0);
+                            let kas_p = data
+                                .pointer("/price/kas")
+                                .and_then(|v| {
+                                    v.as_f64()
+                                        .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                                })
+                                .unwrap_or(0.0);
+                            let resolved_usd = if usd_p > 0.0 {
+                                usd_p
+                            } else if kas_p > 0.0 && kas_usd > 0.0 {
+                                kas_p * kas_usd
+                            } else {
+                                0.0
+                            };
+                            let canonical_ok = canonical_price_usd <= 0.0
+                                || ((resolved_usd - canonical_price_usd).abs()
+                                    / canonical_price_usd)
+                                    <= MAX_CANONICAL_DEVIATION_RATIO;
+                            if resolved_usd > 0.0 && canonical_ok {
+                                let chg = data.get("change24h").and_then(|v| v.as_f64());
+                                discovered_quotes.push(("kasfyi", resolved_usd, chg));
+                            }
                         }
                     }
                 }
             }
 
+            if discovered_quotes.is_empty() {
+                if let Some((yf_spot, yf_chg, _)) =
+                    fetch_yahoo_finance_rwa_quote(&client, &ticker).await
+                {
+                    if yf_spot > 0.0 {
+                        discovered_quotes.push(("yahoo", yf_spot, Some(yf_chg)));
+                    }
+                }
+            }
+
             if !discovered_quotes.is_empty() {
-                let mut lock = prices.write().await;
-                if let Some(ex_map) = lock.get_mut(&ticker) {
-                    for (ex_name, spot_val, chg_val) in discovered_quotes {
-                        record_exchange_quote(ex_map, ex_name, spot_val, chg_val);
+                let mut valid_spots: Vec<f64> =
+                    discovered_quotes.iter().map(|(_, p, _)| *p).collect();
+                valid_spots
+                    .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let median_spot = compute_sorted_median(&valid_spots);
+                let median_chg = discovered_quotes
+                    .iter()
+                    .find_map(|(_, _, c)| *c)
+                    .unwrap_or(0.0);
+
+                {
+                    let mut lock = prices.write().await;
+                    if let Some(ex_map) = lock.get_mut(&ticker) {
+                        for (ex_name, spot_val, chg_val) in discovered_quotes {
+                            record_exchange_quote(ex_map, ex_name, spot_val, chg_val);
+                        }
+                    }
+                }
+
+                if median_spot > 0.0 {
+                    let _: redis::RedisResult<()> = redis::cmd("SETEX")
+                        .arg(format!("oracle:spot:{}_USDC", ticker))
+                        .arg(SPOT_ORACLE_TTL_SECS)
+                        .arg(median_spot.to_string())
+                        .query_async(&mut conn)
+                        .await;
+                    let _: redis::RedisResult<()> = redis::cmd("SETEX")
+                        .arg(format!("oracle:change24h:{}_USDC", ticker))
+                        .arg(CHANGE_24H_TTL_SECS)
+                        .arg(median_chg.to_string())
+                        .query_async(&mut conn)
+                        .await;
+
+                    if let Some(ref pg_pool) = pg_pool_opt {
+                        let _ = sqlx::query(
+                            r#"
+                            INSERT INTO rwa_oracle_feeds (ticker, asset_class, price_usd, change_24h_pct, oracle_source, updated_at)
+                            VALUES ($1, 'DYNAMIC_TOKEN', $2, $3, 'COINGECKO_CEX_QUORUM', CURRENT_TIMESTAMP)
+                            ON CONFLICT (ticker) DO UPDATE SET
+                                price_usd = EXCLUDED.price_usd,
+                                change_24h_pct = EXCLUDED.change_24h_pct,
+                                oracle_source = EXCLUDED.oracle_source,
+                                updated_at = CURRENT_TIMESTAMP
+                            "#,
+                        )
+                        .bind(&ticker)
+                        .bind(median_spot)
+                        .bind(median_chg)
+                        .execute(pg_pool)
+                        .await;
                     }
                 }
             }
