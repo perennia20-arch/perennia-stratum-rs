@@ -456,14 +456,19 @@ pub async fn ensure_database_schema(pool: &PgPool) -> anyhow::Result<()> {
         "ALTER TABLE entity_kyc ADD COLUMN IF NOT EXISTS filing_status VARCHAR(64) NOT NULL DEFAULT 'SINGLE'",
         "ALTER TABLE entity_kyc ADD COLUMN IF NOT EXISTS effective_tax_rate DOUBLE PRECISION NOT NULL DEFAULT 15.0",
         r#"
-        CREATE TABLE IF NOT EXISTS micro_shares (
-            share_id BIGSERIAL PRIMARY KEY,
-            worker_identity VARCHAR(255) NOT NULL,
-            difficulty DOUBLE PRECISION NOT NULL DEFAULT 1.0,
-            is_valid BOOLEAN NOT NULL DEFAULT TRUE,
+        CREATE UNLOGGED TABLE IF NOT EXISTS micro_shares (
+            share_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            worker_id VARCHAR(255) NOT NULL,
+            difficulty_weight DOUBLE PRECISION NOT NULL,
+            kas_value_delta DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+            network_diff DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+            is_settled BOOLEAN NOT NULL DEFAULT FALSE,
             recorded_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         )
         "#,
+        "UPDATE worker_profiles SET worker_identity = worker_id WHERE worker_identity IS NULL OR worker_identity = ''",
+        "DELETE FROM worker_profiles a USING worker_profiles b WHERE a.ctid < b.ctid AND a.worker_identity = b.worker_identity",
+        "UPDATE worker_profiles SET worker_id = worker_identity WHERE worker_identity IS NOT NULL AND worker_identity != '' AND worker_id != worker_identity",
         r#"
         CREATE TABLE IF NOT EXISTS forge_vesting_schedules (
             vesting_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

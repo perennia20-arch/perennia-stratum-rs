@@ -19,15 +19,19 @@ pub const MAX_CONSECUTIVE_STRIKES: u32 = 10;
 pub const BAN_DURATION_SECS: u64 = 600;
 const SOCKET_WINDOW_SECS: u64 = 10;
 const MAX_MESSAGES_PER_WINDOW: u32 = 250;
-const VARDIFF_GRACE_WINDOW_SECS: u64 = 15;
+const VARDIFF_GRACE_WINDOW_SECS: u64 = 30;
 const ASIC_WARMUP_GRACE_SECS: u64 = 180;
+const CLIENT_IDLE_TIMEOUT_SECS: u64 = 540;
 const HAPROXY_HEALTHCHECK_SENTINEL: &str = "haproxy-healthcheck";
 
 lazy_static! {
     pub static ref BANNED_IPS: DashMap<String, Instant> = DashMap::new();
     pub static ref STRIKE_COUNTERS: DashMap<String, u32> = DashMap::new();
     pub static ref ACTIVE_EXTRANONCES: DashSet<u16> = DashSet::new();
+    pub static ref WORKER_STRATUM_PORTS: DashMap<String, i32> = DashMap::new();
 }
+pub fn public_stratum_port_for_tier(p: u16) -> i32 { match p { 6551 => 3331, 6552 => 3332, 6553 => 3333, x => x as i32 } }
+pub fn resolve_worker_public_port(id: &str) -> i32 { WORKER_STRATUM_PORTS.get(id).map(|v| *v).unwrap_or(3332) }
 
 static WORKER_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -267,21 +271,13 @@ pub async fn start_stratum_server(
                 config_clone,
                 job_manager_clone,
                 share_tx_clone,
-                pool_clone,
-                difficulty,
-                throttle_ms,
-            )
-            .await
-            {
+                pool_clone, port, difficulty, throttle_ms,
+            ).await {
                 let err_str = e.to_string();
-                if err_str.contains("Timeout or EOF reading")
-                    || err_str.contains("Connection reset by peer")
-                    || err_str.contains("os error 104")
-                    || err_str.contains("Client closed connection")
-                {
-                    tracing::debug!("Socket closed from {}: {}", haproxy_ip, err_str);
+                if err_str.contains("Timeout or EOF reading initial Stratum stream") {
+                    tracing::debug!("Probe closed from {}: {}", haproxy_ip, err_str);
                 } else {
-                    tracing::warn!("⚠️ Worker disconnected: {}", err_str);
+                    tracing::warn!("🔌 [STRATUM DISCONNECT | :{}] {}", public_stratum_port_for_tier(port), err_str);
                 }
             }
         });
@@ -295,6 +291,7 @@ async fn handle_worker_connection(
     job_manager: Arc<JobManager>,
     valid_share_tx: mpsc::Sender<(String, f64, bool)>,
     pg_pool: PgPool,
+    port: u16,
     difficulty: f64,
     throttle_ms: u64,
 ) -> anyhow::Result<()> {
@@ -533,6 +530,7 @@ async fn handle_worker_connection(
                                 }
                                 current_worker_name = auth_name.clone();
                                 authorized_ok = true;
+                                WORKER_STRATUM_PORTS.insert(current_worker_name.clone(), public_stratum_port_for_tier(port));
                                 reset_socket_strikes(&peer_addr, &current_worker_name);
                                 tracing::info!(
                                     "🔑 [{}] Authorized Worker Identity: {} (Extranonce1: {}, Diff: {})",
@@ -647,6 +645,7 @@ async fn handle_worker_connection(
     let mut vardiff_interval = tokio::time::interval(Duration::from_secs(30));
     let mut pending_job: Option<StratumJob> = None;
     let mut last_dispatched_job_id = String::new();
+    let mut last_client_rx = Instant::now();
 
     loop {
         tokio::select! {
@@ -681,6 +680,7 @@ async fn handle_worker_connection(
                 }
             }
             _ = vardiff_interval.tick() => {
+                if last_client_rx.elapsed() >= Duration::from_secs(CLIENT_IDLE_TIMEOUT_SECS) { anyhow::bail!("[IP: {} | Worker: {} | Diff: {} | Up: {}s] Idle timeout ({}s)", peer_addr, current_worker_name, current_diff, connected_at.elapsed().as_secs(), CLIENT_IDLE_TIMEOUT_SECS); }
                 if config.var_diff && last_vardiff_retarget.elapsed().as_secs() >= 60 {
                     if !has_submitted_first_share && connected_at.elapsed().as_secs() < ASIC_WARMUP_GRACE_SECS {
                         last_vardiff_retarget = Instant::now();
@@ -708,25 +708,19 @@ async fn handle_worker_connection(
                         if write_half.write_all(retarget_msg.as_bytes()).await.is_err() {
                             anyhow::bail!("Write failed - Client disconnected");
                         }
-                        tracing::info!("🔄 Auto-Diff Adjusted for {} -> New Diff: {}", current_worker_name, current_diff);
+                        if let Some(nb) = job_manager.cached_job.read().ok().and_then(|c| c.clone()) { let _ = write_half.write_all(&nb[..]).await; }
+                        tracing::info!("🔄 Auto-Diff Adjusted for {} ({}) -> New Diff: {}", current_worker_name, peer_addr, current_diff);
                     }
                     share_count = 0;
                     last_vardiff_retarget = Instant::now();
                 }
             }
-            line_timeout = tokio::time::timeout(Duration::from_secs(600), reader.next()) => {
-                let line_res = match line_timeout {
-                    Ok(res) => res,
-                    Err(_) => anyhow::bail!("EOF - Miner inactive timeout (No shares submitted in 600s)"),
-                };
-                if line_res.is_none() {
-                    anyhow::bail!("EOF - Client closed connection");
-                }
+            line_res = reader.next() => {
+                if line_res.is_none() { anyhow::bail!("[IP: {} | Worker: {} | Diff: {} | Up: {}s] EOF socket closed", peer_addr, current_worker_name, current_diff, connected_at.elapsed().as_secs()); }
+                last_client_rx = Instant::now();
                 let payload_str = match line_res.unwrap() {
                     Ok(s) => s,
-                    Err(LinesCodecError::Io(io_err)) if is_benign_disconnect_io_error(&io_err) => {
-                        anyhow::bail!("Connection reset by peer: {}", io_err);
-                    }
+                    Err(LinesCodecError::Io(io_err)) if is_benign_disconnect_io_error(&io_err) => { anyhow::bail!("[IP: {} | Worker: {} | Diff: {} | Up: {}s] Reset: {}", peer_addr, current_worker_name, current_diff, connected_at.elapsed().as_secs(), io_err); }
                     Err(e) => {
                         let (_, banned) = record_socket_strike(&peer_addr, &current_worker_name, "Line codec max length violation");
                         if banned {
@@ -828,9 +822,9 @@ async fn handle_worker_connection(
                             let mut is_accepted = false;
                             let mut err_msg = serde_json::Value::Null;
                             let mut should_ban_disconnect = false;
-                            if let Some(job_entry) = job_manager.active_jobs.get(&job_id) {
-                                let active_job = job_entry.value().clone();
-                                drop(job_entry);
+                            WORKER_STRATUM_PORTS.insert(active_identity.clone(), public_stratum_port_for_tier(port));
+                            let resolved_job = job_manager.active_jobs.get(&job_id).map(|e| e.value().clone()).or_else(|| job_manager.active_jobs.get(job_id.trim_start_matches('0')).map(|e| e.value().clone()));
+                            if let Some(active_job) = resolved_job {
                                 if !job_manager.register_submission(&job_id, nonce) {
                                     tracing::debug!(
                                         "⚠ [{}] Duplicate share packet ignored | Worker: {} | Job: {} | Nonce: {:016x}",

@@ -184,7 +184,7 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
         .as_millis() as u64;
     if let Ok(existing_workers) = sqlx::query(
         r#"
-        SELECT worker_identity, valid_shares, rejected_shares, blocks_found,
+        SELECT COALESCE(NULLIF(worker_identity, ''), worker_id) AS worker_identity, valid_shares, rejected_shares, blocks_found,
                last_share_ts, COALESCE(streak_started_ts, 0) AS streak_started_ts,
                COALESCE(effective_fee_rate, 0.01) AS effective_fee_rate
         FROM worker_profiles
@@ -232,6 +232,7 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
     let mut cached_immature_blocks_kas: f64 = 0.0;
     let mut cached_total_blocks_count: i64 = 0;
     let mut tick_counter: u64 = 0;
+    let mut pending_micro_shares: Vec<(String, f64, f64)> = Vec::new();
 
     loop {
         tokio::select! {
@@ -274,6 +275,7 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                     state.shares_contributed += difficulty;
                     state.valid_share_count += 1;
                     state.unflushed_difficulty += difficulty;
+                    pending_micro_shares.push((full_worker_name.clone(), difficulty, eff_rate));
                     WORKER_SHARES.with_label_values(&[&full_worker_name, "valid"]).inc_by(difficulty as u64);
                 } else if difficulty < 0.0 {
                     state.rejected_share_count += 1;
@@ -916,44 +918,42 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                         pipeline.cmd("LTRIM").arg(&w_key).arg(-2880).arg(-1).ignore();
                     }
                 }
-                if tick_counter % 30 == 0 && !db_worker_snapshots.is_empty() {
+                if !pending_micro_shares.is_empty() {
+                    let batch = std::mem::take(&mut pending_micro_shares);
+                    let (mut w_ids, mut diffs, mut deltas, mut ndiffs, mut settled) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                    for (w_id, diff_w, eff_fee) in batch {
+                        let cw = w_id.split('.').next().unwrap_or("").to_lowercase().replace("kaspa:", "");
+                        let is_house = !corp_kas_clean.is_empty() && cw == corp_kas_clean;
+                        let kd = if can_calculate_yields {
+                            let g = (diff_w * KASPA_DIFF_CONSTANT * block_reward) / (net_diff * 2.0);
+                            if is_house { g.max(0.0) } else { (g * (1.0 - eff_fee) * elastic_streaming_factor).max(0.0) }
+                        } else { 0.0 };
+                        w_ids.push(w_id); diffs.push(diff_w); deltas.push(kd); ndiffs.push(net_diff); settled.push(kd > 0.0);
+                    }
+                    let pool_ms = pg_pool.clone();
+                    let prune = tick_counter % 300 == 0;
+                    tokio::spawn(async move {
+                        if let Err(e) = sqlx::query("INSERT INTO micro_shares (worker_id, difficulty_weight, kas_value_delta, network_diff, is_settled) SELECT * FROM UNNEST($1::text[], $2::float8[], $3::float8[], $4::float8[], $5::bool[])")
+                            .bind(&w_ids).bind(&diffs).bind(&deltas).bind(&ndiffs).bind(&settled).execute(&pool_ms).await {
+                            tracing::error!("micro_shares insert failed: {}", e);
+                        }
+                        if prune { let _ = sqlx::query("DELETE FROM micro_shares WHERE recorded_at < CURRENT_TIMESTAMP - INTERVAL '24 hours'").execute(&pool_ms).await; }
+                    });
+                }
+                if tick_counter % 5 == 0 && !db_worker_snapshots.is_empty() {
                     let pool_bg = pg_pool.clone();
                     tokio::spawn(async move {
                         for snap in db_worker_snapshots {
-                            let _ = sqlx::query(
-                                r#"
-                                INSERT INTO worker_profiles
-                                (worker_identity, wallet_address, worker_name, hashrate_ths, valid_shares, rejected_shares, acceptance_pct, blocks_found, last_share_ts, streak_started_ts, effective_fee_rate, status, updated_at)
-                                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, CURRENT_TIMESTAMP)
-                                ON CONFLICT (worker_identity) DO UPDATE SET
-                                    wallet_address = EXCLUDED.wallet_address,
-                                    worker_name = EXCLUDED.worker_name,
-                                    hashrate_ths = EXCLUDED.hashrate_ths,
-                                    valid_shares = EXCLUDED.valid_shares,
-                                    rejected_shares = EXCLUDED.rejected_shares,
-                                    acceptance_pct = EXCLUDED.acceptance_pct,
-                                    blocks_found = EXCLUDED.blocks_found,
-                                    last_share_ts = EXCLUDED.last_share_ts,
-                                    streak_started_ts = EXCLUDED.streak_started_ts,
-                                    effective_fee_rate = EXCLUDED.effective_fee_rate,
-                                    status = EXCLUDED.status,
-                                    updated_at = CURRENT_TIMESTAMP
-                                "#
-                            )
-                            .bind(&snap.full_identity)
-                            .bind(&snap.wallet_address)
-                            .bind(&snap.worker_name)
-                            .bind(snap.hashrate_ths)
-                            .bind(snap.valid_shares)
-                            .bind(snap.rejected_shares)
-                            .bind(snap.acceptance_pct)
-                            .bind(snap.blocks_found)
-                            .bind(snap.last_share_ts)
-                            .bind(snap.streak_started_ts)
-                            .bind(snap.effective_fee_rate)
-                            .bind(&snap.status)
-                            .execute(&pool_bg)
-                            .await;
+                            let port_pub = crate::stratum_tcp::resolve_worker_public_port(&snap.full_identity);
+                            let dev_prof = match port_pub { 3331 => "GPU_TIER_1", 3333 => "INDUSTRIAL_ASIC_TIER_3", _ => "HOME_ASIC_TIER_2" };
+                            let wn = snap.worker_name.to_lowercase();
+                            let hw = if wn.contains("ks7") { "IceRiver KS7 Lite" } else if wn.contains("ultra") { "IceRiver KS0 Ultra" } else if wn.contains("pro") { "IceRiver KS0 Pro" } else if wn.contains("ks0") { "IceRiver KS0" } else { "IceRiver KS" };
+                            let raw_hr = snap.hashrate_ths * 1e12;
+                            if let Err(e) = sqlx::query("INSERT INTO worker_profiles (worker_id, worker_identity, wallet_address, device_profile, hardware_model, worker_name, hashrate_ths, current_hashrate, stratum_port, valid_shares, rejected_shares, acceptance_pct, blocks_found, last_share_ts, streak_started_ts, effective_fee_rate, status, updated_at, last_seen) VALUES ($1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT (worker_id) DO UPDATE SET worker_identity = EXCLUDED.worker_identity, wallet_address = EXCLUDED.wallet_address, device_profile = EXCLUDED.device_profile, hardware_model = EXCLUDED.hardware_model, worker_name = EXCLUDED.worker_name, hashrate_ths = EXCLUDED.hashrate_ths, current_hashrate = EXCLUDED.current_hashrate, stratum_port = EXCLUDED.stratum_port, valid_shares = EXCLUDED.valid_shares, rejected_shares = EXCLUDED.rejected_shares, acceptance_pct = EXCLUDED.acceptance_pct, blocks_found = EXCLUDED.blocks_found, last_share_ts = EXCLUDED.last_share_ts, streak_started_ts = EXCLUDED.streak_started_ts, effective_fee_rate = EXCLUDED.effective_fee_rate, status = EXCLUDED.status, updated_at = CURRENT_TIMESTAMP, last_seen = CASE WHEN EXCLUDED.status = 'online' THEN CURRENT_TIMESTAMP ELSE worker_profiles.last_seen END")
+                                .bind(&snap.full_identity).bind(&snap.wallet_address).bind(dev_prof).bind(hw).bind(&snap.worker_name).bind(snap.hashrate_ths).bind(raw_hr).bind(port_pub).bind(snap.valid_shares).bind(snap.rejected_shares).bind(snap.acceptance_pct).bind(snap.blocks_found).bind(snap.last_share_ts).bind(snap.streak_started_ts).bind(snap.effective_fee_rate).bind(&snap.status)
+                                .execute(&pool_bg).await {
+                                tracing::error!("worker_profiles upsert failed: {}", e);
+                            }
                         }
                     });
                 }
