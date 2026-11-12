@@ -905,15 +905,13 @@ pub async fn handle_sor_execute(
         );
     }
 
-    let anchor_layer_sweep = crate::chronos::sweep_layered_buckets_on_anchor_order(
-        &pool,
-        &receive_asset,
-        anchor_kas_volume,
-        kas_spot,
-        receive_spot,
-    )
-    .await
-    .unwrap_or_else(|_| json!({ "layeredBucketsCleared": 0 }));
+    let anchor_layer_sweep = if !has_local_lp {
+        crate::chronos::sweep_layered_buckets_on_anchor_order(
+            &pool, &receive_asset, anchor_kas_volume, kas_spot, receive_spot,
+        ).await.unwrap_or_else(|_| json!({ "layeredBucketsCleared": 0 }))
+    } else {
+        json!({ "layeredBucketsCleared": 0, "deferredTo10sDarkPoolBatch": true })
+    };
 
     let hifo_summary = match_and_consume_hifo_lots(
         &pool,
@@ -1031,11 +1029,46 @@ pub async fn handle_sor_execute(
                     }
                 }
                 let _: redis::RedisResult<()> = redis::cmd("INCRBYFLOAT")
-                    .arg(format!(
-                        "perennia:lp:pending_yield_usd:{}",
-                        target_distribution_pair
-                    ))
+                    .arg(format!("perennia:lp:pending_yield_usd:{}", target_distribution_pair))
                     .arg(waterfall.lp_allocated_fee_usd)
+                    .query_async(&mut conn)
+                    .await;
+                let direction = if pay_asset == "KAS" {
+                    "SELL_KAS"
+                } else if receive_asset == "KAS" {
+                    "BUY_KAS"
+                } else {
+                    "CROSS_ASSET"
+                };
+                let kas_equiv: f64 = if pay_asset == "KAS" {
+                    amount
+                } else if kas_spot > 0.0_f64 {
+                    gross_usd / kas_spot
+                } else {
+                    estimated_output
+                };
+                let queued_at_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                let netting_order = json!({
+                    "tx_uuid": tx_uuid,
+                    "wallet": prefixed_wallet,
+                    "direction": direction,
+                    "pay_asset": pay_asset,
+                    "receive_asset": receive_asset,
+                    "pay_amount": amount,
+                    "receive_amount": estimated_output,
+                    "amount_kas": kas_equiv,
+                    "gross_usd": gross_usd,
+                    "net_usd": net_usd,
+                    "fee_captured_usd": waterfall.perennia_total_cut_usd,
+                    "total_fee_usd": fee_usd,
+                    "queued_at_ms": queued_at_ms
+                });
+                let _: redis::RedisResult<()> = redis::cmd("RPUSH")
+                    .arg("perennia:sor:netting_queue")
+                    .arg(netting_order.to_string())
                     .query_async(&mut conn)
                     .await;
             }

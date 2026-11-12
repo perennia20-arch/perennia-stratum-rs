@@ -233,73 +233,30 @@ pub async fn debit_user_token_balance(
     ticker: &str,
     amount: f64,
 ) -> Result<(), String> {
-    if amount <= 0.0 {
+    if amount <= 0.0_f64 {
         return Err("Debit amount must be greater than 0.".to_string());
     }
     let clean_ticker = ticker.trim().to_uppercase();
     if clean_ticker == "KAS" {
         if crate::chronos::upsert_signed_yield_reservoir_kas(
-            pool,
-            prefixed_wallet,
-            -amount,
-            0.0,
-            0.0,
-        )
-        .await
-        .is_ok()
-        {
+            pool, prefixed_wallet, -amount, 0.0_f64, 0.0_f64,
+        ).await.is_ok() {
             if let Ok(redis_url) = env::var("REDIS_URL") {
                 if let Ok(client) = redis::Client::open(redis_url) {
                     if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
                         let key = format!("dev:sor:treasury:balances:{}", clean_wallet);
-                        let cur: f64 = redis::cmd("HGET")
-                            .arg(&key)
-                            .arg("KAS")
-                            .query_async::<_, Option<String>>(&mut conn)
-                            .await
-                            .ok()
-                            .flatten()
-                            .and_then(|s| s.parse::<f64>().ok())
-                            .unwrap_or(0.0);
-                        let next = (cur - amount).max(0.0);
-                        let _: redis::RedisResult<()> = redis::cmd("HSET")
-                            .arg(&key)
-                            .arg("KAS")
-                            .arg(next.to_string())
-                            .query_async(&mut conn)
-                            .await;
+                        let cur: f64 = redis::cmd("HGET").arg(&key).arg("KAS")
+                            .query_async::<_, Option<String>>(&mut conn).await
+                            .ok().flatten().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0_f64);
+                        let _: redis::RedisResult<()> = redis::cmd("HSET").arg(&key).arg("KAS")
+                            .arg((cur - amount).max(0.0_f64).to_string()).query_async(&mut conn).await;
                     }
                 }
             }
             return Ok(());
         }
     }
-    if let Ok(redis_url) = env::var("REDIS_URL") {
-        if let Ok(client) = redis::Client::open(redis_url) {
-            if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
-                let key = format!("dev:sor:treasury:balances:{}", clean_wallet);
-                let cur: f64 = redis::cmd("HGET")
-                    .arg(&key)
-                    .arg(&clean_ticker)
-                    .query_async::<_, Option<String>>(&mut conn)
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(0.0);
-                if cur + 1e-8 >= amount {
-                    let next = (cur - amount).max(0.0);
-                    let _: redis::RedisResult<()> = redis::cmd("HSET")
-                        .arg(&key)
-                        .arg(&clean_ticker)
-                        .arg(next.to_string())
-                        .query_async(&mut conn)
-                        .await;
-                    return Ok(());
-                }
-            }
-        }
-    }
+
     let row_opt = sqlx::query(
         r#"
         SELECT wallet_address, streaming_balance_kas, total_yield_kas,
@@ -309,62 +266,76 @@ pub async fn debit_user_token_balance(
         WHERE wallet_address = $1 OR wallet_address = $2
         LIMIT 1
         "#,
-    )
-    .bind(prefixed_wallet)
-    .bind(clean_wallet)
-    .fetch_optional(pool)
-    .await
+    ).bind(prefixed_wallet).bind(clean_wallet).fetch_optional(pool).await
     .map_err(|e| format!("DB lookup failed: {}", e))?;
-    let Some(row) = row_opt else {
-        return Err(format!(
-            "INSUFFICIENT_BALANCE: 0.0000 {} available for {}.",
-            clean_ticker, prefixed_wallet
-        ));
-    };
-    if row.try_get::<bool, _>("quarantined").unwrap_or(false) {
-        return Err(format!("Wallet {} is quarantined.", prefixed_wallet));
+
+    let mut db_avail: f64 = 0.0_f64;
+    if let Some(ref row) = row_opt {
+        if row.try_get::<bool, _>("quarantined").unwrap_or(false) {
+            return Err(format!("Wallet {} is quarantined.", prefixed_wallet));
+        }
+        if clean_ticker != "KAS" {
+            let streaming_kas: f64 = row.try_get("streaming_balance_kas").unwrap_or(0.0_f64);
+            let total_yield_kas: f64 = row.try_get("total_yield_kas").unwrap_or(0.0_f64);
+            let mut lp_tokens: Value = row.try_get("lp_tokens").unwrap_or_else(|_| json!({}));
+            let target_pk: String = row.try_get("wallet_address").unwrap_or_else(|_| prefixed_wallet.to_string());
+            let cur_tok: f64 = lp_tokens.get(&clean_ticker)
+                .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok())))
+                .unwrap_or(0.0_f64);
+            db_avail = cur_tok;
+            if cur_tok + 1e-8_f64 >= amount {
+                let next_tok: f64 = ((cur_tok - amount).max(0.0_f64) * 1e8_f64).round() / 1e8_f64;
+                if let Some(obj) = lp_tokens.as_object_mut() {
+                    obj.insert(clean_ticker.clone(), json!(next_tok));
+                }
+                let new_hmac = crate::chronos::compute_reservoir_hmac(
+                    prefixed_wallet, streaming_kas, total_yield_kas, &lp_tokens,
+                )?;
+                sqlx::query(
+                    "UPDATE yield_reservoirs SET lp_tokens = $2, row_hmac_sig = $3, last_updated = CURRENT_TIMESTAMP WHERE wallet_address = $1",
+                ).bind(&target_pk).bind(&lp_tokens).bind(&new_hmac).execute(pool).await
+                .map_err(|e| format!("Failed to update token reservoir balance: {}", e))?;
+
+                if let Ok(redis_url) = env::var("REDIS_URL") {
+                    if let Ok(client) = redis::Client::open(redis_url) {
+                        if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
+                            let key = format!("dev:sor:treasury:balances:{}", clean_wallet);
+                            let _: redis::RedisResult<()> = redis::cmd("HSET")
+                                .arg(&key).arg(&clean_ticker).arg(next_tok.to_string())
+                                .query_async(&mut conn).await;
+                        }
+                    }
+                }
+                return Ok(());
+            }
+        } else {
+            db_avail = row.try_get("streaming_balance_kas").unwrap_or(0.0_f64);
+        }
     }
-    let streaming_kas: f64 = row.try_get("streaming_balance_kas").unwrap_or(0.0);
-    let total_yield_kas: f64 = row.try_get("total_yield_kas").unwrap_or(0.0);
-    let mut lp_tokens: Value = row.try_get("lp_tokens").unwrap_or_else(|_| json!({}));
-    let target_pk: String = row
-        .try_get("wallet_address")
-        .unwrap_or_else(|_| prefixed_wallet.to_string());
-    let cur_tok = lp_tokens
-        .get(&clean_ticker)
-        .and_then(|v| {
-            v.as_f64()
-                .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
-        })
-        .unwrap_or(0.0);
-    if cur_tok + 1e-8 < amount {
-        return Err(format!(
-            "INSUFFICIENT_BALANCE: Requested {:.4} {}, available {:.4} {}.",
-            amount, clean_ticker, cur_tok, clean_ticker
-        ));
+
+    if db_avail <= 1e-8_f64 {
+        if let Ok(redis_url) = env::var("REDIS_URL") {
+            if let Ok(client) = redis::Client::open(redis_url) {
+                if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
+                    let key = format!("dev:sor:treasury:balances:{}", clean_wallet);
+                    let cur: f64 = redis::cmd("HGET").arg(&key).arg(&clean_ticker)
+                        .query_async::<_, Option<String>>(&mut conn).await
+                        .ok().flatten().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0_f64);
+                    if cur + 1e-8_f64 >= amount {
+                        let _: redis::RedisResult<()> = redis::cmd("HSET")
+                            .arg(&key).arg(&clean_ticker).arg((cur - amount).max(0.0_f64).to_string())
+                            .query_async(&mut conn).await;
+                        return Ok(());
+                    }
+                }
+            }
+        }
     }
-    let next_tok = (cur_tok - amount).max(0.0);
-    if let Some(obj) = lp_tokens.as_object_mut() {
-        obj.insert(clean_ticker.clone(), json!(next_tok));
-    }
-    let new_hmac =
-        crate::chronos::compute_reservoir_hmac(prefixed_wallet, streaming_kas, total_yield_kas, &lp_tokens)?;
-    sqlx::query(
-        r#"
-        UPDATE yield_reservoirs
-        SET lp_tokens = $2,
-            row_hmac_sig = $3,
-            last_updated = CURRENT_TIMESTAMP
-        WHERE wallet_address = $1
-        "#,
-    )
-    .bind(&target_pk)
-    .bind(&lp_tokens)
-    .bind(&new_hmac)
-    .execute(pool)
-    .await
-    .map_err(|e| format!("Failed to update token reservoir balance: {}", e))?;
-    Ok(())
+
+    Err(format!(
+        "INSUFFICIENT_BALANCE: Requested {:.4} {}, available {:.4} {}.",
+        amount, clean_ticker, db_avail, clean_ticker
+    ))
 }
 
 pub async fn credit_user_token_balance(

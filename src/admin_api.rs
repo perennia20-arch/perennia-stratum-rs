@@ -133,6 +133,204 @@ pub fn admin_routes() -> Router<PgPool> {
         .route("/v1/admin/fiat", post(handle_fiat_action))
         .route("/v1/admin/l1-payout", post(handle_l1_payout_action))
         .route("/v1/admin/epoch-bell", post(handle_force_epoch_bell))
+        .route("/v1/admin/netting-cycle", post(handle_force_netting_cycle))
+        .route("/v1/admin/netting-lab", post(handle_netting_lab))
+}
+
+async fn handle_force_netting_cycle(
+    headers: HeaderMap,
+    State(pool): State<PgPool>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    verify_internal_admin_headers(&headers)?;
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let client = redis::Client::open(redis_url).map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Redis client error: {}", e)})))
+    })?;
+    match crate::chronos::run_delta_netting_cycle(&client, &pool).await {
+        Ok(receipt) => Ok(Json(json!({ "success": true, "action": "FORCE_NETTING_CYCLE", "batchReceipt": receipt }))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Netting cycle failed: {}", e)})))),
+    }
+}
+
+async fn handle_netting_lab(
+    headers: HeaderMap,
+    State(pool): State<PgPool>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    verify_internal_admin_headers(&headers)?;
+    if payload.get("labCohortTag").and_then(|v| v.as_str()).unwrap_or("") != "PERENNIA_NETTING_MATH_V5" {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "Invalid labCohortTag."}))));
+    }
+    let action = payload.get("action").and_then(|v| v.as_str()).unwrap_or("");
+    let master_clean = crate::chronos::resolve_master_treasury_address();
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let r_client = redis::Client::open(redis_url).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+    let mut r_conn = r_client.get_multiplexed_async_connection().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+
+    if action == "SEED_COHORT" {
+        let profit_before: Option<String> = redis::cmd("GET").arg("perennia:treasury:netting_profit_usd").query_async(&mut r_conn).await.unwrap_or(None);
+        let delta_before: Option<String> = redis::cmd("GET").arg("perennia:treasury:unhedged_delta_kas").query_async(&mut r_conn).await.unwrap_or(None);
+        let fees_before: Option<String> = redis::cmd("GET").arg("perennia:fees:batch_accumulated:USDC").query_async(&mut r_conn).await.unwrap_or(None);
+        let _: redis::RedisResult<()> = redis::cmd("DEL").arg("perennia:sor:netting_queue").query_async(&mut r_conn).await;
+
+        if let Some(lp_w) = payload.get("lpAnchorWallet").and_then(|v| v.as_str()) {
+            let lp_clean = lp_w.trim().to_lowercase().replace("kaspa:", "").trim().to_string();
+            if !lp_clean.is_empty() && lp_clean != master_clean {
+                let lp_pref = format!("kaspa:{}", lp_clean);
+                let _ = sqlx::query("DELETE FROM liquidity_providers WHERE wallet_address = $1 OR wallet_address = $2").bind(&lp_pref).bind(&lp_clean).execute(&pool).await;
+                for (pair, b_tick, b_amt) in [("KAS/USDC", "USDC", 250_000.0_f64), ("KAS/BTC", "BTC", 5.0_f64), ("KAS/ETH", "ETH", 80.0_f64), ("KAS/SOL", "SOL", 1_500.0_f64)] {
+                    let wj = json!({"KAS": 0.5, b_tick: 0.5});
+                    let rj = json!({"KAS": 1_500_000.0_f64, b_tick: b_amt});
+                    let _ = sqlx::query(
+                        "INSERT INTO liquidity_providers (wallet_address, pool_pair, staked_asset_a, staked_asset_b, weights_json, reserves_json, lock_duration_days, unlock_date) VALUES ($1, $2, 1500000.0, $3, $4, $5, 90, CURRENT_TIMESTAMP + INTERVAL '90 days')"
+                    ).bind(&lp_pref).bind(pair).bind(b_amt).bind(&wj).bind(&rj).execute(&pool).await;
+                }
+            }
+        }
+
+        let empty_s = vec![];
+        let seats = payload.get("seats").and_then(|v| v.as_array()).unwrap_or(&empty_s);
+        let mut seeded_count: usize = 0;
+        for s in seats {
+            let clean = s.get("wallet").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase().replace("kaspa:", "").trim().to_string();
+            if clean.is_empty() || clean == master_clean { continue; }
+            let pref = format!("kaspa:{}", clean);
+            let _ = sqlx::query("DELETE FROM yield_reservoirs WHERE wallet_address = $1 OR wallet_address = $2").bind(&pref).bind(&clean).execute(&pool).await;
+            let _ = sqlx::query("DELETE FROM user_command_centers WHERE wallet_address = $1 OR wallet_address = $2").bind(&pref).bind(&clean).execute(&pool).await;
+            let _: redis::RedisResult<()> = redis::cmd("DEL").arg(format!("dev:sor:treasury:balances:{}", clean)).query_async(&mut r_conn).await;
+            if let Some(bals) = s.get("balances").and_then(|v| v.as_object()) {
+                for (tick, val) in bals {
+                    let amt: f64 = val.as_f64().unwrap_or(0.0_f64);
+                    if amt > 0.0_f64 {
+                        let _ = crate::state_api::credit_user_token_balance(&pool, &clean, &pref, tick, amt, tick.eq_ignore_ascii_case("KAS")).await;
+                    }
+                }
+            }
+            if let Some(sectors) = s.get("sectors") {
+                let layout = json!({ "workers": [], "sectors": sectors, "systemMode": "base" });
+                let _ = sqlx::query(
+                    "INSERT INTO user_command_centers (wallet_address, layout_state, last_updated) VALUES ($1, $2, CURRENT_TIMESTAMP) ON CONFLICT (wallet_address) DO UPDATE SET layout_state = EXCLUDED.layout_state, last_updated = CURRENT_TIMESTAMP"
+                ).bind(&pref).bind(&layout).execute(&pool).await;
+            }
+            seeded_count += 1;
+        }
+        let kas_spot: f64 = crate::fiat_rails::resolve_live_spot_price(&pool, "KAS").await.unwrap_or(0.15_f64);
+        let _ = crate::chronos::publish_live_epoch_bucket_telemetry(&pool, kas_spot).await;
+        return Ok(Json(json!({
+            "success": true,
+            "seededCount": seeded_count,
+            "kasSpotUsd": kas_spot,
+            "baseline": { "nettingProfitUsd": profit_before, "unhedgedDeltaKas": delta_before, "feesUsdc": fees_before }
+        })));
+    }
+
+    if action == "INSPECT_COHORT" {
+        let empty_w = vec![];
+        let wallets = payload.get("wallets").and_then(|v| v.as_array()).unwrap_or(&empty_w);
+        let mut pref_list: Vec<String> = Vec::new();
+        let mut clean_list: Vec<String> = Vec::new();
+        for w in wallets {
+            if let Some(ws) = w.as_str() {
+                let c = ws.trim().to_lowercase().replace("kaspa:", "").trim().to_string();
+                if !c.is_empty() { pref_list.push(format!("kaspa:{}", c)); clean_list.push(c); }
+            }
+        }
+        let res_rows = sqlx::query(
+            "SELECT wallet_address, streaming_balance_kas, total_yield_kas, COALESCE(lp_tokens, '{}'::jsonb) AS lp_tokens, COALESCE(row_hmac_sig, '') AS row_hmac_sig, COALESCE(quarantined, FALSE) AS quarantined FROM yield_reservoirs WHERE wallet_address = ANY($1) OR wallet_address = ANY($2)"
+        ).bind(&pref_list).bind(&clean_list).fetch_all(&pool).await.unwrap_or_default();
+
+        let mut reservoirs = serde_json::Map::new();
+        for r in res_rows {
+            let c = r.try_get::<String, _>("wallet_address").unwrap_or_default().trim().to_lowercase().replace("kaspa:", "").trim().to_string();
+            let pref = format!("kaspa:{}", c);
+            let sk: f64 = r.try_get("streaming_balance_kas").unwrap_or(0.0_f64);
+            let ty: f64 = r.try_get("total_yield_kas").unwrap_or(0.0_f64);
+            let lpt: Value = r.try_get("lp_tokens").unwrap_or_else(|_| json!({}));
+            let sig: String = r.try_get("row_hmac_sig").unwrap_or_default();
+            let exp_sig = crate::chronos::compute_reservoir_hmac(&pref, sk, ty, &lpt).unwrap_or_default();
+            reservoirs.insert(pref, json!({
+                "streamingKas": sk, "totalYieldKas": ty, "lpTokens": lpt,
+                "hmacValid": !sig.is_empty() && sig == exp_sig,
+                "quarantined": r.try_get::<bool, _>("quarantined").unwrap_or(false)
+            }));
+        }
+        let cc_rows = sqlx::query("SELECT wallet_address, layout_state FROM user_command_centers WHERE wallet_address = ANY($1) OR wallet_address = ANY($2)")
+            .bind(&pref_list).bind(&clean_list).fetch_all(&pool).await.unwrap_or_default();
+        let mut sectors_map = serde_json::Map::new();
+        for r in cc_rows {
+            let c = r.try_get::<String, _>("wallet_address").unwrap_or_default().trim().to_lowercase().replace("kaspa:", "").trim().to_string();
+            let ls: Value = r.try_get("layout_state").unwrap_or_else(|_| json!({}));
+            sectors_map.insert(format!("kaspa:{}", c), ls.get("sectors").cloned().unwrap_or_else(|| json!([])));
+        }
+        let hifo_cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM hifo_tax_lots WHERE wallet_address = ANY($1) OR wallet_address = ANY($2)")
+            .bind(&pref_list).bind(&clean_list).fetch_one(&pool).await.unwrap_or(0);
+        let lp_cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM liquidity_providers WHERE wallet_address = ANY($1) OR wallet_address = ANY($2)")
+            .bind(&pref_list).bind(&clean_list).fetch_one(&pool).await.unwrap_or(0);
+        let q_len: usize = redis::cmd("LLEN").arg("perennia:sor:netting_queue").query_async(&mut r_conn).await.unwrap_or(0);
+        let last_batch_raw: Option<String> = redis::cmd("GET").arg("perennia:settlement:last_netting_batch").query_async(&mut r_conn).await.unwrap_or(None);
+        let profit_str: Option<String> = redis::cmd("GET").arg("perennia:treasury:netting_profit_usd").query_async(&mut r_conn).await.unwrap_or(None);
+        let delta_str: Option<String> = redis::cmd("GET").arg("perennia:treasury:unhedged_delta_kas").query_async(&mut r_conn).await.unwrap_or(None);
+        let pt_raw: Vec<String> = redis::cmd("LRANGE").arg("perennia:sor:third_party_passthrough_queue").arg(0).arg(25).query_async(&mut r_conn).await.unwrap_or_default();
+        let pt_parsed: Vec<Value> = pt_raw.iter().filter_map(|s| serde_json::from_str::<Value>(s).ok()).collect();
+        return Ok(Json(json!({
+            "success": true, "reservoirs": reservoirs, "sectorsByWallet": sectors_map,
+            "hifoLotCount": hifo_cnt, "lpPositionsCount": lp_cnt,
+            "redis": {
+                "nettingQueueLen": q_len,
+                "lastNettingBatch": last_batch_raw.and_then(|s| serde_json::from_str::<Value>(&s).ok()),
+                "nettingProfitUsd": profit_str.and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0_f64),
+                "unhedgedDeltaKas": delta_str.and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0_f64),
+                "passthroughQueue": pt_parsed
+            }
+        })));
+    }
+
+    if action == "TEARDOWN_COHORT" {
+        let empty_w = vec![];
+        let wallets = payload.get("wallets").and_then(|v| v.as_array()).unwrap_or(&empty_w);
+        let mut pref_list: Vec<String> = Vec::new();
+        let mut clean_list: Vec<String> = Vec::new();
+        for w in wallets {
+            if let Some(ws) = w.as_str() {
+                let c = ws.trim().to_lowercase().replace("kaspa:", "").trim().to_string();
+                if !c.is_empty() && c != master_clean {
+                    pref_list.push(format!("kaspa:{}", c));
+                    clean_list.push(c.clone());
+                    let _: redis::RedisResult<()> = redis::cmd("DEL").arg(format!("dev:sor:treasury:balances:{}", c)).query_async(&mut r_conn).await;
+                }
+            }
+        }
+        for tbl in ["hifo_disposal_matches", "hifo_tax_lots", "tax_ledger_events", "liquidity_providers", "silo_staking_positions", "user_command_centers", "yield_reservoirs"] {
+            let q = format!("DELETE FROM {} WHERE wallet_address = ANY($1) OR wallet_address = ANY($2)", tbl);
+            let _ = sqlx::query(&q).bind(&pref_list).bind(&clean_list).execute(&pool).await;
+        }
+        if let Some(base) = payload.get("restoreBaseline").and_then(|v| v.as_object()) {
+            for (field, r_key) in [("nettingProfitUsd", "perennia:treasury:netting_profit_usd"), ("unhedgedDeltaKas", "perennia:treasury:unhedged_delta_kas"), ("feesUsdc", "perennia:fees:batch_accumulated:USDC")] {
+                if let Some(val) = base.get(field) {
+                    if let Some(s) = val.as_str() {
+                        let _: redis::RedisResult<()> = redis::cmd("SET").arg(r_key).arg(s).query_async(&mut r_conn).await;
+                    } else if val.is_null() {
+                        let _: redis::RedisResult<()> = redis::cmd("DEL").arg(r_key).query_async(&mut r_conn).await;
+                    }
+                }
+            }
+        }
+        let pt_all: Vec<String> = redis::cmd("LRANGE").arg("perennia:sor:third_party_passthrough_queue").arg(0).arg(-1).query_async(&mut r_conn).await.unwrap_or_default();
+        let _: redis::RedisResult<()> = redis::cmd("DEL").arg("perennia:sor:third_party_passthrough_queue").query_async(&mut r_conn).await;
+        for raw_item in pt_all.into_iter().rev() {
+            let is_lab = serde_json::from_str::<Value>(&raw_item).ok()
+                .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|s| s == "NET_RESIDUAL_AUTOBALANCE"))
+                .unwrap_or(false);
+            if !is_lab {
+                let _: redis::RedisResult<()> = redis::cmd("LPUSH").arg("perennia:sor:third_party_passthrough_queue").arg(raw_item).query_async(&mut r_conn).await;
+            }
+        }
+        let kas_spot: f64 = crate::fiat_rails::resolve_live_spot_price(&pool, "KAS").await.unwrap_or(0.15_f64);
+        let _ = crate::chronos::publish_live_epoch_bucket_telemetry(&pool, kas_spot).await;
+        return Ok(Json(json!({ "success": true, "purgedWallets": pref_list.len() })));
+    }
+
+    Err((StatusCode::BAD_REQUEST, Json(json!({"error": "Unsupported netting-lab action."}))))
 }
 
 async fn handle_force_epoch_bell(
