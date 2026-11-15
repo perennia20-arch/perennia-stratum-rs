@@ -520,11 +520,46 @@ async fn compute_dynamic_hurdle_waterfall(
     }
 }
 
+fn estimate_modeled_gas_and_slippage_usd(
+    pay_asset: &str,
+    receive_asset: &str,
+    gross_usd: f64,
+    is_external_pass_through: bool,
+) -> (f64, f64) {
+    let gas_for_asset = |ticker: &str| -> f64 {
+        match ticker.trim().to_uppercase().as_str() {
+            "KAS" | "SILO" | "NACHO" | "BEDRCK" | "PERX" => 0.002,
+            "BTC" => 0.65,
+            "ETH" | "USDC" | "USDT" | "XAU" => 0.25,
+            "SOL" | "ARB" | "BASE" | "POL" | "AVAX" | "SUI" | "XRP" | "DOGE" | "TRX" => 0.02,
+            _ => 0.15,
+        }
+    };
+    let raw_gas_usd = gas_for_asset(pay_asset) + gas_for_asset(receive_asset);
+    let network_gas_usd = if !is_external_pass_through && gross_usd > 0.0 && gross_usd < 25.0 {
+        raw_gas_usd.min((gross_usd * 0.01).max(0.002))
+    } else {
+        raw_gas_usd
+    };
+    let external_slip_usd = if is_external_pass_through {
+        gross_usd * 0.0015
+    } else {
+        0.0
+    };
+    (
+        (network_gas_usd * 10_000.0).round() / 10_000.0,
+        (external_slip_usd * 10_000.0).round() / 10_000.0,
+    )
+}
+
 async fn resolve_user_fee_rate(
     pool: &PgPool,
     prefixed_wallet: &str,
     clean_wallet: &str,
     usd_volume: f64,
+    pay_asset: &str,
+    receive_asset: &str,
+    allow_dark_pool_internal_clearing: bool,
 ) -> (f64, &'static str) {
     let (wallet_floor_rate, tier_label, has_wholesale_perk) =
         crate::fiat_rails::resolve_wallet_swap_fee_floor_pct(pool, prefixed_wallet).await;
@@ -534,6 +569,11 @@ async fn resolve_user_fee_rate(
             tier_label,
         );
     }
+
+    let pay_up = pay_asset.trim().to_uppercase();
+    let rec_up = receive_asset.trim().to_uppercase();
+    let is_buy_kas = rec_up == "KAS" && pay_up != "USD";
+
     let staked_silo: f64 = sqlx::query_scalar(
         r#"
         SELECT COALESCE(SUM(amount_staked), 0.0)
@@ -547,22 +587,65 @@ async fn resolve_user_fee_rate(
     .fetch_one(pool)
     .await
     .unwrap_or(0.0);
-    let mut fee_rate: f64 = if usd_volume >= 2000.0 {
-        crate::fiat_rails::HARD_PROFIT_FLOOR_PCT
-    } else {
-        wallet_floor_rate.max(crate::fiat_rails::STANDARD_PUBLIC_SWAP_FEE_PCT)
-    };
-    if staked_silo >= 100_000.0 {
-        fee_rate = fee_rate.min(crate::fiat_rails::HARD_PROFIT_FLOOR_PCT);
-        return (fee_rate, "0.10% SILO Sovereign Staker Wholesale Floor");
+
+    if staked_silo >= 1_000_000.0 {
+        return (
+            crate::fiat_rails::HARD_PROFIT_FLOOR_PCT,
+            "0.10% SILO Sovereign Staker Wholesale Floor",
+        );
+    } else if staked_silo >= 100_000.0 {
+        if is_buy_kas {
+            return (
+                crate::fiat_rails::BUY_KAS_INBOUND_FEE_PCT,
+                "0.20% Buy-KAS Inbound Tier",
+            );
+        }
+        return (
+            crate::fiat_rails::WHOLESALE_VOLUME_SWAP_FEE_PCT,
+            "0.25% SILO Vanguard Staker Tier",
+        );
     } else if staked_silo >= 10_000.0 {
-        fee_rate = fee_rate.min(0.0012_f64);
-        return (fee_rate, "0.12% SILO Shield Staker Tier");
+        if is_buy_kas {
+            return (
+                crate::fiat_rails::BUY_KAS_INBOUND_FEE_PCT,
+                "0.20% Buy-KAS Inbound Tier",
+            );
+        }
+        return (
+            crate::fiat_rails::SILO_SHIELD_SWAP_FEE_PCT,
+            "0.35% SILO Shield Staker Tier",
+        );
     }
-    (
-        fee_rate.max(crate::fiat_rails::HARD_PROFIT_FLOOR_PCT),
-        tier_label,
-    )
+
+    if is_buy_kas {
+        return (
+            crate::fiat_rails::BUY_KAS_INBOUND_FEE_PCT,
+            "0.20% Buy-KAS Inbound Tier",
+        );
+    }
+
+    if usd_volume >= 2_500.0 {
+        return (
+            crate::fiat_rails::WHOLESALE_VOLUME_SWAP_FEE_PCT,
+            "0.25% Volume Wholesale Tier ($2,500+)",
+        );
+    }
+
+    let is_dark_pool_major = allow_dark_pool_internal_clearing
+        && DEFAULT_RESERVE_WHITELIST.iter().any(|&t| t == pay_up)
+        && DEFAULT_RESERVE_WHITELIST.iter().any(|&t| t == rec_up);
+
+    if is_dark_pool_major {
+        (
+            crate::fiat_rails::STANDARD_PUBLIC_SWAP_FEE_PCT,
+            "0.50% Dark Pool Major Swap Tier",
+        )
+    } else {
+        (
+            crate::fiat_rails::PASS_THROUGH_SWAP_FEE_PCT,
+            "0.85% External Pass-Through Swap Tier",
+        )
+    }
 }
 
 async fn has_sufficient_local_lp_depth(
@@ -696,10 +779,25 @@ pub async fn handle_sor_execute(
             })),
         );
     }
-    let (fee_rate, fee_tier_label) =
-        resolve_user_fee_rate(&pool, &prefixed_wallet, &clean_wallet, gross_usd).await;
+    let allow_dp_pair = steering.allow_dark_pool_internal_clearing
+        && !dark_pool_paused
+        && DEFAULT_RESERVE_WHITELIST.iter().any(|&t| t == pay_asset)
+        && DEFAULT_RESERVE_WHITELIST.iter().any(|&t| t == receive_asset);
+    let (fee_rate, fee_tier_label) = resolve_user_fee_rate(
+        &pool,
+        &prefixed_wallet,
+        &clean_wallet,
+        gross_usd,
+        &pay_asset,
+        &receive_asset,
+        allow_dp_pair,
+    )
+    .await;
+    let (network_gas_usd, external_slip_usd) =
+        estimate_modeled_gas_and_slippage_usd(&pay_asset, &receive_asset, gross_usd, !allow_dp_pair);
     let hard_floor_usd = (gross_usd * crate::fiat_rails::HARD_PROFIT_FLOOR_PCT).max(0.01);
-    let fee_usd = (gross_usd * fee_rate).max(hard_floor_usd);
+    let protocol_fee_usd = (gross_usd * fee_rate).max(hard_floor_usd);
+    let fee_usd = (protocol_fee_usd + network_gas_usd + external_slip_usd).min(gross_usd);
     let net_usd = (gross_usd - fee_usd).max(0.0);
     if net_usd <= 0.0 {
         return (

@@ -17,7 +17,11 @@ pub const INITIAL_LOCAL_KAS_FLOAT_USD: f64 = 500.0;
 pub const INITIAL_WHOLESALE_API_USD_FLOAT: f64 = 400.0;
 pub const TARGET_RATCHET_FLOAT_CAP_USD: f64 = 5_000.0;
 pub const HARD_PROFIT_FLOOR_PCT: f64 = 0.001;
-pub const STANDARD_PUBLIC_SWAP_FEE_PCT: f64 = 0.0015;
+pub const BUY_KAS_INBOUND_FEE_PCT: f64 = 0.002;
+pub const WHOLESALE_VOLUME_SWAP_FEE_PCT: f64 = 0.0025;
+pub const SILO_SHIELD_SWAP_FEE_PCT: f64 = 0.0035;
+pub const STANDARD_PUBLIC_SWAP_FEE_PCT: f64 = 0.005;
+pub const PASS_THROUGH_SWAP_FEE_PCT: f64 = 0.0085;
 
 pub const RETAIL_ONRAMP_FEE_BPS: u64 = 85;
 pub const PRO_MINER_ONRAMP_FEE_BPS: u64 = 35;
@@ -307,8 +311,8 @@ pub async fn resolve_wallet_swap_fee_floor_pct(
 ) -> (f64, &'static str, bool) {
     let promo_cohort_active = env::var("KICKOFF_PROMO_COHORT_ACTIVE")
         .ok()
-        .map(|v| !v.trim().eq_ignore_ascii_case("false"))
-        .unwrap_or(true);
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
     let clean_wallet = wallet_address
         .trim()
         .to_lowercase()
@@ -321,7 +325,7 @@ pub async fn resolve_wallet_swap_fee_floor_pct(
         } else {
             (
                 STANDARD_PUBLIC_SWAP_FEE_PCT,
-                "0.15% Standard Public Tier",
+                "0.50% Dark Pool Major Swap Tier",
                 false,
             )
         };
@@ -423,7 +427,7 @@ pub async fn resolve_wallet_swap_fee_floor_pct(
     } else {
         (
             STANDARD_PUBLIC_SWAP_FEE_PCT,
-            "0.15% Standard Public Tier",
+            "0.50% Dark Pool Major Swap Tier",
             false,
         )
     }
