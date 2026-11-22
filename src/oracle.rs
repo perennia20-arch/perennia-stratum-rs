@@ -667,14 +667,20 @@ pub async fn start_spot_pricing_daemon() {
     tokio::spawn(kraken_ws(prices.clone()));
     tokio::spawn(coinbase_ws(prices.clone()));
     tokio::spawn(coingecko_rest_fallback(prices.clone()));
+    for &krc in &["SILO", "NACHO"] {
+        register_dynamic_oracle_ticker(krc);
+    }
     tokio::spawn(dynamic_tickers_rest_poller(
         prices.clone(),
         redis_client.clone(),
     ));
 
     let mut interval = tokio::time::interval(Duration::from_secs(1));
+    let mut solver_tick: u64 = 0;
     loop {
         interval.tick().await;
+        solver_tick = solver_tick.wrapping_add(1);
+        let mut venue_snapshots: HashMap<String, String> = HashMap::new();
         let mut active_medians: HashMap<String, f64> = HashMap::new();
         let mut active_changes_24h: HashMap<String, f64> = HashMap::new();
         let mut active_divergences_bps: HashMap<String, u64> = HashMap::new();
@@ -907,6 +913,28 @@ pub async fn start_spot_pricing_daemon() {
                     }
                 }
             }
+
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            for (asset, ex_map) in p_lock.iter() {
+                let max_age = if ORACLE_STABLECOIN_ASSETS.contains(&asset.as_str()) { 90 } else { 60 };
+                let mut v_map = serde_json::Map::new();
+                for (venue, (spot, chg, ts)) in ex_map.iter() {
+                    let age = now.duration_since(*ts);
+                    if *spot > 0.0 && spot.is_finite() && age.as_secs() < max_age {
+                        v_map.insert(venue.clone(), json!({ "spotUsd": *spot, "change24hPct": *chg, "ageMs": age.as_millis() as u64 }));
+                    }
+                }
+                if !v_map.is_empty() {
+                    venue_snapshots.insert(asset.clone(), json!({
+                        "asset": asset,
+                        "medianUsd": active_medians.get(asset).copied(),
+                        "divergenceBps": active_divergences_bps.get(asset).copied().unwrap_or(0),
+                        "venueCount": v_map.len(),
+                        "updatedAtMs": now_ms,
+                        "venues": Value::Object(v_map)
+                    }).to_string());
+                }
+            }
         }
 
         if let Some(&eth_med) = active_medians.get("ETH") {
@@ -951,7 +979,40 @@ pub async fn start_spot_pricing_daemon() {
         }
 
         if !active_medians.is_empty() {
+            let prebell_json_opt: Option<String> = if solver_tick % 5 == 1 {
+                let (ep_raw, q_len): (Option<String>, usize) = redis::pipe()
+                    .cmd("GET").arg("perennia:settlement:epoch_telemetry")
+                    .cmd("LLEN").arg("perennia:sor:netting_queue")
+                    .query_async(&mut redis_conn).await.unwrap_or((None, 0));
+                let now_s = chrono::Utc::now().timestamp().max(0) as u64;
+                let today_bell = (now_s - (now_s % 86_400)) + 22 * 3_600;
+                let next_bell = if now_s >= today_bell { today_bell + 86_400 } else { today_bell };
+                let secs_rem = next_bell.saturating_sub(now_s);
+                let kas_med = active_medians.get("KAS").copied().unwrap_or(0.0);
+                let (mut tot_kas, mut uncov_kas, mut demands) = (0.0_f64, 0.0_f64, Vec::new());
+                if let Some(b_obj) = ep_raw.and_then(|s| serde_json::from_str::<Value>(&s).ok()).and_then(|v| v.get("buckets").and_then(|b| b.as_object()).cloned()) {
+                    for (t, bv) in b_obj {
+                        let p_kas = bv.get("pendingKas").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let lp_cap = bv.get("lpAvailableKasCapacity").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let st = bv.get("status").and_then(|v| v.as_str()).unwrap_or("IDLE");
+                        if p_kas > 0.0 || st != "IDLE" {
+                            let t_spot = active_medians.get(&t).copied().unwrap_or(0.0);
+                            let u_kas = (p_kas - lp_cap).max(0.0);
+                            tot_kas += p_kas;
+                            uncov_kas += u_kas;
+                            demands.push(json!({ "targetAsset": t, "pendingKas": p_kas, "pendingUsd": p_kas * kas_med, "targetSpotUsd": t_spot, "estimatedTargetTokens": if t_spot > 0.0 { (p_kas * kas_med) / t_spot } else { 0.0 }, "lpAvailableKasCapacity": lp_cap, "uncoveredKas": u_kas, "status": st }));
+                        }
+                    }
+                }
+                Some(json!({ "nextEpochBellTs": next_bell, "secondsUntilBell": secs_rem, "inPreHedgeWindow": secs_rem <= 300, "kasMedianUsd": kas_med, "nettingQueueLen": q_len, "totalPendingKas": tot_kas, "totalPendingUsd": tot_kas * kas_med, "totalUncoveredKas": uncov_kas, "demands": demands, "updatedAtMs": chrono::Utc::now().timestamp_millis() }).to_string())
+            } else { None };
             let mut pipeline = redis::pipe();
+            for (asset, v_json) in &venue_snapshots {
+                pipeline.cmd("SETEX").arg(format!("oracle:venues:{}", asset)).arg(SPOT_ORACLE_TTL_SECS).arg(v_json).ignore();
+            }
+            if let Some(ref pb_json) = prebell_json_opt {
+                pipeline.cmd("SETEX").arg("oracle:prebell:2200_demand").arg(SPOT_ORACLE_TTL_SECS).arg(pb_json).ignore();
+            }
             let mut json_data = json!({});
             let mut supported_vec: Vec<String> = ORACLE_SUPPORTED_ASSETS
                 .iter()
