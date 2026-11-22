@@ -235,21 +235,21 @@ async fn resolve_canonical_coingecko_anchor(
 }
 
 
-fn yahoo_symbol_for_rwa_ticker(ticker: &str) -> &'static str {
+fn yahoo_symbol_for_rwa_ticker(ticker: &str) -> Option<&'static str> {
     match ticker.trim().to_uppercase().as_str() {
-        "SPY" => "SPY",
-        "QQQ" => "QQQ",
-        "NVDA" => "NVDA",
-        "AAPL" => "AAPL",
-        "TSLA" => "TSLA",
-        "AMD" => "AMD",
-        "TSM" => "TSM",
-        "AVGO" => "AVGO",
-        "XLE" => "XLE",
-        "XAU" => "GC=F",
-        "XAG" => "SI=F",
-        "USTB" => "SGOV",
-        _ => "SPY",
+        "SPY" => Some("SPY"),
+        "QQQ" => Some("QQQ"),
+        "NVDA" => Some("NVDA"),
+        "AAPL" => Some("AAPL"),
+        "TSLA" => Some("TSLA"),
+        "AMD" => Some("AMD"),
+        "TSM" => Some("TSM"),
+        "AVGO" => Some("AVGO"),
+        "XLE" => Some("XLE"),
+        "XAU" => Some("GC=F"),
+        "XAG" => Some("SI=F"),
+        "USTB" => Some("SGOV"),
+        _ => None,
     }
 }
 
@@ -257,7 +257,7 @@ async fn fetch_yahoo_finance_rwa_quote(
     client: &reqwest::Client,
     ticker: &str,
 ) -> Option<(f64, f64, i64)> {
-    let yahoo_sym = yahoo_symbol_for_rwa_ticker(ticker);
+    let yahoo_sym = yahoo_symbol_for_rwa_ticker(ticker)?;
     let url = format!(
         "https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=1d&range=5d",
         urlencoding::encode(yahoo_sym)
