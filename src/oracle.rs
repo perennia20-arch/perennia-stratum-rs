@@ -919,7 +919,7 @@ pub async fn start_spot_pricing_daemon() {
                 let max_age = if ORACLE_STABLECOIN_ASSETS.contains(&asset.as_str()) { 90 } else { 60 };
                 let mut v_map = serde_json::Map::new();
                 for (venue, (spot, chg, ts)) in ex_map.iter() {
-                    let age = now.duration_since(*ts);
+                    let age = now.saturating_duration_since(*ts);
                     if *spot > 0.0 && spot.is_finite() && age.as_secs() < max_age {
                         v_map.insert(venue.clone(), json!({ "spotUsd": *spot, "change24hPct": *chg, "ageMs": age.as_millis() as u64 }));
                     }
