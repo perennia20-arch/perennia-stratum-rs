@@ -11,6 +11,9 @@ mod chronos;
 mod state_api;
 mod admin_api;
 mod fiat_rails;
+pub mod agent;
+
+pub use state_api::silverscript;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,7 +22,7 @@ use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 use axum::{
     extract::{Query, Request},
-    http::{StatusCode, HeaderMap},
+    http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json},
     routing::{get, post},
@@ -306,7 +309,7 @@ async fn main() -> anyhow::Result<()> {
         .with_max_level(Level::INFO)
         .finish();
     tracing::subscriber::set_global_default(subscriber).expect("Failed to init tracing");
-    tracing::info!("Booting Perennia Core Engine (Hybrid Mainnet + Stratum)...");
+    tracing::info!("Booting Perennia Core Engine (Hybrid Mainnet + Stratum + Headless Agent Gateway)...");
 
     let mut raw_config = config::StratumConfig::load("config.yaml")?;
 
@@ -317,7 +320,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let config = Arc::new(raw_config);
-    tracing::info!("Targeted Treasury / Stratum Coinbase Wallet: {}", config.mining_address);
+    tracing::info!(
+        "Targeted Treasury / Stratum Coinbase Wallet: {}",
+        config.mining_address
+    );
 
     let db_url = std::env::var("DATABASE_URL")
         .expect("CRITICAL: DATABASE_URL environment variable is required.");
@@ -334,6 +340,8 @@ async fn main() -> anyhow::Result<()> {
         });
 
     schema::ensure_database_schema(&pool).await?;
+
+    let agent_state = agent::AgentGatewayState::initialize(pool.clone(), &redis_url).await?;
 
     let (daa_tx, _) = tokio::sync::broadcast::channel::<u64>(100);
     let (utxo_tx, _) =
@@ -421,12 +429,33 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let bind_host =
+        std::env::var("RUST_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:8002".to_string());
+
+    // Optional dedicated TCP edge listener for /api/v1/agent/* if AGENT_BIND_ADDRESS is configured
+    if let Ok(agent_bind) = std::env::var("AGENT_BIND_ADDRESS") {
+        let clean_agent_bind = agent_bind.trim().to_string();
+        if !clean_agent_bind.is_empty() && clean_agent_bind != bind_host {
+            let dedicated_agent_router = agent::agent_public_router(agent_state.clone());
+            let agent_listener = tokio::net::TcpListener::bind(&clean_agent_bind).await?;
+            tokio::spawn(async move {
+                tracing::info!(
+                    "🤖 Dedicated Headless Agent Edge Server bound on {} (/api/v1/agent/* + /api/v1/agent/mcp)",
+                    clean_agent_bind
+                );
+                if let Err(e) = axum::serve(agent_listener, dedicated_agent_router).await {
+                    tracing::error!("Dedicated Agent Edge Server Error: {}", e);
+                }
+            });
+        }
+    }
+
     let protected_routes = Router::new()
         .route("/v1/sor/execute", post(sor::handle_sor_execute))
         .route("/v1/state/action", post(state_api::handle_state_action))
         .route_layer(middleware::from_fn(internal_auth_guard));
 
-    let app = Router::new()
+    let core_app = Router::new()
         .route("/v1/balance", get(handle_get_balance))
         .route("/v1/utxos", get(handle_get_utxos))
         .route("/v1/broadcast", post(handle_post_broadcast))
@@ -435,12 +464,14 @@ async fn main() -> anyhow::Result<()> {
         .merge(fiat_rails::fiat_routes())
         .with_state(pool.clone());
 
-    let bind_host =
-        std::env::var("RUST_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:8002".to_string());
+    let app = core_app
+        .merge(agent::agent_public_router(agent_state.clone()))
+        .merge(agent::agent_internal_router(agent_state));
+
     let listener = tokio::net::TcpListener::bind(&bind_host).await?;
     tokio::spawn(async move {
         tracing::info!(
-            "🚀 Axum HTTP Server bound on {} (SOR, State, Fiat, Balance, UTXOs, Broadcast & Admin API Armed)",
+            "🚀 Axum HTTP Server bound on {} (SOR, State, Fiat, Balance, UTXOs, Broadcast, Admin & Headless Agent Gateway Armed)",
             bind_host
         );
         if let Err(e) = axum::serve(listener, app).await {

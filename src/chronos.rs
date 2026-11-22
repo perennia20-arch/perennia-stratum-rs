@@ -11,6 +11,7 @@ pub use netting::*;
 
 use chrono::{Timelike, Utc};
 use hmac::{Hmac, Mac};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Sha256;
@@ -143,11 +144,7 @@ fn constant_time_hex_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-pub async fn quarantine_single_wallet(
-    pool: &PgPool,
-    wallet_address: &str,
-    reason: &str,
-) {
+pub async fn quarantine_single_wallet(pool: &PgPool, wallet_address: &str, reason: &str) {
     let clean = wallet_address
         .trim()
         .to_lowercase()
@@ -239,11 +236,14 @@ pub async fn verify_wallet_ledger_invariant_or_quarantine(
 
     let streaming_kas: f64 = row.try_get("streaming_balance_kas").unwrap_or(0.0);
     let total_yield_kas: f64 = row.try_get("total_yield_kas").unwrap_or(0.0);
-    let verified_credits_kas: f64 = row.try_get("verified_onchain_credits_kas").unwrap_or(0.0);
+    let verified_credits_kas: f64 = row
+        .try_get("verified_onchain_credits_kas")
+        .unwrap_or(0.0);
     let lp_tokens: Value = row.try_get("lp_tokens").unwrap_or_else(|_| json!({}));
     let stored_hmac: String = row.try_get("row_hmac_sig").unwrap_or_default();
 
-    let expected_hmac = compute_reservoir_hmac(&prefixed, streaming_kas, total_yield_kas, &lp_tokens)?;
+    let expected_hmac =
+        compute_reservoir_hmac(&prefixed, streaming_kas, total_yield_kas, &lp_tokens)?;
 
     if stored_hmac.trim().is_empty() {
         let _ = sqlx::query(
@@ -366,8 +366,10 @@ pub async fn upsert_signed_yield_reservoir_kas(
 
     let next_streaming = (cur_streaming + delta_streaming_kas).max(0.0);
     let next_total_yield = (cur_total_yield + delta_total_yield_kas.max(0.0)).max(0.0);
-    let next_verified = (cur_verified + delta_verified_credits_kas.max(0.0)).max(next_total_yield);
-    let new_hmac = compute_reservoir_hmac(&prefixed, next_streaming, next_total_yield, &lp_tokens)?;
+    let next_verified =
+        (cur_verified + delta_verified_credits_kas.max(0.0)).max(next_total_yield);
+    let new_hmac =
+        compute_reservoir_hmac(&prefixed, next_streaming, next_total_yield, &lp_tokens)?;
 
     sqlx::query(
         r#"
@@ -601,32 +603,293 @@ pub fn compute_jerusalem_epoch_window(now_secs: u64) -> (u64, u64, u64) {
     (epoch_start_ts, next_bell_ts, secs_until_bell)
 }
 
-pub async fn execute_full_2200_utc_settlement_bell(pool: &PgPool) -> anyhow::Result<Value> {
-    tracing::info!("🔔 [22:00 UTC BELL] Executing Global Epoch Netting & Forge Settlement...");
+async fn execute_2200_utc_settlement_with_anti_sandwich(
+    pool: &PgPool,
+    immediate_admin_force: bool,
+) -> anyhow::Result<Value> {
+    let snapshot_ts_utc = Utc::now().to_rfc3339();
+    tracing::info!(
+        "🔔 [22:00 UTC BELL] Exact Accounting Snapshot Frozen ({}) | Crossing Internal Dark Pool First...",
+        snapshot_ts_utc
+    );
+
+    let redis_url =
+        env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let redis_client = redis::Client::open(redis_url)?;
+
+    if let Ok(mut snap_conn) = redis_client.get_multiplexed_async_connection().await {
+        let _: redis::RedisResult<()> = redis::cmd("SET")
+            .arg("perennia:chronos:last_snapshot_utc")
+            .arg(&snapshot_ts_utc)
+            .query_async(&mut snap_conn)
+            .await;
+    }
+
+    // Step 1: Cross internal Dark Pool liquidity first before touching external swaps
+    let pre_bell_dp_cross = run_delta_netting_cycle(&redis_client, pool)
+        .await
+        .unwrap_or_else(|_| json!({ "ordersPopped": 0 }));
+
+    // Step 2: Settle 22:00:00 UTC miner buckets, LP compounding & Forge daily tranches
     let netting_res = execute_epoch_delta_netting_and_lp_compounding(pool).await?;
     let forge_res = execute_2200_utc_forge_bell_settlement(pool).await?;
+
+    // Step 3: Cross any newly generated offsetting Dark Pool delta internally
+    let post_bell_dp_cross = run_delta_netting_cycle(&redis_client, pool)
+        .await
+        .unwrap_or_else(|_| json!({ "ordersPopped": 0 }));
+
+    if immediate_admin_force {
+        return Ok(json!({
+            "snapshotTimestampUtc": snapshot_ts_utc,
+            "antiSandwichMode": "IMMEDIATE_DIRECTOR_OVERRIDE",
+            "preBellDarkPoolCross": pre_bell_dp_cross,
+            "postBellDarkPoolCross": post_bell_dp_cross,
+            "netting": netting_res,
+            "forge": forge_res,
+            "bellTimestampUtc": Utc::now().to_rfc3339()
+        }));
+    }
+
+    // Step 4: Anti-Sandwich Multi-Minute Slicer for Residual External Execution
+    // Pop NET_RESIDUAL_AUTOBALANCE tickets so external bots cannot sandwich a predictable 22:00:01 UTC swap,
+    // then slice and jitter execution across randomized 20s..=65s intervals with fresh Redis oracle checks.
+    let Ok(mut conn) = redis_client.get_multiplexed_async_connection().await else {
+        return Ok(json!({
+            "snapshotTimestampUtc": snapshot_ts_utc,
+            "antiSandwichMode": "REDIS_UNAVAILABLE_INTERNAL_ONLY",
+            "netting": netting_res,
+            "forge": forge_res,
+            "bellTimestampUtc": Utc::now().to_rfc3339()
+        }));
+    };
+
+    let raw_passthrough: Vec<String> = redis::cmd("LRANGE")
+        .arg("perennia:sor:third_party_passthrough_queue")
+        .arg(0)
+        .arg(199)
+        .query_async(&mut conn)
+        .await
+        .unwrap_or_default();
+
+    let mut bell_residuals: Vec<Value> = Vec::new();
+    let mut non_bell_items: Vec<String> = Vec::new();
+
+    for item_str in raw_passthrough {
+        if let Ok(parsed) = serde_json::from_str::<Value>(&item_str) {
+            let is_residual = parsed
+                .get("type")
+                .and_then(|v| v.as_str())
+                .map(|t| t == "NET_RESIDUAL_AUTOBALANCE")
+                .unwrap_or(false);
+            if is_residual {
+                bell_residuals.push(parsed);
+            } else {
+                non_bell_items.push(item_str);
+            }
+        }
+    }
+
+    let residual_count = bell_residuals.len();
+    if residual_count > 0 {
+        let _: redis::RedisResult<()> = redis::cmd("DEL")
+            .arg("perennia:sor:third_party_passthrough_queue")
+            .query_async(&mut conn)
+            .await;
+        for keep in non_bell_items.into_iter().rev() {
+            let _: redis::RedisResult<()> = redis::cmd("LPUSH")
+                .arg("perennia:sor:third_party_passthrough_queue")
+                .arg(keep)
+                .query_async(&mut conn)
+                .await;
+        }
+
+        let num_slices: usize = {
+            rand::rngs::OsRng.gen_range(4usize..=8usize)
+        };
+        let r_client_bg = redis_client.clone();
+
+        tokio::spawn(async move {
+            for (group_idx, ticket) in bell_residuals.into_iter().enumerate() {
+                let slice_count = num_slices.max(2);
+                let total_res_usd = ticket
+                    .get("residual_usd")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let total_kas_eq = ticket
+                    .get("kas_equiv")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let slice_ratio = 1.0 / (slice_count as f64);
+
+                for slice_idx in 0..slice_count {
+                    let sleep_ms: u64 = {
+                        rand::rngs::OsRng.gen_range(20_000u64..=65_000u64)
+                    };
+                    tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+
+                    let Ok(mut slice_conn) =
+                        r_client_bg.get_multiplexed_async_connection().await
+                    else {
+                        tracing::error!(
+                            "❌ [CHRONOS ANTI-SANDWICH] Redis unreachable during jittered slice; failing closed."
+                        );
+                        break;
+                    };
+
+                    let target_asset = ticket
+                        .get("target_asset")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("USDC")
+                        .trim()
+                        .to_uppercase();
+
+                    let (cb_flag, ext_kill, depeg_flag, spot_raw, kas_raw): (
+                        Option<String>,
+                        Option<String>,
+                        Option<String>,
+                        Option<String>,
+                        Option<String>,
+                    ) = redis::pipe()
+                        .cmd("GET")
+                        .arg("perennia:agent:circuit_breaker")
+                        .cmd("GET")
+                        .arg("perennia:killswitch:external_dex")
+                        .cmd("GET")
+                        .arg(format!("oracle:depeg_halt:{}", target_asset))
+                        .cmd("GET")
+                        .arg(format!("oracle:spot:{}_USDC", target_asset))
+                        .cmd("GET")
+                        .arg("oracle:spot:KAS_USDC")
+                        .query_async(&mut slice_conn)
+                        .await
+                        .unwrap_or((None, None, None, None, None));
+
+                    let cb_tripped = cb_flag
+                        .as_deref()
+                        .map(|s| !s.trim().is_empty() && s.trim() != "0" && !s.trim().eq_ignore_ascii_case("false"))
+                        .unwrap_or(false);
+                    let ext_paused = ext_kill
+                        .as_deref()
+                        .map(|s| s.trim() == "1" || s.trim().eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+                    let depeg_halted = depeg_flag
+                        .as_deref()
+                        .map(|s| s.trim() == "1" || s.trim().eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+                    let kas_live = kas_raw
+                        .as_deref()
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .map(|v| v.is_finite() && v > 0.0)
+                        .unwrap_or(false);
+                    let target_live = target_asset == "USD"
+                        || spot_raw
+                            .as_deref()
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .map(|v| v.is_finite() && v > 0.0)
+                            .unwrap_or(false);
+
+                    if cb_tripped || ext_paused || depeg_halted || !kas_live || !target_live {
+                        tracing::warn!(
+                            "⚠️ [CHRONOS ANTI-SANDWICH] Failing closed on residual slice {}/{} for {} (cb={}, ext_paused={}, depeg={}, kas_live={}, target_live={}).",
+                            slice_idx + 1,
+                            slice_count,
+                            target_asset,
+                            cb_tripped,
+                            ext_paused,
+                            depeg_halted,
+                            kas_live,
+                            target_live
+                        );
+                        continue;
+                    }
+
+                    let mut sliced_ticket = ticket.clone();
+                    if let Some(obj) = sliced_ticket.as_object_mut() {
+                        obj.insert(
+                            "slice_index".to_string(),
+                            json!(format!("{}/{}", slice_idx + 1, slice_count)),
+                        );
+                        obj.insert(
+                            "residual_usd".to_string(),
+                            json!(((total_res_usd * slice_ratio) * 10_000.0).round() / 10_000.0),
+                        );
+                        obj.insert(
+                            "kas_equiv".to_string(),
+                            json!(((total_kas_eq * slice_ratio) * 10_000.0).round() / 10_000.0),
+                        );
+                        obj.insert(
+                            "anti_sandwich_dispatched_at".to_string(),
+                            json!(Utc::now().to_rfc3339()),
+                        );
+                        obj.insert("residual_group_idx".to_string(), json!(group_idx));
+                    }
+
+                    let _: redis::RedisResult<()> = redis::cmd("LPUSH")
+                        .arg("perennia:sor:third_party_passthrough_queue")
+                        .arg(sliced_ticket.to_string())
+                        .query_async(&mut slice_conn)
+                        .await;
+                    let _: redis::RedisResult<()> = redis::cmd("LTRIM")
+                        .arg("perennia:sor:third_party_passthrough_queue")
+                        .arg(0)
+                        .arg(199)
+                        .query_async(&mut slice_conn)
+                        .await;
+                }
+            }
+        });
+
+        return Ok(json!({
+            "snapshotTimestampUtc": snapshot_ts_utc,
+            "antiSandwichMode": "JITTERED_MULTI_MINUTE_SLICER",
+            "residualTicketsSliced": residual_count,
+            "slicesPerTicket": num_slices,
+            "preBellDarkPoolCross": pre_bell_dp_cross,
+            "postBellDarkPoolCross": post_bell_dp_cross,
+            "netting": netting_res,
+            "forge": forge_res,
+            "bellTimestampUtc": Utc::now().to_rfc3339()
+        }));
+    }
+
     Ok(json!({
+        "snapshotTimestampUtc": snapshot_ts_utc,
+        "antiSandwichMode": "100_PCT_INTERNAL_DARK_POOL_CROSSED",
+        "residualTicketsSliced": 0,
+        "preBellDarkPoolCross": pre_bell_dp_cross,
+        "postBellDarkPoolCross": post_bell_dp_cross,
         "netting": netting_res,
         "forge": forge_res,
         "bellTimestampUtc": Utc::now().to_rfc3339()
     }))
 }
 
+pub async fn execute_full_2200_utc_settlement_bell(pool: &PgPool) -> anyhow::Result<Value> {
+    execute_2200_utc_settlement_with_anti_sandwich(pool, false).await
+}
+
 pub async fn trigger_immediate_epoch_bell_sweep(pool: &PgPool) -> Result<Value, String> {
-    execute_full_2200_utc_settlement_bell(pool)
+    execute_2200_utc_settlement_with_anti_sandwich(pool, true)
         .await
         .map_err(|e| format!("Epoch bell sweep failed: {}", e))
 }
 
 pub async fn start_chronos_daemon(pool: PgPool) {
-    tracing::info!("🕰️ [CHRONOS ENGINE] 22:00 UTC Settlement Bell Scheduler Armed.");
-    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    tracing::info!(
+        "🕰️ [CHRONOS ENGINE] Exact 22:00:00 UTC Snapshot + Dark Pool Cross + Anti-Sandwich Slicer Armed."
+    );
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
     let mut last_bell_day: Option<u32> = None;
     loop {
         interval.tick().await;
         let now = Utc::now();
         let ordinal_day = now.format("%j").to_string().parse::<u32>().unwrap_or(0);
-        if now.hour() == 22 && now.minute() == 0 && last_bell_day != Some(ordinal_day) {
+        if now.hour() == 22
+            && now.minute() == 0
+            && now.second() <= 5
+            && last_bell_day != Some(ordinal_day)
+        {
             last_bell_day = Some(ordinal_day);
             if let Err(e) = execute_full_2200_utc_settlement_bell(&pool).await {
                 tracing::error!("❌ [22:00 UTC BELL] Execution error: {}", e);
