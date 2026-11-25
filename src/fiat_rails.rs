@@ -137,6 +137,7 @@ pub struct OnrampOrderRequest {
     pub bundled_kas_or_silo: Option<bool>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OfframpOrderRequest {
@@ -781,6 +782,230 @@ pub async fn resolve_live_spot_price(pool: &PgPool, asset_ticker: &str) -> Resul
     }
 }
 
+pub const RAIL_BREAKER_THRESHOLD: u64 = 3;
+pub const RAIL_BREAKER_COOLDOWN_SECS: u64 = 120;
+
+/// Swappable non-custodial external rail boundary with isolated per-provider circuit breaking
+/// so third-party outages fail closed cleanly without stalling Stratum or L1 Vault settlement.
+#[allow(dead_code)]
+pub trait ExternalRailAdapter: Send + Sync {
+    fn provider_id(&self) -> &'static str;
+    fn is_non_custodial_passthrough(&self) -> bool;
+}
+
+pub struct ChangeNowV2Adapter;
+#[allow(dead_code)]
+pub struct BridgeNonCustodialAdapter;
+#[allow(dead_code)]
+pub struct StripeJitIssuingAdapter;
+
+impl ExternalRailAdapter for ChangeNowV2Adapter {
+    fn provider_id(&self) -> &'static str {
+        "changenow_v2"
+    }
+    fn is_non_custodial_passthrough(&self) -> bool {
+        true
+    }
+}
+
+impl ExternalRailAdapter for BridgeNonCustodialAdapter {
+    fn provider_id(&self) -> &'static str {
+        "bridge_noncustodial_liquidation"
+    }
+    fn is_non_custodial_passthrough(&self) -> bool {
+        true
+    }
+}
+
+impl ExternalRailAdapter for StripeJitIssuingAdapter {
+    fn provider_id(&self) -> &'static str {
+        "stripe_jit_issuing"
+    }
+    fn is_non_custodial_passthrough(&self) -> bool {
+        true
+    }
+}
+
+pub async fn is_rail_circuit_open(provider: &str) -> bool {
+    let Ok(redis_url) = env::var("REDIS_URL") else {
+        return false;
+    };
+    let Ok(client) = redis::Client::open(redis_url.trim()) else {
+        return false;
+    };
+    let Ok(mut conn) = client.get_multiplexed_async_connection().await else {
+        return false;
+    };
+    let key = format!("perennia:rail:breaker:{}", provider);
+    redis::cmd("GET")
+        .arg(&key)
+        .query_async::<_, Option<String>>(&mut conn)
+        .await
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("OPEN")
+}
+
+async fn record_rail_failure(provider: &str) {
+    let Ok(redis_url) = env::var("REDIS_URL") else {
+        return;
+    };
+    let Ok(client) = redis::Client::open(redis_url.trim()) else {
+        return;
+    };
+    let Ok(mut conn) = client.get_multiplexed_async_connection().await else {
+        return;
+    };
+    let fail_key = format!("perennia:rail:failures:{}", provider);
+    let count: u64 = redis::cmd("INCR")
+        .arg(&fail_key)
+        .query_async(&mut conn)
+        .await
+        .unwrap_or(1);
+    let _: redis::RedisResult<()> = redis::cmd("EXPIRE")
+        .arg(&fail_key)
+        .arg(RAIL_BREAKER_COOLDOWN_SECS as i64)
+        .query_async(&mut conn)
+        .await;
+    if count >= RAIL_BREAKER_THRESHOLD {
+        let breaker_key = format!("perennia:rail:breaker:{}", provider);
+        let _: redis::RedisResult<()> = redis::cmd("SETEX")
+            .arg(&breaker_key)
+            .arg(RAIL_BREAKER_COOLDOWN_SECS)
+            .arg("OPEN")
+            .query_async(&mut conn)
+            .await;
+    }
+}
+
+async fn reset_rail_failure(provider: &str) {
+    let Ok(redis_url) = env::var("REDIS_URL") else {
+        return;
+    };
+    let Ok(client) = redis::Client::open(redis_url.trim()) else {
+        return;
+    };
+    let Ok(mut conn) = client.get_multiplexed_async_connection().await else {
+        return;
+    };
+    let _: redis::RedisResult<i64> = redis::cmd("DEL")
+        .arg(format!("perennia:rail:failures:{}", provider))
+        .arg(format!("perennia:rail:breaker:{}", provider))
+        .query_async(&mut conn)
+        .await;
+}
+
+/// Explicit `(currency, network, decimals)` mapping for ChangeNOW v2 `flow: "standard"`.
+pub fn resolve_changenow_explicit_pair(
+    target_asset: &str,
+    target_network: Option<&str>,
+) -> (String, String, u8) {
+    let clean_asset = target_asset.trim().to_uppercase();
+    if let Some((cur, net)) = clean_asset.split_once('-') {
+        let cn_cur = cur.to_lowercase();
+        let cn_net = match net {
+            "SOL" | "SOLANA" => "sol",
+            "BASE" => "base",
+            "ARB" | "ARBITRUM" => "arbitrum",
+            "ETH" | "ETHEREUM" => "eth",
+            "MATIC" | "POL" | "POLYGON" => "matic",
+            "KAS" | "KASPA" => "kas",
+            other => return (cn_cur, other.to_lowercase(), 6),
+        };
+        let dec = if cn_cur == "usdc" || cn_cur == "usdt" { 6 } else { 8 };
+        return (cn_cur, cn_net.to_string(), dec);
+    }
+    if let Some(net_raw) = target_network.filter(|s| !s.trim().is_empty()) {
+        let net_up = net_raw.trim().to_uppercase();
+        if clean_asset == "USDC" || clean_asset == "USDT" {
+            let cn_net = match net_up.as_str() {
+                "SOL" | "SOLANA" => "sol",
+                "BASE" => "base",
+                "ARB" | "ARBITRUM" => "arbitrum",
+                "MATIC" | "POL" | "POLYGON" => "matic",
+                _ => "eth",
+            };
+            return (clean_asset.to_lowercase(), cn_net.to_string(), 6);
+        }
+    }
+    match clean_asset.as_str() {
+        "KAS" => ("kas".to_string(), "kas".to_string(), 8),
+        "BTC" => ("btc".to_string(), "btc".to_string(), 8),
+        "ETH" => ("eth".to_string(), "eth".to_string(), 8),
+        "SOL" => ("sol".to_string(), "sol".to_string(), 9),
+        "USDC" => ("usdc".to_string(), "eth".to_string(), 6),
+        "USDT" => ("usdt".to_string(), "eth".to_string(), 6),
+        "XRP" => ("xrp".to_string(), "xrp".to_string(), 6),
+        "DOGE" => ("doge".to_string(), "doge".to_string(), 8),
+        "POL" => ("pol".to_string(), "matic".to_string(), 8),
+        "AVAX" => ("avax".to_string(), "cchain".to_string(), 8),
+        "ARB" => ("arb".to_string(), "arbitrum".to_string(), 8),
+        "BASE" => ("eth".to_string(), "base".to_string(), 8),
+        other => (other.to_lowercase(), "eth".to_string(), 8),
+    }
+}
+
+#[allow(dead_code)]
+fn format_sompi_as_kas_decimal(sompi: u64) -> String {
+    let whole = sompi / 100_000_000;
+    let frac = sompi % 100_000_000;
+    format!("{}.{:08}", whole, frac)
+}
+
+fn parse_decimal_to_u64_sompi(raw: &str) -> Result<u64, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.starts_with('-') {
+        return Err("Invalid decimal amount".to_string());
+    }
+    let mut parts = trimmed.split('.');
+    let whole: u64 = parts
+        .next()
+        .unwrap_or("0")
+        .parse::<u64>()
+        .map_err(|_| "Invalid whole KAS amount".to_string())?;
+    let frac_raw = parts.next().unwrap_or("");
+    let mut frac_bytes = frac_raw.as_bytes().to_vec();
+    frac_bytes.truncate(8);
+    while frac_bytes.len() < 8 {
+        frac_bytes.push(b'0');
+    }
+    let frac: u64 = String::from_utf8(frac_bytes)
+        .unwrap_or_else(|_| "00000000".to_string())
+        .parse::<u64>()
+        .unwrap_or(0);
+    whole
+        .checked_mul(100_000_000)
+        .and_then(|w| w.checked_add(frac))
+        .ok_or_else(|| "Sompi overflow".to_string())
+}
+
+/// Pure integer Tier 3 ChangeNOW split math (`0.5%` house fee + network fee + `~99.5%` payin output).
+#[allow(dead_code)]
+pub fn compute_tier3_changenow_sompi_split(
+    vault_utxo_sompi: u64,
+    network_fee_sompi: u64,
+    house_fee_bps: u16,
+) -> Result<(u64, u64), String> {
+    if vault_utxo_sompi == 0 {
+        return Err("Vault UTXO total must be > 0 sompi.".to_string());
+    }
+    let house_fee_sompi =
+        ((vault_utxo_sompi as u128 * (house_fee_bps as u128)) / 10_000) as u64;
+    let payin_sompi = vault_utxo_sompi
+        .checked_sub(house_fee_sompi.saturating_add(network_fee_sompi))
+        .ok_or_else(|| {
+            format!(
+                "Vault UTXO {} sompi cannot cover house_fee {} + network_fee {}.",
+                vault_utxo_sompi, house_fee_sompi, network_fee_sompi
+            )
+        })?;
+    if payin_sompi == 0 {
+        return Err("ChangeNOW payin_sompi must be > 0.".to_string());
+    }
+    Ok((payin_sompi, house_fee_sompi))
+}
+
 fn resolve_changenow_currency_and_network(ticker: &str) -> (String, &'static str, i32) {
     let clean = ticker.trim().to_uppercase();
     match clean.as_str() {
@@ -809,10 +1034,85 @@ fn resolve_changenow_currency_and_network(ticker: &str) -> (String, &'static str
     }
 }
 
+pub async fn fetch_changenow_min_amount_sompi(
+    to_ticker: &str,
+    to_network: Option<&str>,
+) -> Result<u64, String> {
+    let adapter = ChangeNowV2Adapter;
+    if is_rail_circuit_open(adapter.provider_id()).await {
+        return Err("RAIL_CIRCUIT_OPEN: ChangeNOW v2 adapter circuit breaker is open.".to_string());
+    }
+    let api_key = env::var("CHANGENOW_API_KEY")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "CHANGENOW_API_KEY_MISSING: Configure CHANGENOW_API_KEY in .env.".to_string())?;
+    let (to_cur, to_net, _) = resolve_changenow_explicit_pair(to_ticker, to_network);
+    if to_cur == "kas" && to_net == "kas" {
+        return Ok(100_000_000);
+    }
+    let url = format!(
+        "https://api.changenow.io/v2/exchange/min-amount?fromCurrency=kas&toCurrency={}&fromNetwork=kas&toNetwork={}&flow=standard",
+        to_cur, to_net
+    );
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let res = match client.get(&url).header("x-changenow-api-key", api_key).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            record_rail_failure(adapter.provider_id()).await;
+            return Err(format!("ChangeNOW v2 min-amount failed: {}", e));
+        }
+    };
+    if !res.status().is_success() {
+        record_rail_failure(adapter.provider_id()).await;
+        return Err(format!("ChangeNOW v2 min-amount HTTP {}", res.status()));
+    }
+    let data: Value = res
+        .json()
+        .await
+        .map_err(|e| format!("Invalid ChangeNOW min-amount JSON: {}", e))?;
+    let min_str = data
+        .get("minAmount")
+        .and_then(|v| {
+            v.as_str()
+                .map(|s| s.to_string())
+                .or_else(|| v.as_f64().map(|f| format!("{:.8}", f)))
+        })
+        .ok_or_else(|| "ChangeNOW v2 minAmount missing.".to_string())?;
+    let sompi = parse_decimal_to_u64_sompi(&min_str)?;
+    if sompi == 0 {
+        return Err("ChangeNOW v2 returned 0 minAmount.".to_string());
+    }
+    reset_rail_failure(adapter.provider_id()).await;
+    Ok(sompi)
+}
+
+/// Computes `max(min_amount_sompi * 1.05, min_profitable_sompi)` using strict integer `ORACLE_USD_E8` math.
+pub async fn resolve_live_profitable_vault_floor_sompi(
+    pool: &PgPool,
+    to_ticker: &str,
+    to_network: Option<&str>,
+) -> Result<u64, String> {
+    let kas_usd_e8 = crate::state_api::resolve_strict_spot_price_e8(pool, "KAS").await?;
+    let cn_min_sompi = fetch_changenow_min_amount_sompi(to_ticker, to_network).await?;
+    let with_buffer = ((cn_min_sompi as u128 * 105 + 99) / 100) as u64;
+    // Minimum economical L1 slice threshold ($5.00 USD in atomic sompi = 5 * 1e8 * 1e8 / kas_usd_e8)
+    let min_profitable_sompi = ((500_000_000u128 * 100_000_000u128) / kas_usd_e8.max(1)) as u64;
+    Ok(with_buffer.max(min_profitable_sompi))
+}
+
+#[allow(dead_code)]
 pub async fn fetch_changenow_min_amount(
     from_ticker: &str,
     to_ticker: &str,
 ) -> Result<f64, String> {
+    if from_ticker.trim().eq_ignore_ascii_case("KAS") {
+        let sompi = fetch_changenow_min_amount_sompi(to_ticker, None).await?;
+        return Ok((sompi as f64) / 100_000_000.0);
+    }
     let api_key = env::var("CHANGENOW_API_KEY")
         .ok()
         .map(|s| s.trim().to_string())
@@ -872,69 +1172,22 @@ pub async fn resolve_live_profitable_bucket_threshold(
     let safe_kas_spot = if kas_spot_usd.is_finite() && kas_spot_usd > 0.0 {
         kas_spot_usd
     } else {
-        resolve_live_spot_price(pool, "KAS")
-            .await
-            .unwrap_or(0.15)
-            .max(0.01)
+        let Ok(live) = resolve_live_spot_price(pool, "KAS").await else {
+            // Fail closed ("a fail is a fail"): zero synthetic 0.15 fallback
+            return (f64::MAX, f64::MAX);
+        };
+        live
     };
-    if clean == "USD" {
-        let min_usd = 25.28;
-        let min_kas = ((min_usd / safe_kas_spot) * 10.0).ceil() / 10.0;
-        return (min_kas, round_cents(min_kas * safe_kas_spot));
+    if clean == "KAS" {
+        return (25.0, round_cents(25.0 * safe_kas_spot));
     }
-    if clean == "SILO" || clean == "NACHO" || clean == "BEDRCK" || clean == "PERX" {
-        let min_usd = 3.50;
-        let min_kas = ((min_usd / safe_kas_spot) * 10.0).ceil() / 10.0;
-        return (min_kas, round_cents(min_kas * safe_kas_spot));
-    }
-    let cache_key = format!("perennia:changenow:min_kas:{}", clean);
-    if let Ok(redis_url) = env::var("REDIS_URL") {
-        if let Ok(client) = redis::Client::open(redis_url) {
-            if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
-                if let Ok(Some(cached_str)) = redis::cmd("GET")
-                    .arg(&cache_key)
-                    .query_async::<_, Option<String>>(&mut conn)
-                    .await
-                {
-                    if let Ok(cached_kas) = cached_str.parse::<f64>() {
-                        if cached_kas.is_finite() && cached_kas > 0.0 {
-                            let min_usd = round_cents(cached_kas * safe_kas_spot);
-                            return (cached_kas, min_usd);
-                        }
-                    }
-                }
-            }
+    match resolve_live_profitable_vault_floor_sompi(pool, &clean, None).await {
+        Ok(floor_sompi) => {
+            let floor_kas = (floor_sompi as f64) / 100_000_000.0;
+            (floor_kas, round_cents(floor_kas * safe_kas_spot))
         }
+        Err(_) => (f64::MAX, f64::MAX),
     }
-    let base_bridge_min_kas = match fetch_changenow_min_amount("KAS", &clean).await {
-        Ok(live_min_kas) if live_min_kas.is_finite() && live_min_kas > 0.0 => live_min_kas,
-        _ => {
-            let min_bridge_usd = match clean.as_str() {
-                "BTC" => 22.0,
-                "ETH" | "XAU" | "XAG" | "USTB" | "USDT" => 14.0,
-                "USDC" | "SOL" | "ARB" | "BASE" | "POL" | "AVAX" => 6.5,
-                "SPY" | "QQQ" | "NVDA" | "AAPL" | "TSLA" | "AMD" | "TSM" | "AVGO" | "XLE" => 8.5,
-                _ => 5.5,
-            };
-            min_bridge_usd / safe_kas_spot
-        }
-    };
-    let margin_kas = 0.50 / safe_kas_spot;
-    let profitable_min_kas = (((base_bridge_min_kas * 1.015) + margin_kas) * 10.0).ceil() / 10.0;
-    let profitable_min_usd = round_cents(profitable_min_kas * safe_kas_spot);
-    if let Ok(redis_url) = env::var("REDIS_URL") {
-        if let Ok(client) = redis::Client::open(redis_url) {
-            if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
-                let _: redis::RedisResult<()> = redis::cmd("SETEX")
-                    .arg(&cache_key)
-                    .arg(180u64)
-                    .arg(format!("{:.4}", profitable_min_kas))
-                    .query_async(&mut conn)
-                    .await;
-            }
-        }
-    }
-    (profitable_min_kas, profitable_min_usd)
 }
 
 pub async fn fetch_changenow_estimated_amount(
@@ -989,16 +1242,354 @@ pub async fn fetch_changenow_estimated_amount(
         })
         .filter(|&v| v > 0.0)
         .ok_or_else(|| "ChangeNOW v2 returned 0 toAmount.".to_string())?;
-    let withdrawal_fee = data
-        .get("withdrawalFee")
-        .and_then(|v| {
-            v.as_f64()
-                .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
-        })
-        .unwrap_or(0.0)
-        .max(0.0);
-    let _ = withdrawal_fee;
     Ok(raw_to_amount)
+}
+
+#[allow(dead_code)]
+async fn create_changenow_exchange_order_sompi(
+    to_ticker: &str,
+    to_network: Option<&str>,
+    from_sompi: u64,
+    payout_address: &str,
+    user_refund_kaspa_address: &str,
+) -> Result<(String, String), String> {
+    let adapter = ChangeNowV2Adapter;
+    if is_rail_circuit_open(adapter.provider_id()).await {
+        return Err("RAIL_CIRCUIT_OPEN: ChangeNOW v2 adapter circuit breaker is open.".to_string());
+    }
+    let clean_refund = user_refund_kaspa_address.trim();
+    if !clean_refund.starts_with("kaspa:") || clean_refund.len() < 55 {
+        return Err(
+            "NON_CUSTODIAL_INVARIANT: refundAddress must be the user's own Kaspa wallet."
+                .to_string(),
+        );
+    }
+    let api_key = env::var("CHANGENOW_API_KEY")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "CHANGENOW_API_KEY_MISSING: Configure CHANGENOW_API_KEY in .env.".to_string())?;
+    let (to_cur, to_net, _) = resolve_changenow_explicit_pair(to_ticker, to_network);
+    let payload = json!({
+        "fromCurrency": "kas",
+        "toCurrency": to_cur,
+        "fromNetwork": "kas",
+        "toNetwork": to_net,
+        "fromAmount": format_sompi_as_kas_decimal(from_sompi),
+        "address": payout_address.trim(),
+        "refundAddress": clean_refund,
+        "flow": "standard"
+    });
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let res = match client
+        .post("https://api.changenow.io/v2/exchange")
+        .header("x-changenow-api-key", api_key)
+        .header("content-type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            record_rail_failure(adapter.provider_id()).await;
+            return Err(format!("ChangeNOW v2 order creation failed: {}", e));
+        }
+    };
+    if !res.status().is_success() {
+        record_rail_failure(adapter.provider_id()).await;
+        let status = res.status();
+        let err_body = res.text().await.unwrap_or_default();
+        return Err(format!(
+            "ChangeNOW v2 order creation rejected ({}): {}",
+            status, err_body
+        ));
+    }
+    let data: Value = res
+        .json()
+        .await
+        .map_err(|e| format!("Malformed ChangeNOW v2 response: {}", e))?;
+    let exchange_id = data
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "ChangeNOW v2 missing id.".to_string())?
+        .to_string();
+    let payin_address = data
+        .get("payinAddress")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "ChangeNOW v2 missing payinAddress.".to_string())?
+        .to_string();
+    reset_rail_failure(adapter.provider_id()).await;
+    Ok((exchange_id, payin_address))
+}
+
+/// Tier 3 ChangeNOW v2 Non-Custodial Split-Output Fallback (`22:00 UTC`):
+/// Spends unmatched `THRESHOLD_MET` Vault Locks directly into Output 0 (`99.5%` -> `payinAddress` with
+/// `refundAddress` = user's own Kaspa wallet) and Output 1 (`0.5%` -> Perennia House Revenue Vault).
+#[allow(dead_code)]
+pub async fn execute_tier3_changenow_vault_fallback(
+    pool: &PgPool,
+    epoch_id: &str,
+) -> Result<Value, String> {
+    let sys_cfg = crate::chronos::load_system_treasury_config(pool).await;
+    if sys_cfg.outflow_breaker_tripped || sys_cfg.solvency_breaker_tripped {
+        return Err("TIER3_HALTED: Circuit breaker tripped.".to_string());
+    }
+    let house_revenue_address = crate::chronos::resolve_house_revenue_kas_address(&sys_cfg)
+        .ok_or_else(|| "TIER3_CONFIG_ERR: House revenue Kaspa address not configured.".to_string())?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT vault_id, wallet_address, clean_wallet, covenant_address, redeem_script_hex,
+               target_asset, target_network, destination_address, refund_kaspa_address, fee_bps
+        FROM vault_locks
+        WHERE status = 'THRESHOLD_MET'
+          AND UPPER(target_asset) <> 'KAS'
+        ORDER BY updated_at ASC
+        LIMIT 50
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("Failed querying THRESHOLD_MET vault_locks: {}", e))?;
+
+    let mut settled_count = 0usize;
+    let mut deferred_submin_count = 0usize;
+    let mut failed_count = 0usize;
+
+    for row in rows {
+        let vault_id: String = row.try_get("vault_id").unwrap_or_default();
+        let wallet_address: String = row.try_get("wallet_address").unwrap_or_default();
+        let clean_wallet: String = row.try_get("clean_wallet").unwrap_or_default();
+        let covenant_address: String = row.try_get("covenant_address").unwrap_or_default();
+        let redeem_script_hex: String = row.try_get("redeem_script_hex").unwrap_or_default();
+        let target_asset: String = row.try_get("target_asset").unwrap_or_default();
+        let target_network: String = row.try_get("target_network").unwrap_or_default();
+        let destination_address: String = row.try_get("destination_address").unwrap_or_default();
+        let refund_kaspa_address: String = row.try_get("refund_kaspa_address").unwrap_or_default();
+        let fee_bps = row.try_get::<i32, _>("fee_bps").unwrap_or(50).clamp(0, 1000) as u16;
+
+        let Ok(floor_sompi) = resolve_live_profitable_vault_floor_sompi(
+            pool,
+            &target_asset,
+            Some(&target_network),
+        )
+        .await
+        else {
+            failed_count += 1;
+            continue;
+        };
+
+        let Ok((total_utxo_sompi, net_fee_sompi)) =
+            crate::state_api::estimate_path_b_vault_network_fee_sompi(
+                &covenant_address,
+                &redeem_script_hex,
+            )
+            .await
+        else {
+            failed_count += 1;
+            continue;
+        };
+
+        if total_utxo_sompi < floor_sompi {
+            let _ = sqlx::query(
+                "UPDATE vault_locks SET status = 'FILLING', confirmed_utxo_sompi = $2::NUMERIC(39,0), updated_at = CURRENT_TIMESTAMP WHERE vault_id = $1",
+            )
+            .bind(&vault_id)
+            .bind(total_utxo_sompi.to_string())
+            .execute(pool)
+            .await;
+            deferred_submin_count += 1;
+            continue;
+        }
+
+        let Ok((payin_sompi, house_fee_sompi)) =
+            compute_tier3_changenow_sompi_split(total_utxo_sompi, net_fee_sompi, fee_bps)
+        else {
+            failed_count += 1;
+            continue;
+        };
+
+        let Ok((cn_exchange_id, payin_address)) = create_changenow_exchange_order_sompi(
+            &target_asset,
+            Some(&target_network),
+            payin_sompi,
+            &destination_address,
+            &refund_kaspa_address,
+        )
+        .await
+        else {
+            failed_count += 1;
+            continue;
+        };
+
+        match crate::state_api::execute_path_b_vault_split_tx(
+            pool,
+            &vault_id,
+            &payin_address,
+            payin_sompi,
+            &house_revenue_address,
+            house_fee_sompi,
+        )
+        .await
+        {
+            Ok((kaspa_txid, actual_net_fee)) => {
+                let _ = sqlx::query(
+                    "UPDATE vault_locks SET status = 'SETTLED', updated_at = CURRENT_TIMESTAMP WHERE vault_id = $1",
+                )
+                .bind(&vault_id)
+                .execute(pool)
+                .await;
+
+                let receipt_id = format!("CN3-{}", &cn_exchange_id);
+                let kas_e8 = crate::state_api::resolve_strict_spot_price_e8(pool, "KAS")
+                    .await
+                    .unwrap_or(0);
+                let _ = sqlx::query(
+                    r#"
+                    INSERT INTO settlement_receipts (
+                        receipt_id, epoch_id, wallet_address, clean_wallet, vault_id,
+                        settlement_tier, source_sompi, house_fee_sompi, network_fee_sompi,
+                        target_asset, target_network, settled_atomic, oracle_kas_usd_e8,
+                        kaspa_l1_txid, changenow_exchange_id, status
+                    ) VALUES (
+                        $1, $2, $3, $4, $5,
+                        'TIER3_CHANGENOW_SPLIT', $6::NUMERIC(39,0), $7::NUMERIC(39,0), $8::NUMERIC(39,0),
+                        $9, $10, $11::NUMERIC(39,0), $12::NUMERIC(39,0),
+                        $13, $14, 'PENDING_CHANGENOW'
+                    )
+                    ON CONFLICT (receipt_id) DO NOTHING
+                    "#,
+                )
+                .bind(&receipt_id)
+                .bind(epoch_id)
+                .bind(&wallet_address)
+                .bind(&clean_wallet)
+                .bind(&vault_id)
+                .bind(total_utxo_sompi.to_string())
+                .bind(house_fee_sompi.to_string())
+                .bind(actual_net_fee.to_string())
+                .bind(&target_asset)
+                .bind(&target_network)
+                .bind(payin_sompi.to_string())
+                .bind(kas_e8.to_string())
+                .bind(&kaspa_txid)
+                .bind(&cn_exchange_id)
+                .execute(pool)
+                .await;
+
+                settled_count += 1;
+            }
+            Err(_) => {
+                failed_count += 1;
+            }
+        }
+    }
+
+    Ok(json!({
+        "settledCount": settled_count,
+        "deferredSubMinimumCount": deferred_submin_count,
+        "failedCount": failed_count
+    }))
+}
+
+/// Polls ChangeNOW v2 terminal status (`finished` / `refunded` / `failed`) and writes `destination_txid` to `settlement_receipts`.
+pub async fn reconcile_changenow_settlement_receipts(pool: &PgPool) -> Result<usize, String> {
+    let adapter = ChangeNowV2Adapter;
+    if is_rail_circuit_open(adapter.provider_id()).await {
+        return Ok(0);
+    }
+    let Ok(api_key) = env::var("CHANGENOW_API_KEY")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or(())
+    else {
+        return Ok(0);
+    };
+
+    let rows = sqlx::query(
+        r#"
+        SELECT receipt_id, changenow_exchange_id
+        FROM settlement_receipts
+        WHERE status = 'PENDING_CHANGENOW'
+          AND changenow_exchange_id IS NOT NULL
+        ORDER BY settled_at ASC
+        LIMIT 25
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("Failed querying pending ChangeNOW receipts: {}", e))?;
+
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(6))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let mut updated = 0usize;
+
+    for row in rows {
+        let receipt_id: String = row.try_get("receipt_id").unwrap_or_default();
+        let ex_id: String = row.try_get("changenow_exchange_id").unwrap_or_default();
+        if ex_id.is_empty() {
+            continue;
+        }
+        let url = format!("https://api.changenow.io/v2/exchange/by-id?id={}", ex_id);
+        let Ok(resp) = client
+            .get(&url)
+            .header("x-changenow-api-key", &api_key)
+            .send()
+            .await
+        else {
+            continue;
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(data) = resp.json::<Value>().await else {
+            continue;
+        };
+        let cn_status = data
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        let payout_hash = data
+            .get("payoutHash")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let next_status = match cn_status.as_str() {
+            "finished" => "CONFIRMED",
+            "refunded" => "REFUNDED_TO_USER",
+            "failed" | "expired" => "FAILED",
+            _ => continue,
+        };
+        let _ = sqlx::query(
+            r#"
+            UPDATE settlement_receipts
+            SET status = $2,
+                destination_txid = COALESCE($3, destination_txid)
+            WHERE receipt_id = $1
+            "#,
+        )
+        .bind(&receipt_id)
+        .bind(next_status)
+        .bind(payout_hash.as_deref())
+        .execute(pool)
+        .await;
+        updated += 1;
+    }
+
+    Ok(updated)
 }
 
 pub async fn create_changenow_exchange_order(
@@ -2594,17 +3185,8 @@ async fn handle_authenticated_webhook(
             .bind(&tx_hash)
             .execute(&pool)
             .await;
-        } else {
-            let _ = crate::state_api::credit_user_token_balance(
-                &pool,
-                &clean_wallet,
-                &prefixed_wallet,
-                &target_asset,
-                delivered_tokens,
-                false,
-            )
-            .await;
         }
+        // Custodial yield_reservoirs credits retired; non-custodial onramp fulfillment settles directly L1 via dropship TXID.
         let _ = sqlx::query(
             r#"
             UPDATE fiat_onramp_orders
@@ -2861,5 +3443,27 @@ mod tests {
         assert_eq!(wire_100k.perennia_fee_cents, 20_000);
         assert_eq!(wire_100k.stripe_gateway_fee_cents, 0);
         assert!(wire_100k.requires_institutional_wire);
+    }
+
+    #[test]
+    fn verify_changenow_explicit_pairs_and_sompi_split() {
+        assert_eq!(
+            resolve_changenow_explicit_pair("USDC-SOL", None),
+            ("usdc".to_string(), "sol".to_string(), 6)
+        );
+        assert_eq!(
+            resolve_changenow_explicit_pair("USDC", Some("BASE")),
+            ("usdc".to_string(), "base".to_string(), 6)
+        );
+        assert_eq!(
+            resolve_changenow_explicit_pair("USDC-ARB", None),
+            ("usdc".to_string(), "arbitrum".to_string(), 6)
+        );
+        let (payin, house) = compute_tier3_changenow_sompi_split(10_000_000_000, 300_000, 50).unwrap();
+        assert_eq!(house, 50_000_000);
+        assert_eq!(payin, 9_949_700_000);
+        assert_eq!(payin + house + 300_000, 10_000_000_000);
+        let _ = BridgeNonCustodialAdapter.is_non_custodial_passthrough();
+        let _ = StripeJitIssuingAdapter.provider_id();
     }
 }

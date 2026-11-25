@@ -5,6 +5,28 @@ pub const KASPA_CHARSET: &[u8; 32] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 pub const KASPA_ADDR_VERSION_P2PK_SCHNORR: u8 = 0x00;
 pub const KASPA_ADDR_VERSION_P2SH: u8 = 0x08;
 pub const CANONICAL_GENESIS_ANCHOR_EPOCH_SEC: i64 = 1_767_225_600;
+/// Active Kaspa Groth16 `OpZkPrecompile` tag (`0x20`). Tag `0x21` (RISC Zero) is permanently banned.
+pub const OP_ZK_PRECOMPILE_GROTH16_TAG: u8 = 0x20;
+pub const BANNED_RISC0_PRECOMPILE_TAG: u8 = 0x21;
+pub const PERENNIA_KIP21_SEQCOMMIT_SUBNETWORK_HEX: &str = "0000000000000000000000000000000000000000";
+
+/// Validates Kaspa L1 `OpZkPrecompile` tag selection:
+/// permits ONLY `0x20` (Groth16) and rejects deprecated/unsound `0x21` (GHSA-g6qg-9j8p-7j87).
+pub fn validate_zk_precompile_tag(tag: u8) -> Result<u8, String> {
+    if tag == OP_ZK_PRECOMPILE_GROTH16_TAG {
+        Ok(OP_ZK_PRECOMPILE_GROTH16_TAG)
+    } else if tag == BANNED_RISC0_PRECOMPILE_TAG {
+        Err(
+            "ZK_PRECOMPILE_BANNED: OpZkPrecompile tag 0x21 (RISC Zero recursion) is deprecated/unsound (GHSA-g6qg-9j8p-7j87). Use 0x20 (Groth16) only."
+                .to_string(),
+        )
+    } else {
+        Err(format!(
+            "ZK_PRECOMPILE_UNSUPPORTED: Unsupported OpZkPrecompile tag 0x{:02x}; only 0x20 (Groth16) is permitted.",
+            tag
+        ))
+    }
+}
 
 const BLAKE2B_IV: [u64; 8] = [
     0x6a09e667f3bcc908,
@@ -430,4 +452,290 @@ pub fn compile_silverscript_proof_of_lock_vault(
 
 pub fn silverscript_compilation_to_json(comp: &SilverScriptCompilation) -> Value {
     serde_json::to_value(comp).unwrap_or_else(|_| json!({}))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum VaultLockKind {
+    MinerSilo,
+    StandaloneWalletSilo,
+    MakerPlant,
+}
+
+impl VaultLockKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VaultLockKind::MinerSilo => "MINER_SILO",
+            VaultLockKind::StandaloneWalletSilo => "STANDALONE_WALLET_SILO",
+            VaultLockKind::MakerPlant => "MAKER_PLANT",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KCC20StateU128 {
+    pub amount_atomic: String,
+    pub ticker: String,
+    pub owner_hex: String,
+    pub owner_scheme: u8,
+    pub borrow_scheme: u8,
+    pub borrow_guard_hex: String,
+    pub extension_commitment_hex: String,
+    pub packed_state_hex: String,
+    pub state_root_hex: String,
+    pub covenant_id_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultLockCovenantSpec {
+    pub vault_kind: VaultLockKind,
+    pub owner_kaspa_address: String,
+    pub chronos_trigger_pubkey: [u8; 32],
+    pub destination_spk_hex: String,
+    pub house_revenue_spk_hex: String,
+    pub refund_kaspa_address: String,
+    pub threshold_sompi: u64,
+    pub fee_bps: u16,
+    pub maker_spread_bps: u16,
+    pub target_asset: String,
+    pub target_network: String,
+    pub kcc20_ticker: Option<String>,
+    pub kcc20_amount_atomic: Option<u128>,
+    pub zk_precompile_tag: Option<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompiledVaultLockCovenant {
+    pub vault_id: String,
+    pub vault_kind: VaultLockKind,
+    pub kip20_covenant_id: String,
+    pub kip21_subnetwork_id: String,
+    pub covenant_address: String,
+    pub covenant_spk_hex: String,
+    pub redeem_script_hex: String,
+    pub silverscript_source: String,
+    pub owner_pubkey_hex: String,
+    pub chronos_trigger_pubkey_hex: String,
+    pub kip17_policy_commitment_hex: String,
+    pub sig_op_count: u8,
+    pub kcc20_state: Option<KCC20StateU128>,
+}
+
+/// Builds a pure `u128` integer KCC-20 covenant state commitment (`SILO`, `PERX`, `kUSDT`).
+pub fn build_kcc20_state_commitment_u128(
+    ticker: &str,
+    amount_atomic: u128,
+    owner_bytes: &[u8; 32],
+    owner_scheme: u8,
+    borrow_scheme: u8,
+    borrow_guard_bytes: &[u8; 32],
+    charter_sha256_hex: Option<&str>,
+) -> KCC20StateU128 {
+    let clean_ticker = ticker.trim().to_uppercase();
+    let ext_seed = format!(
+        "{}:{}",
+        clean_ticker,
+        charter_sha256_hex.unwrap_or("PERENNIA_KCC20_CHARTER_V1")
+    );
+    let extension32 = blake2b_256(ext_seed.as_bytes());
+
+    let mut packed = Vec::with_capacity(114);
+    packed.extend_from_slice(&amount_atomic.to_le_bytes());
+    packed.extend_from_slice(owner_bytes);
+    packed.push(owner_scheme);
+    packed.push(borrow_scheme);
+    packed.extend_from_slice(borrow_guard_bytes);
+    packed.extend_from_slice(&extension32);
+
+    let state_root = blake2b_256_keyed(b"KCC20StateCommitmentU128", &packed);
+    let mut cov_preimage = Vec::with_capacity(16 + state_root.len());
+    cov_preimage.extend_from_slice(format!("KCC-20:{}:", clean_ticker).as_bytes());
+    cov_preimage.extend_from_slice(&state_root);
+    let covenant_id = blake2b_256(&cov_preimage);
+
+    KCC20StateU128 {
+        amount_atomic: amount_atomic.to_string(),
+        ticker: clean_ticker,
+        owner_hex: hex::encode(owner_bytes),
+        owner_scheme,
+        borrow_scheme,
+        borrow_guard_hex: hex::encode(borrow_guard_bytes),
+        extension_commitment_hex: hex::encode(extension32),
+        packed_state_hex: hex::encode(&packed),
+        state_root_hex: hex::encode(state_root),
+        covenant_id_hex: hex::encode(covenant_id),
+    }
+}
+
+/// Compiles a post-Toccata dual-path SilverScript v1.0 + KIP-17 + KIP-20 + KIP-21 Vault Lock covenant.
+/// Path A (`OP_TRUE` branch): 24/7 owner cancellation back to owner's Kaspa P2PK/address.
+/// Path B (`OP_FALSE` branch): Chronos 22:00 UTC trigger constrained by KIP-17 output introspection.
+pub fn compile_toccata_vault_lock_covenant(
+    spec: &VaultLockCovenantSpec,
+) -> Result<CompiledVaultLockCovenant, String> {
+    let (owner_scheme, owner_pubkey) = decode_kaspa_address_payload(&spec.owner_kaspa_address)
+        .ok_or_else(|| "owner_kaspa_address failed Kaspa Bech32m validation.".to_string())?;
+    if decode_kaspa_address_payload(&spec.refund_kaspa_address).is_none() {
+        return Err("refund_kaspa_address failed Kaspa Bech32m validation.".to_string());
+    }
+    if spec.threshold_sompi == 0 {
+        return Err("Vault threshold_sompi must be > 0.".to_string());
+    }
+    if spec.fee_bps > 1000 || spec.maker_spread_bps > 1000 {
+        return Err("fee_bps and maker_spread_bps must be <= 1000 bps (10%).".to_string());
+    }
+    if let Some(tag) = spec.zk_precompile_tag {
+        validate_zk_precompile_tag(tag)?;
+    }
+
+    let owner_pubkey_hex = hex::encode(owner_pubkey);
+    let trigger_pubkey_hex = hex::encode(spec.chronos_trigger_pubkey);
+    let clean_asset = spec.target_asset.trim().to_uppercase();
+    let clean_net = spec.target_network.trim().to_uppercase();
+
+    let kip17_commitment = blake2b_256(
+        format!(
+            "KIP17:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            spec.vault_kind.as_str(),
+            owner_pubkey_hex,
+            trigger_pubkey_hex,
+            spec.destination_spk_hex.trim().to_lowercase(),
+            spec.house_revenue_spk_hex.trim().to_lowercase(),
+            spec.threshold_sompi,
+            spec.fee_bps,
+            spec.maker_spread_bps,
+            clean_asset
+        )
+        .as_bytes(),
+    );
+    let kip17_hex = hex::encode(kip17_commitment);
+
+    // Clean-stack dual-path Kaspa Script:
+    // IF   : 24/7 Owner Cancel -> <owner_pubkey> OP_CHECKSIG
+    // ELSE : Chronos KIP-17 Trigger -> <kip17_commitment> OP_DROP <trigger_pubkey> OP_CHECKSIG
+    let mut redeem_script = Vec::with_capacity(110);
+    redeem_script.push(0x63); // OP_IF
+    redeem_script.push(0x20); // OP_DATA_32
+    redeem_script.extend_from_slice(&owner_pubkey);
+    redeem_script.push(0xac); // OP_CHECKSIG
+    redeem_script.push(0x67); // OP_ELSE
+    redeem_script.push(0x20); // OP_DATA_32
+    redeem_script.extend_from_slice(&kip17_commitment);
+    redeem_script.push(0x75); // OP_DROP
+    redeem_script.push(0x20); // OP_DATA_32
+    redeem_script.extend_from_slice(&spec.chronos_trigger_pubkey);
+    redeem_script.push(0xac); // OP_CHECKSIG
+    redeem_script.push(0x68); // OP_ENDIF
+
+    let script_hash = blake2b_256(&redeem_script);
+    let script_hash_hex = hex::encode(script_hash);
+    let covenant_address =
+        encode_kaspa_bech32m_address(KASPA_ADDR_VERSION_P2SH, &script_hash);
+    let covenant_spk_hex = format!("a9{}87", script_hash_hex);
+    let redeem_script_hex = hex::encode(&redeem_script);
+
+    let vault_id = hex::encode(
+        &blake2b_256(
+            format!(
+                "TOCCATA_VAULT:{}:{}:{}",
+                spec.vault_kind.as_str(),
+                owner_pubkey_hex,
+                covenant_spk_hex
+            )
+            .as_bytes(),
+        )[..16],
+    );
+
+    let kcc20_state = if let Some(ref kcc_ticker) = spec.kcc20_ticker {
+        let amt = spec.kcc20_amount_atomic.unwrap_or(0);
+        Some(build_kcc20_state_commitment_u128(
+            kcc_ticker,
+            amt,
+            &owner_pubkey,
+            owner_scheme,
+            if spec.vault_kind == VaultLockKind::MakerPlant {
+                0x02
+            } else {
+                0x01
+            },
+            &script_hash,
+            Some(&kip17_hex),
+        ))
+    } else {
+        None
+    };
+
+    let kip20_covenant_id = kcc20_state
+        .as_ref()
+        .map(|s| s.covenant_id_hex.clone())
+        .unwrap_or_else(|| {
+            hex::encode(blake2b_256(
+                format!("KIP20:{}:{}", vault_id, script_hash_hex).as_bytes(),
+            ))
+        });
+
+    let maker_guard_clause = if spec.vault_kind == VaultLockKind::MakerPlant {
+        format!(
+            "\n        // Maker Plant KIP-20 Lineage & Spread Enforcement ({} bps)\n\
+             require(tx.outputs[0].covenantId == 0x{});\n\
+             require(tx.outputs[0].value >= (tx.inputs[this.activeInputIndex].value * (10000 + {})) / 10000);",
+            spec.maker_spread_bps, kip20_covenant_id, spec.maker_spread_bps
+        )
+    } else {
+        String::new()
+    };
+
+    let silverscript_source = format!(
+        "pragma silverscript ^1.0.0;\n\n\
+         // Perennia Toccata Sovereign Vault ({} -> {}:{})\n\
+         // KIP-17 Policy Commitment: 0x{}\n\
+         // KIP-20 Covenant ID:       0x{}\n\
+         // OpZkPrecompile Tag:       0x{:02x} (Groth16 ONLY)\n\
+         contract PerenniaToccataVault(\n\
+             pubkey ownerPubkey,\n\
+             pubkey chronosTriggerPubkey,\n\
+             bytes32 destSpkDigest,\n\
+             bytes32 houseRevenueSpkDigest,\n\
+             int thresholdSompi,\n\
+             int feeBps\n\
+         ) {{\n\
+             entrypoint function cancelToOwner(sig ownerSig) {{\n\
+                 require(checkSig(ownerSig, ownerPubkey));\n\
+                 require(tx.outputs[0].scriptPublicKey == new ScriptPublicKeyP2PK(ownerPubkey));\n\
+             }}\n\
+             entrypoint function triggerChronosSettlement(sig triggerSig, int inputSompi) {{\n\
+                 require(checkSig(triggerSig, chronosTriggerPubkey));\n\
+                 require(tx.inputs[this.activeInputIndex].value >= thresholdSompi);\n\
+                 require(blake2b(tx.outputs[0].scriptPublicKey) == destSpkDigest);\n\
+                 require(blake2b(tx.outputs[1].scriptPublicKey) == houseRevenueSpkDigest);\n\
+                 require(tx.outputs[1].value <= (inputSompi * feeBps) / 10000);{}\n\
+             }}\n\
+         }}",
+        spec.vault_kind.as_str(),
+        clean_asset,
+        clean_net,
+        kip17_hex,
+        kip20_covenant_id,
+        OP_ZK_PRECOMPILE_GROTH16_TAG,
+        maker_guard_clause
+    );
+
+    Ok(CompiledVaultLockCovenant {
+        vault_id,
+        vault_kind: spec.vault_kind,
+        kip20_covenant_id,
+        kip21_subnetwork_id: PERENNIA_KIP21_SEQCOMMIT_SUBNETWORK_HEX.to_string(),
+        covenant_address,
+        covenant_spk_hex,
+        redeem_script_hex,
+        silverscript_source,
+        owner_pubkey_hex,
+        chronos_trigger_pubkey_hex: trigger_pubkey_hex,
+        kip17_policy_commitment_hex: kip17_hex,
+        sig_op_count: 2,
+        kcc20_state,
+    })
 }

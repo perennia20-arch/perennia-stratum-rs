@@ -20,8 +20,9 @@ use protowire::{
     SubmitBlockRequestMessage, NotifyNewBlockTemplateRequestMessage,
     GetBlockDagInfoRequestMessage, GetBlockRewardInfoRequestMessage,
     GetBalanceByAddressRequestMessage, GetUtxosByAddressesRequestMessage,
-    SubmitTransactionRequestMessage, RpcTransaction, RpcTransactionInput,
-    RpcTransactionOutput, RpcOutpoint, RpcScriptPublicKey,
+    GetFeeEstimateRequestMessage, SubmitTransactionRequestMessage,
+    RpcTransaction, RpcTransactionInput, RpcTransactionOutput,
+    RpcOutpoint, RpcScriptPublicKey, RpcCovenantBinding,
 };
 use protowire::kaspad_request::Payload as RequestPayload;
 use protowire::kaspad_response::Payload as ResponsePayload;
@@ -165,6 +166,47 @@ async fn execute_single_grpc_request(payload: RequestPayload) -> Result<Response
     Err(last_err)
 }
 
+pub const POST_TOCCATA_MIN_FEERATE_SOMPI_PER_GRAM: u64 = 100;
+#[allow(dead_code)]
+pub const RELAY_SAFE_FEERATE_SOMPI_PER_GRAM: u64 = 110;
+
+pub async fn get_virtual_daa_score_grpc() -> Result<u64, String> {
+    let req = RequestPayload::GetBlockDagInfoRequest(GetBlockDagInfoRequestMessage {});
+    match execute_single_grpc_request(req).await? {
+        ResponsePayload::GetBlockDagInfoResponse(res) => {
+            if let Some(err) = res.error {
+                return Err(format!("kaspad gRPC GetBlockDagInfo error: {}", err.message));
+            }
+            Ok(res.virtual_daa_score)
+        }
+        _ => Err("Unexpected gRPC response variant for GetBlockDagInfo".to_string()),
+    }
+}
+
+pub async fn get_fee_estimate_sompi_per_gram_grpc() -> Result<u64, String> {
+    let req = RequestPayload::GetFeeEstimateRequest(GetFeeEstimateRequestMessage {});
+    match execute_single_grpc_request(req).await? {
+        ResponsePayload::GetFeeEstimateResponse(res) => {
+            if let Some(err) = res.error {
+                return Err(format!("kaspad gRPC GetFeeEstimate error: {}", err.message));
+            }
+            let estimate = res
+                .estimate
+                .ok_or_else(|| "kaspad gRPC GetFeeEstimate returned no estimate".to_string())?;
+            let bucket = estimate
+                .priority_bucket
+                .as_ref()
+                .or_else(|| estimate.normal_buckets.first())
+                .ok_or_else(|| "kaspad gRPC GetFeeEstimate returned no feerate buckets".to_string())?;
+            if !bucket.feerate.is_finite() || bucket.feerate <= 0.0 {
+                return Err("kaspad gRPC GetFeeEstimate returned non-positive feerate".to_string());
+            }
+            Ok((bucket.feerate.ceil() as u64).max(POST_TOCCATA_MIN_FEERATE_SOMPI_PER_GRAM))
+        }
+        _ => Err("Unexpected gRPC response variant for GetFeeEstimate".to_string()),
+    }
+}
+
 pub async fn get_balance_by_address_grpc(address: &str) -> Result<u64, String> {
     let clean = address.trim().to_lowercase().replace("kaspa:", "");
     let formatted = format!("kaspa:{}", clean);
@@ -215,7 +257,8 @@ pub async fn get_utxos_by_address_grpc(address: &str) -> Result<Vec<Value>, Stri
                             "scriptPublicKey": spk_hex
                         },
                         "blockDaaScore": utxo_entry.block_daa_score.to_string(),
-                        "isCoinbase": utxo_entry.is_coinbase
+                        "isCoinbase": utxo_entry.is_coinbase,
+                        "covenantId": utxo_entry.covenant_id
                     }
                 }));
             }
@@ -230,7 +273,7 @@ fn parse_json_to_rpc_transaction(tx_payload: &Value) -> Result<RpcTransaction, S
     let version = tx_obj
         .get("version")
         .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
+        .unwrap_or(1) as u32;
     let lock_time = tx_obj
         .get("lockTime")
         .or_else(|| tx_obj.get("lock_time"))
@@ -243,6 +286,14 @@ fn parse_json_to_rpc_transaction(tx_payload: &Value) -> Result<RpcTransaction, S
         .unwrap_or("0000000000000000000000000000000000000000")
         .to_string();
     let gas = tx_obj.get("gas").and_then(|v| v.as_u64()).unwrap_or(0);
+    let storage_mass = tx_obj
+        .get("storageMass")
+        .or_else(|| tx_obj.get("storage_mass"))
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+        })
+        .unwrap_or(0);
     let payload = tx_obj
         .get("payload")
         .and_then(|v| v.as_str())
@@ -301,10 +352,9 @@ fn parse_json_to_rpc_transaction(tx_payload: &Value) -> Result<RpcTransaction, S
             .or_else(|| out.get("value"))
             .and_then(|v| {
                 v.as_u64()
-                    .or_else(|| v.as_f64().map(|f| f.round() as u64))
-                    .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
             })
-            .ok_or_else(|| "Output missing amount".to_string())?;
+            .ok_or_else(|| "Output missing strict integer sompi amount".to_string())?;
         let spk_field = out.get("scriptPublicKey").or_else(|| out.get("script_public_key"));
         let (spk_version, spk_hex) = match spk_field {
             Some(Value::String(s)) => (0u32, s.clone()),
@@ -323,12 +373,30 @@ fn parse_json_to_rpc_transaction(tx_payload: &Value) -> Result<RpcTransaction, S
             }
             _ => return Err("Output missing scriptPublicKey".to_string()),
         };
+        let covenant = out.get("covenant").and_then(|c| {
+            let cov_id = c
+                .get("covenantId")
+                .or_else(|| c.get("covenant_id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())?;
+            let auth_input = c
+                .get("authorizingInput")
+                .or_else(|| c.get("authorizing_input"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            Some(RpcCovenantBinding {
+                authorizing_input: auth_input,
+                covenant_id: cov_id,
+            })
+        });
         outputs.push(RpcTransactionOutput {
             amount,
             script_public_key: Some(RpcScriptPublicKey {
                 version: spk_version,
                 script_public_key: spk_hex,
             }),
+            covenant,
             ..Default::default()
         });
     }
@@ -341,6 +409,7 @@ fn parse_json_to_rpc_transaction(tx_payload: &Value) -> Result<RpcTransaction, S
         subnetwork_id,
         gas,
         payload,
+        storage_mass,
         ..Default::default()
     })
 }

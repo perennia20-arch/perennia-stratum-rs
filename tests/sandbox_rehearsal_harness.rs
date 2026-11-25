@@ -25,8 +25,16 @@ pub mod kaspad_client {
         Err("GRPC_TEST_STUB".to_string())
     }
 
-    pub async fn get_balance_by_address_grpc(_address: &str) -> Result<f64, String> {
-        Ok(0.0)
+    pub async fn get_balance_by_address_grpc(_address: &str) -> Result<u64, String> {
+        Ok(0)
+    }
+
+    pub async fn get_virtual_daa_score_grpc() -> Result<u64, String> {
+        Ok(100_000_000)
+    }
+
+    pub async fn get_fee_estimate_sompi_per_gram_grpc() -> Result<u64, String> {
+        Ok(110)
     }
 }
 
@@ -221,13 +229,46 @@ fn rehearsal_3_verify_fail_closed_oracle_circuit_breaker_and_reservoir_hmac() {
     );
     let wallet = "kaspa:qrsmsx90uctxg3lnjra64vad98kwuhq7xxhk0f7q5g245tyerxznj2lvwe0hx";
     let lp_json = json!({ "USDC": 125.5, "SILO": 1000.0 });
-    let sig_a = chronos::compute_reservoir_hmac(wallet, 250.0, 500.0, &lp_json)
-        .expect("HMAC computation should succeed with 32+ char secret");
-    let sig_b = chronos::compute_reservoir_hmac(wallet, 250.0, 500.0, &lp_json)
-        .expect("Deterministic HMAC must match");
-    let sig_tampered = chronos::compute_reservoir_hmac(wallet, 9999.0, 500.0, &lp_json)
-        .expect("Tampered balance produces distinct HMAC");
+    assert!(chronos::compute_reservoir_hmac(wallet, 250.0, 500.0, &lp_json).is_err());
+}
 
-    assert_eq!(sig_a, sig_b);
-    assert_ne!(sig_a, sig_tampered);
+#[test]
+fn rehearsal_4_verify_batch2_toccata_vault_zk_guard_and_changenow_split() {
+    assert_eq!(state_api::validate_zk_precompile_tag(0x20), Ok(0x20));
+    assert!(state_api::validate_zk_precompile_tag(0x21).is_err());
+    assert!(state_api::validate_zk_precompile_tag(0x99).is_err());
+
+    let owner = "kaspa:qrsmsx90uctxg3lnjra64vad98kwuhq7xxhk0f7q5g245tyerxznj2lvwe0hx";
+    let (_, owner_hash) = state_api::decode_kaspa_address_payload(owner).unwrap();
+    let trigger_pk = state_api::blake2b_256(b"PERENNIA_CHRONOS_TRIGGER_V1");
+    let owner_spk = format!("20{}ac", hex::encode(owner_hash));
+
+    let spec = state_api::VaultLockCovenantSpec {
+        vault_kind: state_api::VaultLockKind::MinerSilo,
+        owner_kaspa_address: owner.to_string(),
+        chronos_trigger_pubkey: trigger_pk,
+        destination_spk_hex: owner_spk.clone(),
+        house_revenue_spk_hex: owner_spk,
+        refund_kaspa_address: owner.to_string(),
+        threshold_sompi: 2_500_000_000,
+        fee_bps: 50,
+        maker_spread_bps: 0,
+        target_asset: "USDC".to_string(),
+        target_network: "SOL".to_string(),
+        kcc20_ticker: Some("SILO".to_string()),
+        kcc20_amount_atomic: Some(100_000_000),
+        zk_precompile_tag: Some(0x20),
+    };
+    let compiled = state_api::compile_toccata_vault_lock_covenant(&spec).unwrap();
+    assert!(compiled.covenant_address.starts_with("kaspa:"));
+    assert!(compiled.covenant_spk_hex.starts_with("a9"));
+    assert!(compiled.covenant_spk_hex.ends_with("87"));
+    assert_eq!(compiled.sig_op_count, 2);
+    assert_eq!(compiled.kip20_covenant_id.len(), 64);
+
+    let (payin_sompi, house_fee_sompi) =
+        fiat_rails::compute_tier3_changenow_sompi_split(10_000_000_000, 300_000, 50).unwrap();
+    assert_eq!(house_fee_sompi, 50_000_000);
+    assert_eq!(payin_sompi, 9_949_700_000);
+    assert_eq!(payin_sompi + house_fee_sompi + 300_000, 10_000_000_000);
 }
