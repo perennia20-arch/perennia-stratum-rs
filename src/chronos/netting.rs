@@ -1,32 +1,309 @@
-use chrono::Utc;
+use chrono::{Timelike, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sqlx::{PgPool, Row};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const CORE_POOL_BUCKET_ASSETS: &[&str] = &[
-    "USDC", "USDT", "USD", "BTC", "ETH", "SOL", "SILO", "XRP", "DOGE", "POL", "AVAX", "SUI",
-    "TRX", "ZEC", "ARB", "BASE", "NVDA", "SPY", "XAU",
-];
+pub const COW_HOUSE_SPREAD_MIN_BPS: u16 = 50;
+pub const COW_HOUSE_SPREAD_MAX_BPS: u16 = 100;
+pub const TIER2_DARK_POOL_MIN_FEE_BPS: u16 = 50;
+pub const TIER2_DARK_POOL_MAX_FEE_BPS: u16 = 75;
+pub const TIER2_MIN_IMPROVEMENT_BPS: u16 = 10;
+pub const DEFAULT_HTLC_DAA_REFUND_DELTA: u64 = 36_000;
 
-fn lock_multiplier_for_days(days: i32) -> f64 {
-    if days >= 365 {
-        2.5
-    } else if days >= 90 {
-        1.5
-    } else if days >= 30 {
-        1.2
-    } else {
-        1.0
+pub const REDIS_KEY_CHRONOS_RFQ_BATCHES: &str = "perennia:chronos:rfq:batches";
+pub const REDIS_KEY_CHRONOS_WINNING_BID_PREFIX: &str = "perennia:chronos:rfq:winning_bid:";
+pub const REDIS_CHANNEL_CHRONOS_RFQ_EVENTS: &str = "perennia:chronos:rfq:events";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KaspaOpSha256HtlcCovenant {
+    pub p2sh_address: String,
+    pub p2sh_spk_hex: String,
+    pub redeem_script_hex: String,
+    pub sha256_hashlock_hex: String,
+    pub claim_pubkey_hex: String,
+    pub refund_pubkey_hex: String,
+    pub refund_daa_lock: u64,
+    pub sig_op_count: u8,
+}
+
+/// Builds clean-stack Kaspa `OpSHA256` P2SH HTLC bytecode:
+/// `OpIf OpSHA256 <32B hashlock> OpEqualVerify <32B claim_pubkey> OpCheckSig OpElse <8B refund_daa_le> OpCheckLockTimeVerify OpDrop <32B refund_pubkey> OpCheckSig OpEndIf`
+pub fn build_kaspa_opsha256_htlc_covenant(
+    sha256_hashlock: &[u8; 32],
+    claim_pubkey: &[u8; 32],
+    refund_pubkey: &[u8; 32],
+    refund_daa_lock: u64,
+) -> KaspaOpSha256HtlcCovenant {
+    let mut redeem = Vec::with_capacity(115);
+    redeem.push(0x63); // OP_IF (claim with SHA-256 preimage)
+    redeem.push(0xa8); // OP_SHA256
+    redeem.push(0x20); // OP_DATA_32
+    redeem.extend_from_slice(sha256_hashlock);
+    redeem.push(0x88); // OP_EQUALVERIFY
+    redeem.push(0x20); // OP_DATA_32
+    redeem.extend_from_slice(claim_pubkey);
+    redeem.push(0xac); // OP_CHECKSIG
+    redeem.push(0x67); // OP_ELSE (refund after DAA maturity locktime)
+    redeem.push(0x08); // OP_DATA_8
+    redeem.extend_from_slice(&refund_daa_lock.to_le_bytes());
+    redeem.push(0xb0); // OP_CHECKLOCKTIMEVERIFY
+    redeem.push(0x75); // OP_DROP
+    redeem.push(0x20); // OP_DATA_32
+    redeem.extend_from_slice(refund_pubkey);
+    redeem.push(0xac); // OP_CHECKSIG
+    redeem.push(0x68); // OP_ENDIF
+
+    let script_hash = crate::state_api::blake2b_256(&redeem);
+    let p2sh_address = crate::state_api::encode_kaspa_bech32m_address(
+        crate::state_api::KASPA_ADDR_VERSION_P2SH,
+        &script_hash,
+    );
+    let p2sh_spk_hex = format!("a9{}87", hex::encode(script_hash));
+    KaspaOpSha256HtlcCovenant {
+        p2sh_address,
+        p2sh_spk_hex,
+        redeem_script_hex: hex::encode(&redeem),
+        sha256_hashlock_hex: hex::encode(sha256_hashlock),
+        claim_pubkey_hex: hex::encode(claim_pubkey),
+        refund_pubkey_hex: hex::encode(refund_pubkey),
+        refund_daa_lock,
+        sig_op_count: 2,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThermostatValveRule {
+    pub priority_order: u8,
+    pub valve_type: String,
+    pub target_asset: String,
+    pub target_network: String,
+    pub destination_address: String,
+    pub target_cap_sompi: u128,
+    pub target_cap_usd_micros: u128,
+    pub filled_epoch_sompi: u128,
+    pub filled_epoch_usd_micros: u128,
+    pub zktls_biller_commitment_hex: Option<String>,
+    pub is_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThermostatValveAllocation {
+    pub priority_order: u8,
+    pub valve_type: String,
+    pub target_asset: String,
+    pub target_network: String,
+    pub destination_address: String,
+    pub allocated_sompi: u128,
+    pub zktls_biller_commitment_hex: Option<String>,
+}
+
+/// Sequential 4-Valve Thermostat Router:
+/// `Valve 1: Electric Bill` -> `Valve 2: AI Agent x402 Floor` -> `Valve 3: JIT Visa Spend Ceiling` -> `Valve 4: Tangem Cold / Plant Sweep`.
+pub fn route_sompi_across_thermostat_valves(
+    available_sompi: u128,
+    kas_usd_e8: u128,
+    valves: &[ThermostatValveRule],
+) -> Vec<ThermostatValveAllocation> {
+    let mut ordered: Vec<&ThermostatValveRule> =
+        valves.iter().filter(|v| v.is_enabled).collect();
+    ordered.sort_by_key(|v| v.priority_order);
+
+    let mut remaining = available_sompi;
+    let mut allocations = Vec::with_capacity(ordered.len());
+
+    for v in ordered {
+        if remaining == 0 {
+            break;
+        }
+        let capacity_sompi = if v.target_cap_sompi > 0 {
+            v.target_cap_sompi.saturating_sub(v.filled_epoch_sompi)
+        } else if v.target_cap_usd_micros > 0 && kas_usd_e8 > 0 {
+            let rem_usd_micros = v
+                .target_cap_usd_micros
+                .saturating_sub(v.filled_epoch_usd_micros);
+            // (usd_micros * 1e-6) / (kas_usd_e8 * 1e-8) * 1e8 = usd_micros * 1e10 / kas_usd_e8
+            rem_usd_micros.saturating_mul(10_000_000_000) / kas_usd_e8
+        } else if v.priority_order == 4 || v.valve_type == "VALVE_4_TANGEM_COLD_OR_PLANT" {
+            remaining
+        } else {
+            0
+        };
+
+        let take = remaining.min(capacity_sompi);
+        if take > 0 {
+            remaining = remaining.saturating_sub(take);
+            allocations.push(ThermostatValveAllocation {
+                priority_order: v.priority_order,
+                valve_type: v.valve_type.clone(),
+                target_asset: v.target_asset.trim().to_uppercase(),
+                target_network: v.target_network.trim().to_uppercase(),
+                destination_address: v.destination_address.trim().to_string(),
+                allocated_sompi: take,
+                zktls_biller_commitment_hex: v.zktls_biller_commitment_hex.clone(),
+            });
+        }
+    }
+    allocations
+}
+
+pub async fn evaluate_wallet_thermostat_route(
+    pool: &PgPool,
+    clean_wallet: &str,
+    available_sompi: u128,
+    kas_usd_e8: u128,
+) -> Vec<ThermostatValveAllocation> {
+    let rows = sqlx::query(
+        r#"
+        SELECT priority_order, valve_type, target_asset, target_network, destination_address,
+               target_cap_sompi::NUMERIC(39,0)::TEXT AS target_cap_sompi,
+               target_cap_usd_micros::NUMERIC(39,0)::TEXT AS target_cap_usd_micros,
+               filled_epoch_sompi::NUMERIC(39,0)::TEXT AS filled_epoch_sompi,
+               filled_epoch_usd_micros::NUMERIC(39,0)::TEXT AS filled_epoch_usd_micros,
+               zktls_biller_commitment_hex, is_enabled
+        FROM thermostat_valves
+        WHERE clean_wallet = $1 AND is_enabled = TRUE
+        ORDER BY priority_order ASC
+        "#,
+    )
+    .bind(clean_wallet)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let rules: Vec<ThermostatValveRule> = rows
+        .into_iter()
+        .map(|r| ThermostatValveRule {
+            priority_order: r.try_get::<i16, _>("priority_order").unwrap_or(4) as u8,
+            valve_type: r.try_get("valve_type").unwrap_or_default(),
+            target_asset: r.try_get("target_asset").unwrap_or_else(|_| "KAS".to_string()),
+            target_network: r.try_get("target_network").unwrap_or_else(|_| "KAS".to_string()),
+            destination_address: r.try_get("destination_address").unwrap_or_default(),
+            target_cap_sompi: r
+                .try_get::<String, _>("target_cap_sompi")
+                .ok()
+                .and_then(|s| s.parse::<u128>().ok())
+                .unwrap_or(0),
+            target_cap_usd_micros: r
+                .try_get::<String, _>("target_cap_usd_micros")
+                .ok()
+                .and_then(|s| s.parse::<u128>().ok())
+                .unwrap_or(0),
+            filled_epoch_sompi: r
+                .try_get::<String, _>("filled_epoch_sompi")
+                .ok()
+                .and_then(|s| s.parse::<u128>().ok())
+                .unwrap_or(0),
+            filled_epoch_usd_micros: r
+                .try_get::<String, _>("filled_epoch_usd_micros")
+                .ok()
+                .and_then(|s| s.parse::<u128>().ok())
+                .unwrap_or(0),
+            zktls_biller_commitment_hex: r
+                .try_get::<Option<String>, _>("zktls_biller_commitment_hex")
+                .ok()
+                .flatten(),
+            is_enabled: r.try_get::<bool, _>("is_enabled").unwrap_or(true),
+        })
+        .collect();
+
+    route_sompi_across_thermostat_valves(available_sompi, kas_usd_e8, &rules)
+}
+
+/// Hard Tier 2 Batch Auction Invariants:
+/// 1. `solver_net_miner_payout_atomic >= ceil(changenow_net_floor_atomic * (10_000 + 10) / 10_000)` (`+10 bps`)
+/// 2. `50 <= house_fee_bps <= 75`, skimming exact `sompi` to Perennia House Revenue.
+pub fn verify_tier2_solver_bid_invariants(
+    changenow_net_floor_atomic: u128,
+    solver_net_miner_payout_atomic: u128,
+    gross_vault_sompi: u128,
+    house_fee_bps: u16,
+) -> Result<(u128, u128), String> {
+    if !(TIER2_DARK_POOL_MIN_FEE_BPS..=TIER2_DARK_POOL_MAX_FEE_BPS).contains(&house_fee_bps) {
+        return Err(format!(
+            "TIER2_FEE_OUT_OF_BOUNDS: house_fee_bps={} must be between {} and {} bps.",
+            house_fee_bps, TIER2_DARK_POOL_MIN_FEE_BPS, TIER2_DARK_POOL_MAX_FEE_BPS
+        ));
+    }
+    if changenow_net_floor_atomic == 0 || gross_vault_sompi == 0 {
+        return Err("TIER2_INVALID_AMOUNTS: floor and gross vault sompi must be > 0.".to_string());
+    }
+    let min_required_atomic = (changenow_net_floor_atomic
+        .saturating_mul(10_000 + TIER2_MIN_IMPROVEMENT_BPS as u128)
+        + 9_999)
+        / 10_000;
+    if solver_net_miner_payout_atomic < min_required_atomic {
+        return Err(format!(
+            "SOLVER_BID_BELOW_RESERVE_FLOOR: bid {} < minimum {} (ChangeNOW floor {} + {} bps).",
+            solver_net_miner_payout_atomic,
+            min_required_atomic,
+            changenow_net_floor_atomic,
+            TIER2_MIN_IMPROVEMENT_BPS
+        ));
+    }
+    let house_fee_sompi = gross_vault_sompi.saturating_mul(house_fee_bps as u128) / 10_000;
+    Ok((min_required_atomic, house_fee_sompi))
+}
+
+fn asset_decimals_for_target(ticker: &str) -> u8 {
+    match ticker.trim().to_uppercase().as_str() {
+        "USDC" | "USDT" | "KUSDT" | "USD" | "XRP" | "TRX" | "ADA" => 6,
+        "SOL" | "SUI" | "TON" => 9,
+        "ETH" | "ARB" | "BASE" | "POL" | "AVAX" | "LINK" => 18,
+        _ => 8,
     }
 }
 
 pub async fn start_delta_netting_engine(redis_client: redis::Client, pool: PgPool) {
-    tracing::info!("⚡ [CHRONOS NETTING] Delta Netting, Live ChangeNOW Bucket Telemetry & 50%-KAS LP Invariant Engine Armed.");
+    tracing::info!(
+        "⚡ [CHRONOS NETTING] Sovereign L1 4-Valve Thermostat, Tier 1/2/3 Dark Pool & RFQ Engine Armed."
+    );
     let mut interval = tokio::time::interval(Duration::from_secs(10));
+    let mut last_tier12_day: Option<u32> = None;
+    let mut last_tier2_close_day: Option<u32> = None;
+
     loop {
         interval.tick().await;
+        let now = Utc::now();
+        let ordinal_day = now.format("%j").to_string().parse::<u32>().unwrap_or(0);
+        let epoch_id = now.format("%Y-%m-%d").to_string();
+
+        // 21:58:00 UTC -> Tier 1 P2P CoW Cross + Publish Tier 2 Solver RFQ Batch Manifests
+        if now.hour() == 21
+            && now.minute() == 58
+            && last_tier12_day != Some(ordinal_day)
+        {
+            last_tier12_day = Some(ordinal_day);
+            if let Ok(kas_e8) = crate::state_api::resolve_strict_spot_price_e8(&pool, "KAS").await {
+                let _ = execute_tier1_cow_dark_pool_cross(&pool, &epoch_id, kas_e8).await;
+                if let Ok(mut conn) = redis_client.get_multiplexed_async_connection().await {
+                    let _ = publish_tier2_chronos_rfq_batches(&pool, &mut conn, &epoch_id, kas_e8)
+                        .await;
+                }
+            } else {
+                tracing::warn!("⚠️ [21:58 UTC] Live KAS oracle offline; failing closed on Tier 1/2 window.");
+            }
+        }
+
+        // 21:59:30 UTC -> Close Solver Auction & Lock Winning OpSHA256 HTLCs
+        if now.hour() == 21
+            && now.minute() == 59
+            && now.second() >= 30
+            && last_tier2_close_day != Some(ordinal_day)
+        {
+            last_tier2_close_day = Some(ordinal_day);
+            if let Ok(mut conn) = redis_client.get_multiplexed_async_connection().await {
+                let _ =
+                    finalize_tier2_chronos_auction_and_lock_htlcs(&pool, &mut conn, &epoch_id)
+                        .await;
+            }
+        }
+
         if let Err(e) = run_delta_netting_cycle(&redis_client, &pool).await {
             tracing::warn!("⚠️ [CHRONOS NETTING] Cycle warning: {}", e);
         }
@@ -35,132 +312,52 @@ pub async fn start_delta_netting_engine(redis_client: redis::Client, pool: PgPoo
 
 pub async fn publish_live_epoch_bucket_telemetry(
     pool: &PgPool,
-    kas_spot_usd: f64,
+    _legacy_kas_spot: f64,
 ) -> anyhow::Result<Value> {
-    let safe_kas_spot = if kas_spot_usd.is_finite() && kas_spot_usd > 0.0 {
-        kas_spot_usd
-    } else {
-        crate::fiat_rails::resolve_live_spot_price(pool, "KAS")
-            .await
-            .unwrap_or(0.15)
-            .max(0.01)
-    };
+    let kas_usd_e8 = crate::state_api::resolve_strict_spot_price_e8(pool, "KAS")
+        .await
+        .map_err(|e| anyhow::anyhow!("ORACLE_HALT: {}", e))?;
 
-    let cc_rows = sqlx::query(
+    let vault_rows = sqlx::query(
         r#"
-        SELECT wallet_address, layout_state
-        FROM user_command_centers
+        SELECT target_asset, target_network, clean_wallet,
+               confirmed_utxo_sompi::NUMERIC(39,0)::TEXT AS confirmed_utxo_sompi,
+               status
+        FROM vault_locks
+        WHERE status IN ('FILLING', 'THRESHOLD_MET', 'LOCKED_IN_AUCTION')
         "#,
     )
     .fetch_all(pool)
     .await
     .unwrap_or_default();
 
-    let mut pending_kas_by_asset: HashMap<String, f64> = HashMap::new();
-    let mut participants_by_asset: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut discovered_tickers: HashSet<String> = CORE_POOL_BUCKET_ASSETS
-        .iter()
-        .map(|s| (*s).to_string())
-        .collect();
+    let mut sompi_by_asset: BTreeMap<String, u128> = BTreeMap::new();
+    let mut ready_sompi_by_asset: BTreeMap<String, u128> = BTreeMap::new();
+    let mut wallets_by_asset: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
 
-    for row in &cc_rows {
-        let wallet: String = row.try_get("wallet_address").unwrap_or_default();
-        let layout: Value = row
-            .try_get("layout_state")
-            .unwrap_or_else(|_| json!({ "sectors": [] }));
-        if let Some(sectors) = layout.get("sectors").and_then(|v| v.as_array()) {
-            for sec in sectors {
-                let alloc_pct = sec
-                    .get("allocationPercentage")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
-                let sec_pending_kas = sec
-                    .get("pendingKaspa")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0)
-                    .max(0.0);
-                if alloc_pct <= 0.0 && sec_pending_kas <= 0.0 {
-                    continue;
-                }
-                if let Some(target_assets) = sec
-                    .get("settlementConfig")
-                    .and_then(|c| c.get("targetAssets"))
-                    .and_then(|v| v.as_array())
-                {
-                    if target_assets.len() >= 2 {
-                        for leg in target_assets {
-                            let tick = leg
-                                .get("ticker")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .trim()
-                                .to_uppercase();
-                            if tick.is_empty() || tick == "KAS" {
-                                continue;
-                            }
-                            discovered_tickers.insert(tick.clone());
-                            let leg_weight_ratio = (leg
-                                .get("weightPct")
-                                .and_then(|v| v.as_f64())
-                                .unwrap_or(50.0)
-                                .max(0.0))
-                                / 100.0;
-                            let leg_kas = sec_pending_kas * leg_weight_ratio;
-                            *pending_kas_by_asset.entry(tick.clone()).or_insert(0.0) += leg_kas;
-                            if !wallet.is_empty() {
-                                participants_by_asset
-                                    .entry(tick)
-                                    .or_default()
-                                    .insert(wallet.clone());
-                            }
-                        }
-                        continue;
-                    }
-                }
-                let primary_tick = sec
-                    .get("settlementConfig")
-                    .and_then(|c| c.get("targetAsset"))
-                    .and_then(|t| t.get("ticker"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim()
-                    .to_uppercase();
-                if !primary_tick.is_empty() && primary_tick != "KAS" {
-                    discovered_tickers.insert(primary_tick.clone());
-                    *pending_kas_by_asset
-                        .entry(primary_tick.clone())
-                        .or_insert(0.0) += sec_pending_kas;
-                    if !wallet.is_empty() {
-                        participants_by_asset
-                            .entry(primary_tick)
-                            .or_default()
-                            .insert(wallet.clone());
-                    }
-                }
-            }
+    for r in vault_rows {
+        let asset = r
+            .try_get::<String, _>("target_asset")
+            .unwrap_or_else(|_| "KAS".to_string())
+            .trim()
+            .to_uppercase();
+        if asset.is_empty() || asset == "KAS" {
+            continue;
         }
-    }
+        let sompi = r
+            .try_get::<String, _>("confirmed_utxo_sompi")
+            .ok()
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or(0);
+        let status: String = r.try_get("status").unwrap_or_default();
+        let wallet: String = r.try_get("clean_wallet").unwrap_or_default();
 
-    let lp_rows = sqlx::query(
-        r#"
-        SELECT pool_pair, COALESCE(SUM(staked_asset_a), 0.0) AS total_kas_a
-        FROM liquidity_providers
-        GROUP BY pool_pair
-        "#,
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
-
-    let mut lp_kas_by_asset: HashMap<String, f64> = HashMap::new();
-    for r in lp_rows {
-        let pair: String = r.try_get("pool_pair").unwrap_or_default();
-        let kas_a: f64 = r.try_get::<f64, _>("total_kas_a").unwrap_or(0.0_f64).max(0.0_f64);
-        for part in pair.split('/') {
-            let clean = part.trim().to_uppercase();
-            if !clean.is_empty() && clean != "KAS" {
-                *lp_kas_by_asset.entry(clean).or_insert(0.0) += kas_a;
-            }
+        *sompi_by_asset.entry(asset.clone()).or_insert(0) += sompi;
+        if status == "THRESHOLD_MET" || status == "LOCKED_IN_AUCTION" {
+            *ready_sompi_by_asset.entry(asset.clone()).or_insert(0) += sompi;
+        }
+        if !wallet.is_empty() {
+            wallets_by_asset.entry(asset).or_default().insert(wallet);
         }
     }
 
@@ -172,72 +369,46 @@ pub async fn publish_live_epoch_bucket_telemetry(
         crate::chronos::compute_jerusalem_epoch_window(now_secs);
 
     let mut buckets_map = Map::new();
-    for ticker in discovered_tickers {
-        let pending_kas = pending_kas_by_asset.get(&ticker).copied().unwrap_or(0.0);
-        let pending_usd = ((pending_kas * safe_kas_spot) * 100.0).round() / 100.0;
-        let (min_profitable_kas, min_profitable_usd) =
-            crate::fiat_rails::resolve_live_profitable_bucket_threshold(
-                pool,
-                &ticker,
-                safe_kas_spot,
-            )
-            .await;
-        let weight_pct = if min_profitable_kas > 0.0 {
-            ((pending_kas / min_profitable_kas) * 100.0).clamp(0.0, 100.0)
-        } else {
-            0.0
-        };
-        let participant_count = participants_by_asset
-            .get(&ticker)
-            .map(|s| s.len())
-            .unwrap_or(0);
-        let lp_avail_kas = lp_kas_by_asset
-            .get(&ticker)
-            .copied()
-            .filter(|&v| v > 0.0)
-            .unwrap_or(5_000.0);
-        let lp_coverage_pct = if pending_kas > 0.0 {
-            ((lp_avail_kas / pending_kas) * 100.0).clamp(0.0, 100.0)
-        } else {
-            100.0
-        };
-        let status = if weight_pct >= 100.0 {
+    for (asset, pending_sompi) in sompi_by_asset {
+        let floor_sompi = crate::fiat_rails::resolve_live_profitable_vault_floor_sompi(
+            pool, &asset, None,
+        )
+        .await
+        .ok()
+        .map(|v| v as u128);
+        let ready_sompi = ready_sompi_by_asset.get(&asset).copied().unwrap_or(0);
+        let pending_usd_micros = pending_sompi.saturating_mul(kas_usd_e8) / 10_000_000_000;
+        let participants = wallets_by_asset.get(&asset).map(|s| s.len()).unwrap_or(0);
+        let status = if floor_sompi.map(|f| pending_sompi >= f).unwrap_or(false) {
             "READY_FOR_BELL"
-        } else if pending_kas > 0.0 {
+        } else if pending_sompi > 0 {
             "FILLING"
         } else {
             "IDLE"
         };
-        let rail_cost_usd = if ticker == "USD" { 0.25 } else { 0.0 };
 
         buckets_map.insert(
-            ticker.clone(),
+            asset.clone(),
             json!({
-                "asset": ticker,
-                "pendingKas": (pending_kas * 10000.0).round() / 10000.0,
-                "pendingUsd": pending_usd,
-                "minProfitableKas": min_profitable_kas,
-                "minProfitableUsd": min_profitable_usd,
-                "weightPct": (weight_pct * 100.0).round() / 100.0,
-                "participantCount": participant_count,
-                "lpAvailableKasCapacity": lp_avail_kas,
-                "lpCoveragePct": (lp_coverage_pct * 10.0).round() / 10.0,
-                "effectiveSpreadFloorPct": 0.10,
-                "railCostUsd": rail_cost_usd,
+                "asset": asset,
+                "pendingSompi": pending_sompi.to_string(),
+                "readySompi": ready_sompi.to_string(),
+                "pendingUsdMicros": pending_usd_micros.to_string(),
+                "minProfitableSompi": floor_sompi.map(|f| f.to_string()),
+                "participantCount": participants,
                 "status": status,
-                "lastClearedAt": current_epoch_bell_ts,
-                "lastClearType": "ANCHOR_OR_EPOCH"
+                "lastClearedAt": current_epoch_bell_ts
             }),
         );
     }
 
     let epoch_state = json!({
         "anchorUtcHour": 22,
-        "anchorLabel": "22:00 UTC Global Settlement",
+        "anchorLabel": "22:00 UTC Three-Tier Sovereign Settlement",
+        "kasSpotUsdE8": kas_usd_e8.to_string(),
         "currentEpochBellTs": current_epoch_bell_ts,
         "nextEpochBellTs": next_epoch_bell_ts,
         "secondsRemaining": seconds_remaining,
-        "volatilitySweepThresholdPct": 450,
         "updatedAt": now_secs,
         "buckets": Value::Object(buckets_map)
     });
@@ -267,275 +438,672 @@ pub async fn publish_live_epoch_bucket_telemetry(
     Ok(epoch_state)
 }
 
+#[allow(dead_code)]
 pub async fn sweep_layered_buckets_on_anchor_order(
     pool: &PgPool,
     target_asset: &str,
-    anchor_kas_volume: f64,
-    kas_spot_usd: f64,
-    target_spot_usd: f64,
+    _anchor_kas_volume: f64,
+    _kas_spot_usd: f64,
+    _target_spot_usd: f64,
 ) -> anyhow::Result<Value> {
     let clean_target = target_asset.trim().to_uppercase();
-    if clean_target.is_empty()
-        || clean_target == "KAS"
-        || clean_target == "USD"
-        || kas_spot_usd <= 0.0
-        || target_spot_usd <= 0.0
-    {
-        return Ok(json!({
-            "layeredBucketsCleared": 0,
-            "layeredKasSwept": 0.0,
-            "layeredTokensDispatched": 0.0
-        }));
+    let epoch_id = Utc::now().format("ANCHOR-%Y%m%d-%H%M").to_string();
+    let kas_e8 = crate::state_api::resolve_strict_spot_price_e8(pool, "KAS")
+        .await
+        .map_err(|e| anyhow::anyhow!("ORACLE_HALT: {}", e))?;
+    let cow_res = execute_tier1_cow_dark_pool_cross(pool, &epoch_id, kas_e8)
+        .await
+        .unwrap_or_else(|e| json!({ "error": e, "matchedCount": 0 }));
+    Ok(json!({
+        "targetAsset": clean_target,
+        "tier1CowCross": cow_res
+    }))
+}
+
+/// Tier 1 (`21:58:00 UTC`): Matches `THRESHOLD_MET` Miner `KAS` sell vaults against opposing Buy-KAS
+/// Standalone Wallet Silos / Maker Plants at uniform mid-market `ORACLE_USD_E8`, skimming `50–100 bps`.
+pub async fn execute_tier1_cow_dark_pool_cross(
+    pool: &PgPool,
+    epoch_id: &str,
+    kas_usd_e8: u128,
+) -> Result<Value, String> {
+    if kas_usd_e8 == 0 {
+        return Err("ORACLE_HALT: kas_usd_e8 must be > 0.".to_string());
     }
+    let sys_cfg = crate::chronos::load_system_treasury_config(pool).await;
+    if sys_cfg.outflow_breaker_tripped || sys_cfg.solvency_breaker_tripped {
+        return Err("TIER1_HALTED: Circuit breaker is tripped.".to_string());
+    }
+    let house_revenue_address = crate::chronos::resolve_house_revenue_kas_address(&sys_cfg)
+        .unwrap_or_else(|| sys_cfg.cold_kas_address.clone());
 
-    let (min_profitable_kas, _) =
-        crate::fiat_rails::resolve_live_profitable_bucket_threshold(pool, &clean_target, kas_spot_usd)
-            .await;
-
-    let rows = sqlx::query(
+    let sell_rows = sqlx::query(
         r#"
-        SELECT wallet_address, layout_state
-        FROM user_command_centers
+        SELECT vault_id, wallet_address, clean_wallet, owner_pubkey_hex,
+               covenant_address, target_asset, target_network, destination_address,
+               confirmed_utxo_sompi::NUMERIC(39,0)::TEXT AS confirmed_utxo_sompi, fee_bps
+        FROM vault_locks
+        WHERE status = 'THRESHOLD_MET'
+          AND vault_kind IN ('MINER_SILO', 'STANDALONE_WALLET_SILO')
+          AND UPPER(target_asset) <> 'KAS'
+        ORDER BY updated_at ASC
+        LIMIT 50
         "#,
     )
     .fetch_all(pool)
-    .await?;
+    .await
+    .map_err(|e| format!("Tier 1 sell vault query failed: {}", e))?;
 
-    let mut total_pending_bucket_kas = 0.0_f64;
-    for r in &rows {
-        let layout: Value = r
-            .try_get("layout_state")
-            .unwrap_or_else(|_| json!({ "sectors": [] }));
-        if let Some(sectors) = layout.get("sectors").and_then(|v| v.as_array()) {
-            for sec in sectors {
-                let pending = sec
-                    .get("pendingKaspa")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0)
-                    .max(0.0);
-                if pending <= 0.0 {
-                    continue;
-                }
-                let route_mode = sec
-                    .get("routeMode")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("hold")
-                    .to_lowercase();
-                if route_mode == "auto-lp" {
-                    continue;
-                }
-                let sec_ticker = sec
-                    .get("settlementConfig")
-                    .and_then(|c| c.get("targetAsset"))
-                    .and_then(|t| t.get("ticker"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim()
-                    .to_uppercase();
-                if sec_ticker == clean_target {
-                    total_pending_bucket_kas += pending;
-                }
-            }
+    let buy_rows = sqlx::query(
+        r#"
+        SELECT vault_id, wallet_address, clean_wallet, owner_pubkey_hex,
+               covenant_address, destination_address, refund_kaspa_address,
+               confirmed_utxo_sompi::NUMERIC(39,0)::TEXT AS confirmed_utxo_sompi
+        FROM vault_locks
+        WHERE status = 'THRESHOLD_MET'
+          AND vault_kind IN ('STANDALONE_WALLET_SILO', 'MAKER_PLANT')
+          AND UPPER(target_asset) = 'KAS'
+        ORDER BY updated_at ASC
+        LIMIT 50
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("Tier 1 buy vault query failed: {}", e))?;
+
+    if sell_rows.is_empty() || buy_rows.is_empty() {
+        return Ok(json!({ "matchedPairs": 0, "crossedSompi": "0", "houseFeeSompi": "0" }));
+    }
+
+    let v_daa = crate::kaspad_client::get_virtual_daa_score_grpc()
+        .await
+        .unwrap_or(0);
+    let mut buy_idx = 0usize;
+    let mut matched_pairs = 0usize;
+    let mut total_crossed_sompi: u128 = 0;
+    let mut total_house_fee_sompi: u128 = 0;
+
+    for s_row in sell_rows {
+        if buy_idx >= buy_rows.len() {
+            break;
         }
-    }
-
-    // Combined Anchor + Layer volume must clear the live ChangeNOW profitable minimum
-    if total_pending_bucket_kas <= 1e-6
-        || (anchor_kas_volume + total_pending_bucket_kas) + 1e-6 < min_profitable_kas
-    {
-        return Ok(json!({
-            "layeredBucketsCleared": 0,
-            "layeredKasSwept": 0.0,
-            "layeredTokensDispatched": 0.0,
-            "minProfitableKas": min_profitable_kas
-        }));
-    }
-
-    let mut cleared_count = 0usize;
-    let mut swept_kas_total = 0.0_f64;
-    let mut dispatched_tokens_total = 0.0_f64;
-    let mut total_protocol_fees_usd = 0.0_f64;
-
-    for row in rows {
-        let raw_wallet: String = row.try_get("wallet_address").unwrap_or_default();
-        let clean_wallet = raw_wallet
-            .trim()
-            .to_lowercase()
-            .replace("kaspa:", "")
-            .trim()
-            .to_string();
-        if clean_wallet.is_empty() {
+        let s_vault_id: String = s_row.try_get("vault_id").unwrap_or_default();
+        let s_wallet: String = s_row.try_get("wallet_address").unwrap_or_default();
+        let s_clean: String = s_row.try_get("clean_wallet").unwrap_or_default();
+        let s_cov_addr: String = s_row.try_get("covenant_address").unwrap_or_default();
+        let s_owner_pub: String = s_row.try_get("owner_pubkey_hex").unwrap_or_default();
+        let mut target_asset: String = s_row.try_get("target_asset").unwrap_or_default();
+        let mut target_network: String = s_row.try_get("target_network").unwrap_or_default();
+        let mut dest_address: String = s_row.try_get("destination_address").unwrap_or_default();
+        let s_utxo_sompi: u128 = s_row
+            .try_get::<String, _>("confirmed_utxo_sompi")
+            .ok()
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or(0);
+        if s_utxo_sompi == 0 {
             continue;
         }
-        let prefixed_wallet = format!("kaspa:{}", clean_wallet);
-        let mut layout: Value = row
-            .try_get("layout_state")
-            .unwrap_or_else(|_| json!({ "sectors": [] }));
-        let mut user_swept_kas = 0.0_f64;
-        let mut mutated = false;
 
-        if let Some(sectors) = layout.get_mut("sectors").and_then(|v| v.as_array_mut()) {
-            for sec in sectors.iter_mut() {
-                let pending = sec
-                    .get("pendingKaspa")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0)
-                    .max(0.0);
-                if pending <= 0.0 {
-                    continue;
-                }
-                let route_mode = sec
-                    .get("routeMode")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("hold")
-                    .to_lowercase();
-                if route_mode == "auto-lp" {
-                    continue;
-                }
-                let sec_ticker = sec
-                    .get("settlementConfig")
-                    .and_then(|c| c.get("targetAsset"))
-                    .and_then(|t| t.get("ticker"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim()
-                    .to_uppercase();
-                if sec_ticker == clean_target {
-                    user_swept_kas += pending;
-                    sec["pendingKaspa"] = json!(0.0);
-                    mutated = true;
-                    cleared_count += 1;
+        // Apply 4-Valve sequential Thermostat prioritization when configured
+        let valve_allocs =
+            evaluate_wallet_thermostat_route(pool, &s_clean, s_utxo_sompi, kas_usd_e8).await;
+        if let Some(first_valve) = valve_allocs.first() {
+            if !first_valve.target_asset.is_empty() && first_valve.target_asset != "KAS" {
+                target_asset = first_valve.target_asset.clone();
+                target_network = first_valve.target_network.clone();
+                if !first_valve.destination_address.is_empty() {
+                    dest_address = first_valve.destination_address.clone();
                 }
             }
         }
+        let _ = s_cov_addr;
 
-        if mutated && user_swept_kas > 0.0 {
-            let (user_fee_floor_rate, _, _) =
-                crate::fiat_rails::resolve_wallet_swap_fee_floor_pct(pool, &prefixed_wallet).await;
-            let effective_fee_rate = user_fee_floor_rate.max(crate::fiat_rails::HARD_PROFIT_FLOOR_PCT);
-            let gross_usd = user_swept_kas * kas_spot_usd;
-            let fee_usd = (gross_usd * effective_fee_rate).max(0.01);
-            let net_usd = (gross_usd - fee_usd).max(0.0);
-            if net_usd <= 0.0 {
-                continue;
-            }
-            let out_tokens = ((net_usd / target_spot_usd) * 100_000_000.0).round() / 100_000_000.0;
-            if out_tokens <= 0.0 {
-                continue;
-            }
+        let fee_bps = s_row
+            .try_get::<i32, _>("fee_bps")
+            .unwrap_or(COW_HOUSE_SPREAD_MIN_BPS as i32)
+            .clamp(COW_HOUSE_SPREAD_MIN_BPS as i32, COW_HOUSE_SPREAD_MAX_BPS as i32)
+            as u128;
 
-            if crate::state_api::credit_user_token_balance(
-                pool,
-                &clean_wallet,
-                &prefixed_wallet,
-                &clean_target,
-                out_tokens,
-                false,
+        let b_row = &buy_rows[buy_idx];
+        let b_vault_id: String = b_row.try_get("vault_id").unwrap_or_default();
+        let b_clean: String = b_row.try_get("clean_wallet").unwrap_or_default();
+        let b_dest: String = b_row.try_get("destination_address").unwrap_or_default();
+        let b_pub_hex: String = b_row.try_get("owner_pubkey_hex").unwrap_or_default();
+        let b_utxo_sompi: u128 = b_row
+            .try_get::<String, _>("confirmed_utxo_sompi")
+            .ok()
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or(0);
+        if s_clean == b_clean || b_utxo_sompi < s_utxo_sompi / 2 {
+            buy_idx += 1;
+            continue;
+        }
+
+        let target_usd_e8 =
+            match crate::state_api::resolve_strict_spot_price_e8(pool, &target_asset).await {
+                Ok(p) if p > 0 => p,
+                _ => continue,
+            };
+
+        let house_fee_sompi = s_utxo_sompi.saturating_mul(fee_bps) / 10_000;
+        let net_sompi = s_utxo_sompi.saturating_sub(house_fee_sompi);
+        let settled_atomic = (net_sompi.saturating_mul(kas_usd_e8)
+            / target_usd_e8.max(1))
+            .saturating_mul(10u128.pow(asset_decimals_for_target(&target_asset) as u32))
+            / 100_000_000;
+
+        let hashlock_digest = blake3::hash(
+            format!("COW1:{}:{}:{}:{}", epoch_id, s_vault_id, b_vault_id, v_daa).as_bytes(),
+        );
+        let mut hashlock_arr = [0u8; 32];
+        hashlock_arr.copy_from_slice(hashlock_digest.as_bytes());
+
+        let mut claim_pk = [0u8; 32];
+        if let Ok(bytes) = hex::decode(&b_pub_hex) {
+            if bytes.len() >= 32 {
+                claim_pk.copy_from_slice(&bytes[..32]);
+            }
+        }
+        let mut refund_pk = [0u8; 32];
+        if let Ok(bytes) = hex::decode(&s_owner_pub) {
+            if bytes.len() >= 32 {
+                refund_pk.copy_from_slice(&bytes[..32]);
+            }
+        }
+        let htlc = build_kaspa_opsha256_htlc_covenant(
+            &hashlock_arr,
+            &claim_pk,
+            &refund_pk,
+            v_daa.saturating_add(DEFAULT_HTLC_DAA_REFUND_DELTA),
+        );
+
+        let l1_dest = if target_asset == "KUSDT" {
+            b_dest.as_str()
+        } else {
+            htlc.p2sh_address.as_str()
+        };
+        let Ok(payin_u64) = u64::try_from(net_sompi.min(u64::MAX as u128)) else {
+            continue;
+        };
+        let Ok(fee_u64) = u64::try_from(house_fee_sompi.min(u64::MAX as u128)) else {
+            continue;
+        };
+        if let Ok((txid, net_fee)) = crate::state_api::execute_path_b_vault_split_tx(
+            pool,
+            &s_vault_id,
+            l1_dest,
+            payin_u64,
+            &house_revenue_address,
+            fee_u64,
+        )
+        .await
+        {
+            let _ = sqlx::query(
+                "UPDATE vault_locks SET status = 'SETTLED', updated_at = CURRENT_TIMESTAMP WHERE vault_id IN ($1, $2)",
             )
-            .await
-            .is_ok()
-            {
-                let _ = sqlx::query(
-                    r#"
-                    UPDATE user_command_centers
-                    SET layout_state = $2,
-                        last_updated = CURRENT_TIMESTAMP
-                    WHERE wallet_address = $1
-                    "#,
+            .bind(&s_vault_id)
+            .bind(&b_vault_id)
+            .execute(pool)
+            .await;
+
+            let receipt_id = format!("COW1-{}", &htlc.sha256_hashlock_hex[..24]);
+            let _ = sqlx::query(
+                r#"
+                INSERT INTO settlement_receipts (
+                    receipt_id, epoch_id, wallet_address, clean_wallet, vault_id,
+                    settlement_tier, source_sompi, house_fee_sompi, network_fee_sompi,
+                    target_asset, target_network, settled_atomic, oracle_kas_usd_e8,
+                    kaspa_l1_txid, htlc_hashlock_sha256, confirmed_daa_score, status
+                ) VALUES (
+                    $1, $2, $3, $4, $5,
+                    'TIER1_COW_DARK_POOL', $6::NUMERIC(39,0), $7::NUMERIC(39,0), $8::NUMERIC(39,0),
+                    $9, $10, $11::NUMERIC(39,0), $12::NUMERIC(39,0),
+                    $13, $14, $15, 'CONFIRMED'
                 )
-                .bind(&raw_wallet)
-                .bind(&layout)
-                .execute(pool)
-                .await;
+                ON CONFLICT (receipt_id) DO NOTHING
+                "#,
+            )
+            .bind(&receipt_id)
+            .bind(epoch_id)
+            .bind(&s_wallet)
+            .bind(&s_clean)
+            .bind(&s_vault_id)
+            .bind(s_utxo_sompi.to_string())
+            .bind(house_fee_sompi.to_string())
+            .bind(net_fee.to_string())
+            .bind(&target_asset)
+            .bind(&target_network)
+            .bind(settled_atomic.to_string())
+            .bind(kas_usd_e8.to_string())
+            .bind(&txid)
+            .bind(&htlc.sha256_hashlock_hex)
+            .bind(v_daa as i64)
+            .execute(pool)
+            .await;
 
-                let tx_ref = format!(
-                    "ANCHOR-LAYER-{}-{}",
-                    clean_target,
-                    &uuid::Uuid::new_v4().simple().to_string().to_uppercase()[..8]
-                );
-                let _ = crate::sor::record_hifo_acquisition_lot(
-                    pool,
-                    &clean_wallet,
-                    &clean_target,
-                    out_tokens,
-                    target_spot_usd,
-                    "ANCHOR_LAYER_BUCKET_SWEEP",
-                    Some(&tx_ref),
-                )
-                .await;
-
-                let _ = sqlx::query(
-                    r#"
-                    INSERT INTO tax_ledger_events (
-                        wallet_address, asset_ticker, event_type, gross_proceeds_usd,
-                        amount_tokens, spot_price_at_execution, tx_hash, cost_basis_usd,
-                        realized_gain_loss_usd, holding_period
-                    ) VALUES ($1, $2, 'ANCHOR_LAYER_BUCKET_SWEEP', $3, $4, $5, $6, $3, 0.0, 'SHORT_TERM')
-                    "#,
-                )
-                .bind(&clean_wallet)
-                .bind(&clean_target)
-                .bind(net_usd)
-                .bind(out_tokens)
-                .bind(target_spot_usd)
-                .bind(&tx_ref)
-                .execute(pool)
-                .await;
-
-                swept_kas_total += user_swept_kas;
-                dispatched_tokens_total += out_tokens;
-                total_protocol_fees_usd += fee_usd;
-
-                if let Ok(redis_url) = env::var("REDIS_URL") {
-                    if let Ok(client) = redis::Client::open(redis_url) {
-                        if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
-                            if let Some(sectors_val) = layout.get("sectors") {
-                                let yield_evt = json!({
-                                    "wallet": clean_wallet,
-                                    "yield_update": true,
-                                    "sectors": sectors_val
-                                });
-                                let _: redis::RedisResult<()> = redis::cmd("PUBLISH")
-                                    .arg("telemetry:updates")
-                                    .arg(yield_evt.to_string())
-                                    .query_async(&mut conn)
-                                    .await;
-                            }
-                        }
-                    }
-                }
-            }
+            let _ = dest_address;
+            matched_pairs += 1;
+            total_crossed_sompi = total_crossed_sompi.saturating_add(s_utxo_sompi);
+            total_house_fee_sompi = total_house_fee_sompi.saturating_add(house_fee_sompi);
+            buy_idx += 1;
         }
     }
-
-    if total_protocol_fees_usd > 0.0 {
-        if let Ok(redis_url) = env::var("REDIS_URL") {
-            if let Ok(client) = redis::Client::open(redis_url) {
-                if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
-                    let _: redis::RedisResult<()> = redis::cmd("INCRBYFLOAT")
-                        .arg("perennia:treasury:netting_profit_usd")
-                        .arg(total_protocol_fees_usd)
-                        .query_async(&mut conn)
-                        .await;
-                    let _: redis::RedisResult<()> = redis::cmd("INCRBYFLOAT")
-                        .arg("perennia:fees:batch_accumulated:USDC")
-                        .arg(total_protocol_fees_usd)
-                        .query_async(&mut conn)
-                        .await;
-                }
-            }
-        }
-    }
-
-    let _ = publish_live_epoch_bucket_telemetry(pool, kas_spot_usd).await;
 
     Ok(json!({
-        "targetAsset": clean_target,
-        "layeredBucketsCleared": cleared_count,
-        "layeredKasSwept": (swept_kas_total * 10000.0).round() / 10000.0,
-        "layeredTokensDispatched": (dispatched_tokens_total * 100_000_000.0).round() / 100_000_000.0,
-        "protocolFeesCapturedUsd": (total_protocol_fees_usd * 10000.0).round() / 10000.0,
-        "minProfitableKas": min_profitable_kas
+        "matchedPairs": matched_pairs,
+        "crossedSompi": total_crossed_sompi.to_string(),
+        "houseFeeSompi": total_house_fee_sompi.to_string()
+    }))
+}
+
+/// Tier 2 (`21:58:00 UTC`): Publishes anonymized batch manifests + live ChangeNOW net reserve floor
+/// on `/api/v1/agent/chronos/rfq` (`perennia:chronos:rfq:batches`).
+pub async fn publish_tier2_chronos_rfq_batches(
+    pool: &PgPool,
+    redis_conn: &mut redis::aio::MultiplexedConnection,
+    epoch_id: &str,
+    kas_usd_e8: u128,
+) -> Result<Value, String> {
+    let rows = sqlx::query(
+        r#"
+        SELECT vault_id, clean_wallet, target_asset, target_network,
+               destination_address,
+               confirmed_utxo_sompi::NUMERIC(39,0)::TEXT AS confirmed_utxo_sompi
+        FROM vault_locks
+        WHERE status = 'THRESHOLD_MET'
+          AND UPPER(target_asset) <> 'KAS'
+        ORDER BY updated_at ASC
+        LIMIT 200
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("Failed querying THRESHOLD_MET vaults for Tier 2 RFQ: {}", e))?;
+
+    if rows.is_empty() {
+        return Ok(json!({ "batchesPublished": 0, "vaultsLocked": 0 }));
+    }
+
+    #[derive(Clone)]
+    struct VaultSlice {
+        vault_id: String,
+        clean_wallet: String,
+        sompi: u128,
+    }
+
+    let mut grouped: BTreeMap<(String, String), Vec<VaultSlice>> = BTreeMap::new();
+    for r in rows {
+        let vault_id: String = r.try_get("vault_id").unwrap_or_default();
+        let clean_wallet: String = r.try_get("clean_wallet").unwrap_or_default();
+        let asset = r
+            .try_get::<String, _>("target_asset")
+            .unwrap_or_else(|_| "USDC".to_string())
+            .trim()
+            .to_uppercase();
+        let network = r
+            .try_get::<String, _>("target_network")
+            .unwrap_or_else(|_| "SOL".to_string())
+            .trim()
+            .to_uppercase();
+        let sompi = r
+            .try_get::<String, _>("confirmed_utxo_sompi")
+            .ok()
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or(0);
+        if vault_id.is_empty() || sompi == 0 {
+            continue;
+        }
+        grouped
+            .entry((asset, network))
+            .or_default()
+            .push(VaultSlice {
+                vault_id,
+                clean_wallet,
+                sompi,
+            });
+    }
+
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let closes_at_unix = now_secs.saturating_add(90);
+    let mut batches_published = 0usize;
+    let mut total_vaults_locked = 0usize;
+
+    let _: redis::RedisResult<i64> = redis::cmd("DEL")
+        .arg(REDIS_KEY_CHRONOS_RFQ_BATCHES)
+        .query_async(redis_conn)
+        .await;
+
+    for ((asset, network), slices) in grouped {
+        let gross_kas_sompi: u128 = slices.iter().map(|s| s.sompi).sum();
+        let fee_bps = TIER2_DARK_POOL_MIN_FEE_BPS;
+        let house_fee_sompi = gross_kas_sompi.saturating_mul(fee_bps as u128) / 10_000;
+        let net_solver_kas_sompi = gross_kas_sompi.saturating_sub(house_fee_sompi);
+
+        // Compute live ChangeNOW net post-fee Reserve Floor in target atomic units (zero fallback!)
+        let Ok(target_usd_e8) = crate::state_api::resolve_strict_spot_price_e8(pool, &asset).await
+        else {
+            continue;
+        };
+        if target_usd_e8 == 0 {
+            continue;
+        }
+        let cn_est_f64 = crate::fiat_rails::fetch_changenow_estimated_amount(
+            "KAS",
+            &format!("{}-{}", asset, network),
+            (net_solver_kas_sompi as f64) / 100_000_000.0,
+        )
+        .await
+        .ok()
+        .filter(|v| v.is_finite() && *v > 0.0);
+
+        let dec_scale = 10u128.pow(asset_decimals_for_target(&asset) as u32);
+        let oracle_net_atomic =
+            (net_solver_kas_sompi.saturating_mul(kas_usd_e8) / target_usd_e8).saturating_mul(dec_scale)
+                / 100_000_000;
+        let cn_floor_atomic = cn_est_f64
+            .map(|v| (v * (dec_scale as f64)).floor() as u128)
+            .unwrap_or(oracle_net_atomic)
+            .max(1);
+        let min_winning_bid_atomic = (cn_floor_atomic
+            .saturating_mul(10_000 + TIER2_MIN_IMPROVEMENT_BPS as u128)
+            + 9_999)
+            / 10_000;
+
+        let batch_id = format!(
+            "CHRONOS-{}-{}-{}",
+            epoch_id,
+            asset,
+            network
+        );
+        let mut slice_commitments = Vec::with_capacity(slices.len());
+        let mut vault_ids = Vec::with_capacity(slices.len());
+
+        for s in &slices {
+            vault_ids.push(s.vault_id.clone());
+            let commitment = blake3::hash(
+                format!("SLICE:{}:{}:{}", epoch_id, s.vault_id, s.clean_wallet).as_bytes(),
+            )
+            .to_hex()
+            .to_string();
+            slice_commitments.push(json!({
+                "sliceCommitment": commitment,
+                "sompi": s.sompi.to_string()
+            }));
+            let _ = sqlx::query(
+                "UPDATE vault_locks SET status = 'LOCKED_IN_AUCTION', updated_at = CURRENT_TIMESTAMP WHERE vault_id = $1 AND status = 'THRESHOLD_MET'",
+            )
+            .bind(&s.vault_id)
+            .execute(pool)
+            .await;
+            total_vaults_locked += 1;
+        }
+
+        let manifest = json!({
+            "batchId": batch_id,
+            "epochId": epoch_id,
+            "targetAsset": asset,
+            "targetNetwork": network,
+            "vaultCount": slices.len(),
+            "vaultIds": vault_ids,
+            "grossKasSompi": gross_kas_sompi.to_string(),
+            "houseDarkPoolFeeBps": fee_bps,
+            "houseFeeSompi": house_fee_sompi.to_string(),
+            "netSolverKasSompi": net_solver_kas_sompi.to_string(),
+            "changenowNetFloorAtomic": cn_floor_atomic.to_string(),
+            "minSolverNetPayoutAtomic": min_winning_bid_atomic.to_string(),
+            "daaTimelockDelta": DEFAULT_HTLC_DAA_REFUND_DELTA,
+            "sliceCommitments": slice_commitments,
+            "closesAtUnix": closes_at_unix
+        });
+
+        let _: redis::RedisResult<i64> = redis::cmd("HSET")
+            .arg(REDIS_KEY_CHRONOS_RFQ_BATCHES)
+            .arg(&batch_id)
+            .arg(manifest.to_string())
+            .query_async(redis_conn)
+            .await;
+        let _: redis::RedisResult<i64> = redis::cmd("PUBLISH")
+            .arg(REDIS_CHANNEL_CHRONOS_RFQ_EVENTS)
+            .arg(manifest.to_string())
+            .query_async(redis_conn)
+            .await;
+        batches_published += 1;
+    }
+
+    Ok(json!({
+        "batchesPublished": batches_published,
+        "vaultsLocked": total_vaults_locked
+    }))
+}
+
+/// Tier 2 Close (`21:59:30 UTC`): Consumes winning solver bids with verified `PerenniaBatchHTLC`
+/// locks on Base/Solana/Arbitrum, locks pooled `KAS` into Kaspa `OpSHA256` P2SH HTLCs + skims `50–75 bps`
+/// to House Revenue, and releases unbid vaults back to `THRESHOLD_MET` for Tier 3.
+pub async fn finalize_tier2_chronos_auction_and_lock_htlcs(
+    pool: &PgPool,
+    redis_conn: &mut redis::aio::MultiplexedConnection,
+    epoch_id: &str,
+) -> Result<Value, String> {
+    let sys_cfg = crate::chronos::load_system_treasury_config(pool).await;
+    if sys_cfg.outflow_breaker_tripped || sys_cfg.solvency_breaker_tripped {
+        return Err("TIER2_FINALIZE_HALTED: Circuit breaker tripped.".to_string());
+    }
+    let house_revenue_address = crate::chronos::resolve_house_revenue_kas_address(&sys_cfg)
+        .unwrap_or_else(|| sys_cfg.cold_kas_address.clone());
+
+    let batch_map: HashMap<String, String> = redis::cmd("HGETALL")
+        .arg(REDIS_KEY_CHRONOS_RFQ_BATCHES)
+        .query_async(redis_conn)
+        .await
+        .unwrap_or_default();
+
+    let v_daa = crate::kaspad_client::get_virtual_daa_score_grpc()
+        .await
+        .unwrap_or(0);
+    let kas_usd_e8 = crate::state_api::resolve_strict_spot_price_e8(pool, "KAS")
+        .await
+        .unwrap_or(0);
+
+    let mut settled_batches = 0usize;
+    let mut released_vaults = 0usize;
+
+    for (batch_id, manifest_raw) in batch_map {
+        let Ok(manifest) = serde_json::from_str::<Value>(&manifest_raw) else {
+            continue;
+        };
+        let vault_ids: Vec<String> = manifest
+            .get("vaultIds")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let target_asset = manifest
+            .get("targetAsset")
+            .and_then(|v| v.as_str())
+            .unwrap_or("USDC")
+            .to_string();
+        let target_network = manifest
+            .get("targetNetwork")
+            .and_then(|v| v.as_str())
+            .unwrap_or("BASE")
+            .to_string();
+
+        let bid_key = format!("{}{}", REDIS_KEY_CHRONOS_WINNING_BID_PREFIX, batch_id);
+        let bid_raw_opt: Option<String> = redis::cmd("GET")
+            .arg(&bid_key)
+            .query_async(redis_conn)
+            .await
+            .ok()
+            .flatten();
+
+        let Some(bid_raw) = bid_raw_opt else {
+            for vid in &vault_ids {
+                let _ = sqlx::query(
+                    "UPDATE vault_locks SET status = 'THRESHOLD_MET', updated_at = CURRENT_TIMESTAMP WHERE vault_id = $1 AND status = 'LOCKED_IN_AUCTION'",
+                )
+                .bind(vid)
+                .execute(pool)
+                .await;
+                released_vaults += 1;
+            }
+            continue;
+        };
+
+        let Ok(bid) = serde_json::from_str::<Value>(&bid_raw) else {
+            continue;
+        };
+        let hashlock_hex = bid
+            .get("sha256HashlockHex")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let solver_pk_hex = bid
+            .get("solverKaspaPubkeyHex")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let disperse_txid = bid
+            .get("disperseLockTxid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let fee_bps = bid
+            .get("houseFeeBps")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(50) as u128;
+        let total_bid_out_atomic = bid
+            .get("solverNetMinerPayoutAtomic")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or(0);
+
+        let Ok(hl_bytes) = hex::decode(hashlock_hex) else {
+            continue;
+        };
+        let Ok(spk_bytes) = hex::decode(solver_pk_hex) else {
+            continue;
+        };
+        if hl_bytes.len() != 32 || spk_bytes.len() != 32 {
+            continue;
+        }
+        let mut hl_arr = [0u8; 32];
+        hl_arr.copy_from_slice(&hl_bytes);
+        let mut claim_arr = [0u8; 32];
+        claim_arr.copy_from_slice(&spk_bytes);
+
+        let total_batch_sompi: u128 = manifest
+            .get("grossKasSompi")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or(1)
+            .max(1);
+
+        let mut batch_ok = false;
+        for vid in &vault_ids {
+            let Ok(Some(v_row)) = sqlx::query(
+                "SELECT wallet_address, clean_wallet, owner_pubkey_hex, confirmed_utxo_sompi::NUMERIC(39,0)::TEXT AS confirmed_utxo_sompi FROM vault_locks WHERE vault_id = $1 LIMIT 1",
+            )
+            .bind(vid)
+            .fetch_optional(pool)
+            .await
+            else {
+                continue;
+            };
+            let v_wallet: String = v_row.try_get("wallet_address").unwrap_or_default();
+            let v_clean: String = v_row.try_get("clean_wallet").unwrap_or_default();
+            let v_owner_pk: String = v_row.try_get("owner_pubkey_hex").unwrap_or_default();
+            let v_sompi: u128 = v_row
+                .try_get::<String, _>("confirmed_utxo_sompi")
+                .ok()
+                .and_then(|s| s.parse::<u128>().ok())
+                .unwrap_or(0);
+            if v_sompi == 0 {
+                continue;
+            }
+            let mut ref_arr = [0u8; 32];
+            if let Ok(b) = hex::decode(&v_owner_pk) {
+                if b.len() >= 32 {
+                    ref_arr.copy_from_slice(&b[..32]);
+                }
+            }
+            let htlc = build_kaspa_opsha256_htlc_covenant(
+                &hl_arr,
+                &claim_arr,
+                &ref_arr,
+                v_daa.saturating_add(DEFAULT_HTLC_DAA_REFUND_DELTA),
+            );
+            let house_fee_sompi = v_sompi.saturating_mul(fee_bps) / 10_000;
+            let net_htlc_sompi = v_sompi.saturating_sub(house_fee_sompi);
+            if let (Ok(pay_u64), Ok(fee_u64)) = (u64::try_from(net_htlc_sompi), u64::try_from(house_fee_sompi)) {
+                if let Ok((kaspa_txid, net_fee)) = crate::state_api::execute_path_b_vault_split_tx(
+                    pool,
+                    vid,
+                    &htlc.p2sh_address,
+                    pay_u64,
+                    &house_revenue_address,
+                    fee_u64,
+                )
+                .await
+                {
+                    let _ = sqlx::query(
+                        "UPDATE vault_locks SET status = 'SETTLED', updated_at = CURRENT_TIMESTAMP WHERE vault_id = $1",
+                    )
+                    .bind(vid)
+                    .execute(pool)
+                    .await;
+                    let proportional_out =
+                        total_bid_out_atomic.saturating_mul(v_sompi) / total_batch_sompi;
+                    let receipt_id = format!("BOT2-{}-{}", &vid[..10.min(vid.len())], &hashlock_hex[..10]);
+                    let _ = sqlx::query(
+                        r#"
+                        INSERT INTO settlement_receipts (
+                            receipt_id, epoch_id, wallet_address, clean_wallet, vault_id,
+                            settlement_tier, source_sompi, house_fee_sompi, network_fee_sompi,
+                            target_asset, target_network, settled_atomic, oracle_kas_usd_e8,
+                            kaspa_l1_txid, destination_txid, htlc_hashlock_sha256,
+                            confirmed_daa_score, status
+                        ) VALUES (
+                            $1, $2, $3, $4, $5,
+                            'TIER2_BOT_BATCH_HTLC', $6::NUMERIC(39,0), $7::NUMERIC(39,0), $8::NUMERIC(39,0),
+                            $9, $10, $11::NUMERIC(39,0), $12::NUMERIC(39,0),
+                            $13, $14, $15, $16, 'CONFIRMED'
+                        )
+                        ON CONFLICT (receipt_id) DO NOTHING
+                        "#,
+                    )
+                    .bind(&receipt_id)
+                    .bind(epoch_id)
+                    .bind(&v_wallet)
+                    .bind(&v_clean)
+                    .bind(vid)
+                    .bind(v_sompi.to_string())
+                    .bind(house_fee_sompi.to_string())
+                    .bind(net_fee.to_string())
+                    .bind(&target_asset)
+                    .bind(&target_network)
+                    .bind(proportional_out.to_string())
+                    .bind(kas_usd_e8.to_string())
+                    .bind(&kaspa_txid)
+                    .bind(disperse_txid)
+                    .bind(hashlock_hex)
+                    .bind(v_daa as i64)
+                    .execute(pool)
+                    .await;
+                    batch_ok = true;
+                }
+            }
+        }
+        if batch_ok {
+            settled_batches += 1;
+        }
+    }
+
+    Ok(json!({
+        "settledBatches": settled_batches,
+        "releasedVaultsToTier3": released_vaults
     }))
 }
 
@@ -543,471 +1111,65 @@ pub async fn run_delta_netting_cycle(
     redis_client: &redis::Client,
     pool: &PgPool,
 ) -> anyhow::Result<Value> {
-    let Ok(mut redis_conn) = redis_client.get_multiplexed_async_connection().await else {
-        return Ok(json!({ "ordersPopped": 0, "skipped": "redis_unavailable" }));
-    };
-    let Ok(kas_spot_usd) = crate::fiat_rails::resolve_live_spot_price(pool, "KAS").await else {
-        return Ok(json!({ "ordersPopped": 0, "skipped": "oracle_offline" }));
-    };
-    if !kas_spot_usd.is_finite() || kas_spot_usd <= 0.0_f64 {
-        return Ok(json!({ "ordersPopped": 0, "skipped": "invalid_kas_spot" }));
-    }
-
-    let _ = publish_live_epoch_bucket_telemetry(pool, kas_spot_usd).await;
-
-    let mut queued_orders: Vec<Value> = Vec::new();
-    for _ in 0..2000 {
-        let item_opt: Option<String> = redis::cmd("LPOP")
-            .arg("perennia:sor:netting_queue")
-            .query_async(&mut redis_conn).await.unwrap_or(None);
-        let Some(raw_str) = item_opt else { break; };
-        if let Ok(parsed) = serde_json::from_str::<Value>(&raw_str) {
-            queued_orders.push(parsed);
-        }
-    }
-
-    let min_dark_pool_usd: f64 = env::var("MIN_DARK_POOL_POSITION_USD")
-        .ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|&v| v >= 1.0_f64).unwrap_or(5.0_f64);
-    let batch_id = format!("NET-10S-{}", &uuid::Uuid::new_v4().simple().to_string().to_uppercase()[..10]);
-    let mut batch_receipt = json!({
-        "batchId": batch_id,
-        "ordersPopped": queued_orders.len(),
-        "kasSpotUsd": kas_spot_usd,
+    let mut redis_conn = redis_client.get_multiplexed_async_connection().await?;
+    let epoch_state = publish_live_epoch_bucket_telemetry(pool, 0.0).await?;
+    let rfq_count: i64 = redis::cmd("HLEN")
+        .arg(REDIS_KEY_CHRONOS_RFQ_BATCHES)
+        .query_async(&mut redis_conn)
+        .await
+        .unwrap_or(0);
+    Ok(json!({
+        "mode": "SOVEREIGN_L1_VAULT_NETTING",
+        "activeRfqBatches": rfq_count,
+        "epoch": epoch_state,
         "completedAtMs": Utc::now().timestamp_millis()
-    });
-
-    if !queued_orders.is_empty() {
-        let mut inflow_usd: HashMap<String, f64> = HashMap::new();
-        let mut outflow_usd: HashMap<String, f64> = HashMap::new();
-        let mut total_gross_usd: f64 = 0.0_f64;
-        let mut total_net_principal_usd: f64 = 0.0_f64;
-        let mut total_buy_kas: f64 = 0.0_f64;
-        let mut total_sell_kas: f64 = 0.0_f64;
-
-        for ord in &queued_orders {
-            let dir = ord.get("direction").and_then(|v| v.as_str()).unwrap_or("SELL_KAS");
-            let pay_a = ord.get("pay_asset").and_then(|v| v.as_str())
-                .unwrap_or(if dir.eq_ignore_ascii_case("BUY_KAS") { "USDC" } else { "KAS" })
-                .trim().to_uppercase();
-            let rec_a = ord.get("receive_asset").and_then(|v| v.as_str())
-                .unwrap_or(if dir.eq_ignore_ascii_case("BUY_KAS") { "KAS" } else { "USDC" })
-                .trim().to_uppercase();
-            let amt_kas: f64 = ord.get("amount_kas").and_then(|v| v.as_f64()).unwrap_or(0.0_f64).max(0.0_f64);
-            let gross_u: f64 = ord.get("gross_usd").and_then(|v| v.as_f64()).unwrap_or(amt_kas * kas_spot_usd).max(0.0_f64);
-            let net_u: f64 = ord.get("net_usd").and_then(|v| v.as_f64()).unwrap_or(gross_u).max(0.0_f64);
-
-            total_gross_usd += gross_u;
-            total_net_principal_usd += net_u;
-            if dir.eq_ignore_ascii_case("BUY_KAS") {
-                total_buy_kas += amt_kas;
-            } else if dir.eq_ignore_ascii_case("SELL_KAS") {
-                total_sell_kas += amt_kas;
-            }
-            *inflow_usd.entry(pay_a).or_insert(0.0_f64) += net_u;
-            *outflow_usd.entry(rec_a).or_insert(0.0_f64) += net_u;
-        }
-
-        let mut all_assets: HashSet<String> = inflow_usd.keys().cloned().collect();
-        all_assets.extend(outflow_usd.keys().cloned());
-
-        let mut net_delta_usd: HashMap<String, f64> = HashMap::new();
-        let mut user_crossed_usd: f64 = 0.0_f64;
-        for asset in &all_assets {
-            let inf: f64 = inflow_usd.get(asset).copied().unwrap_or(0.0_f64);
-            let outf: f64 = outflow_usd.get(asset).copied().unwrap_or(0.0_f64);
-            user_crossed_usd += inf.min(outf);
-            net_delta_usd.insert(asset.clone(), inf - outf);
-        }
-
-        let mut miner_silos_crossed_count: usize = 0;
-        let mut miner_silo_crossed_kas: f64 = 0.0_f64;
-        let mut miner_silo_crossed_usd: f64 = 0.0_f64;
-        let mut silo_fees_captured_usd: f64 = 0.0_f64;
-
-        if net_delta_usd.get("KAS").copied().unwrap_or(0.0_f64) < -0.05_f64 {
-            let cc_rows = sqlx::query("SELECT wallet_address, layout_state FROM user_command_centers")
-                .fetch_all(pool).await.unwrap_or_default();
-            for row in cc_rows {
-                if net_delta_usd.get("KAS").copied().unwrap_or(0.0_f64) >= -0.05_f64 { break; }
-                let raw_wallet: String = row.try_get("wallet_address").unwrap_or_default();
-                let clean_wallet = raw_wallet.trim().to_lowercase().replace("kaspa:", "").trim().to_string();
-                if clean_wallet.is_empty() { continue; }
-                let prefixed_wallet = format!("kaspa:{}", clean_wallet);
-                let mut layout: Value = row.try_get("layout_state").unwrap_or_else(|_| json!({ "sectors": [] }));
-                let mut row_mutated = false;
-
-                if let Some(sectors) = layout.get_mut("sectors").and_then(|v| v.as_array_mut()) {
-                    for sec in sectors.iter_mut() {
-                        let pending: f64 = sec.get("pendingKaspa").and_then(|v| v.as_f64()).unwrap_or(0.0_f64).max(0.0_f64);
-                        if pending <= 1e-6_f64 { continue; }
-                        let route_mode = sec.get("routeMode").and_then(|v| v.as_str()).unwrap_or("hold").to_lowercase();
-                        if route_mode != "swap" && route_mode != "convert" { continue; }
-                        let sec_ticker = sec.get("settlementConfig").and_then(|c| c.get("targetAsset"))
-                            .and_then(|t| t.get("ticker")).and_then(|v| v.as_str()).unwrap_or("").trim().to_uppercase();
-                        if sec_ticker.is_empty() || sec_ticker == "KAS" { continue; }
-
-                        let short_kas_usd: f64 = (-net_delta_usd.get("KAS").copied().unwrap_or(0.0_f64)).max(0.0_f64);
-                        let surplus_tok_usd: f64 = net_delta_usd.get(&sec_ticker).copied().unwrap_or(0.0_f64).max(0.0_f64);
-                        let matchable_usd: f64 = short_kas_usd.min(surplus_tok_usd);
-                        if matchable_usd <= 0.05_f64 { continue; }
-
-                        let target_spot: f64 = if sec_ticker == "USD" {
-                            1.0_f64
-                        } else {
-                            match crate::fiat_rails::resolve_live_spot_price(pool, &sec_ticker).await {
-                                Ok(p) if p > 0.0_f64 => p,
-                                _ => continue,
-                            }
-                        };
-                        let take_kas: f64 = pending.min(matchable_usd / kas_spot_usd);
-                        if take_kas <= 1e-6_f64 { continue; }
-                        let (u_floor, _, _) = crate::fiat_rails::resolve_wallet_swap_fee_floor_pct(pool, &prefixed_wallet).await;
-                        let eff_rate: f64 = u_floor.max(crate::fiat_rails::HARD_PROFIT_FLOOR_PCT);
-                        let gross_silo_usd: f64 = take_kas * kas_spot_usd;
-                        let fee_silo_usd: f64 = (gross_silo_usd * eff_rate).max(0.01_f64);
-                        let net_silo_usd: f64 = (gross_silo_usd - fee_silo_usd).max(0.0_f64);
-                        if net_silo_usd <= 0.0_f64 { continue; }
-
-                        let credit_ticker = if sec_ticker == "USD" { "USDC" } else { sec_ticker.as_str() };
-                        let out_tokens: f64 = ((net_silo_usd / target_spot) * 1e8_f64).round() / 1e8_f64;
-                        if out_tokens <= 0.0_f64 { continue; }
-
-                        if crate::state_api::credit_user_token_balance(
-                            pool, &clean_wallet, &prefixed_wallet, credit_ticker, out_tokens, false,
-                        ).await.is_ok() {
-                            sec["pendingKaspa"] = json!(((pending - take_kas).max(0.0_f64) * 1e8_f64).round() / 1e8_f64);
-                            row_mutated = true;
-                            miner_silos_crossed_count += 1;
-                            miner_silo_crossed_kas += take_kas;
-                            miner_silo_crossed_usd += net_silo_usd;
-                            silo_fees_captured_usd += fee_silo_usd;
-                            *net_delta_usd.entry("KAS".to_string()).or_insert(0.0_f64) += net_silo_usd;
-                            *net_delta_usd.entry(sec_ticker.clone()).or_insert(0.0_f64) -= net_silo_usd;
-
-                            let tx_ref = format!("{}-SILO-{}", batch_id, miner_silos_crossed_count);
-                            let _ = crate::sor::record_hifo_acquisition_lot(
-                                pool, &clean_wallet, credit_ticker, out_tokens, target_spot, "DARK_POOL_SILO_CROSS", Some(&tx_ref),
-                            ).await;
-                            let _ = sqlx::query(
-                                "INSERT INTO tax_ledger_events (wallet_address, asset_ticker, event_type, gross_proceeds_usd, amount_tokens, spot_price_at_execution, tx_hash, cost_basis_usd, realized_gain_loss_usd, holding_period) VALUES ($1, $2, 'DARK_POOL_SILO_CROSS', $3, $4, $5, $6, $3, 0.0, 'SHORT_TERM')",
-                            ).bind(&clean_wallet).bind(credit_ticker).bind(net_silo_usd).bind(out_tokens).bind(target_spot).bind(&tx_ref).execute(pool).await;
-                        }
-                    }
-                }
-                if row_mutated {
-                    let _ = sqlx::query(
-                        "UPDATE user_command_centers SET layout_state = $2, last_updated = CURRENT_TIMESTAMP WHERE wallet_address = $1",
-                    ).bind(&raw_wallet).bind(&layout).execute(pool).await;
-                }
-            }
-        }
-
-        let final_residual_usd: f64 = 0.5_f64 * net_delta_usd.values().map(|v| v.abs()).sum::<f64>();
-        let combined_principal_usd: f64 = total_net_principal_usd + miner_silo_crossed_usd;
-        let internal_offset_usd: f64 = (combined_principal_usd - final_residual_usd).max(0.0_f64);
-        let offset_efficiency_pct: f64 = if combined_principal_usd > 0.0_f64 {
-            ((internal_offset_usd / combined_principal_usd) * 100.0_f64).clamp(0.0_f64, 100.0_f64)
-        } else { 100.0_f64 };
-        let spread_saved_usd: f64 = internal_offset_usd * 0.005_f64;
-        let incremental_profit_usd: f64 = spread_saved_usd + silo_fees_captured_usd;
-
-        if incremental_profit_usd > 0.0_f64 {
-            let _: redis::RedisResult<()> = redis::cmd("INCRBYFLOAT")
-                .arg("perennia:treasury:netting_profit_usd").arg(incremental_profit_usd)
-                .query_async(&mut redis_conn).await;
-        }
-        if silo_fees_captured_usd > 0.0_f64 {
-            let _: redis::RedisResult<()> = redis::cmd("INCRBYFLOAT")
-                .arg("perennia:fees:batch_accumulated:USDC").arg(silo_fees_captured_usd * 0.60_f64)
-                .query_async(&mut redis_conn).await;
-        }
-        let residual_kas_delta: f64 = net_delta_usd.get("KAS").copied().unwrap_or(0.0_f64) / kas_spot_usd;
-        if residual_kas_delta.abs() > 1e-8_f64 {
-            let _: redis::RedisResult<()> = redis::cmd("INCRBYFLOAT")
-                .arg("perennia:treasury:unhedged_delta_kas").arg(residual_kas_delta)
-                .query_async(&mut redis_conn).await;
-        }
-
-        let mut external_tickets_staged: usize = 0;
-        let mut sorted_assets: Vec<String> = net_delta_usd.keys().cloned().collect();
-        sorted_assets.sort();
-        for asset in sorted_assets {
-            if asset == "KAS" { continue; }
-            let delta_u: f64 = net_delta_usd.get(&asset).copied().unwrap_or(0.0_f64);
-            if delta_u.abs() >= min_dark_pool_usd {
-                let ticket = json!({
-                    "batch_id": batch_id,
-                    "type": "NET_RESIDUAL_AUTOBALANCE",
-                    "target_asset": asset,
-                    "rebalance_action": if delta_u > 0.0_f64 { "SELL_SURPLUS_FOR_KAS" } else { "BUY_DEFICIT_WITH_KAS" },
-                    "residual_usd": (delta_u.abs() * 10000.0_f64).round() / 10000.0_f64,
-                    "kas_equiv": ((delta_u.abs() / kas_spot_usd) * 10000.0_f64).round() / 10000.0_f64,
-                    "orders_consolidated": queued_orders.len(),
-                    "offset_efficiency_pct": (offset_efficiency_pct * 100.0_f64).round() / 100.0_f64,
-                    "created_at": Utc::now().to_rfc3339()
-                });
-                let _: redis::RedisResult<()> = redis::cmd("LPUSH")
-                    .arg("perennia:sor:third_party_passthrough_queue").arg(ticket.to_string())
-                    .query_async(&mut redis_conn).await;
-                let _: redis::RedisResult<()> = redis::cmd("LTRIM")
-                    .arg("perennia:sor:third_party_passthrough_queue").arg(0).arg(199)
-                    .query_async(&mut redis_conn).await;
-                external_tickets_staged += 1;
-            }
-        }
-
-        batch_receipt = json!({
-            "batchId": batch_id,
-            "ordersPopped": queued_orders.len(),
-            "totalGrossUsd": (total_gross_usd * 10000.0_f64).round() / 10000.0_f64,
-            "totalNetPrincipalUsd": (total_net_principal_usd * 10000.0_f64).round() / 10000.0_f64,
-            "totalBuyKas": (total_buy_kas * 10000.0_f64).round() / 10000.0_f64,
-            "totalSellKas": (total_sell_kas * 10000.0_f64).round() / 10000.0_f64,
-            "userToUserCrossedUsd": (user_crossed_usd * 10000.0_f64).round() / 10000.0_f64,
-            "minerSilosCrossedCount": miner_silos_crossed_count,
-            "minerSiloCrossedKas": (miner_silo_crossed_kas * 10000.0_f64).round() / 10000.0_f64,
-            "minerSiloCrossedUsd": (miner_silo_crossed_usd * 10000.0_f64).round() / 10000.0_f64,
-            "internalDarkPoolOffsetUsd": (internal_offset_usd * 10000.0_f64).round() / 10000.0_f64,
-            "finalResidualUsd": (final_residual_usd * 10000.0_f64).round() / 10000.0_f64,
-            "offsetEfficiencyPct": (offset_efficiency_pct * 100.0_f64).round() / 100.0_f64,
-            "spreadSavedUsd": (spread_saved_usd * 10000.0_f64).round() / 10000.0_f64,
-            "siloFeesCapturedUsd": (silo_fees_captured_usd * 10000.0_f64).round() / 10000.0_f64,
-            "externalTicketsStaged": external_tickets_staged,
-            "netDeltaUsdByAsset": net_delta_usd,
-            "kasSpotUsd": kas_spot_usd,
-            "completedAtMs": Utc::now().timestamp_millis()
-        });
-
-        let serialized_receipt = batch_receipt.to_string();
-        let _: redis::RedisResult<()> = redis::cmd("SET")
-            .arg("perennia:settlement:last_netting_batch").arg(&serialized_receipt)
-            .query_async(&mut redis_conn).await;
-        let _: redis::RedisResult<()> = redis::cmd("SET")
-            .arg("perennia:treasury:hedge_status").arg(&serialized_receipt)
-            .query_async(&mut redis_conn).await;
-        if miner_silos_crossed_count > 0 {
-            let _ = publish_live_epoch_bucket_telemetry(pool, kas_spot_usd).await;
-        }
-    }
-
-    let house_usdc_fees: f64 = redis::cmd("GET")
-        .arg("perennia:fees:batch_accumulated:USDC")
-        .query_async::<_, Option<String>>(&mut redis_conn).await
-        .ok().flatten().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0_f64);
-    if house_usdc_fees >= min_dark_pool_usd {
-        if let Ok(master_wallet) = crate::chronos::resolve_master_treasury_prefixed() {
-            let half_usd: f64 = house_usdc_fees * 0.5_f64;
-            let kas_leg: f64 = half_usd / kas_spot_usd;
-            let usdc_leg: f64 = half_usd;
-            let existing_house_lp = sqlx::query(
-                "SELECT lp_id::text AS lp_id, staked_asset_a, staked_asset_b FROM liquidity_providers WHERE wallet_address = $1 AND pool_pair = 'KAS/USDC' AND lock_duration_days = 365 ORDER BY created_at ASC LIMIT 1",
-            ).bind(&master_wallet).fetch_optional(pool).await?;
-            if let Some(row) = existing_house_lp {
-                let lp_id: String = row.try_get("lp_id").unwrap_or_default();
-                let next_a: f64 = row.try_get::<f64, _>("staked_asset_a").unwrap_or(0.0_f64) + kas_leg;
-                let next_b: f64 = row.try_get::<f64, _>("staked_asset_b").unwrap_or(0.0_f64) + usdc_leg;
-                let reserves_json = json!({ "KAS": next_a, "USDC": next_b });
-                let _ = sqlx::query(
-                    "UPDATE liquidity_providers SET staked_asset_a = $2, staked_asset_b = $3, reserves_json = $4, last_yield_distribution = CURRENT_TIMESTAMP WHERE lp_id::text = $1",
-                ).bind(&lp_id).bind(next_a).bind(next_b).bind(&reserves_json).execute(pool).await;
-            } else {
-                let weights_json = json!({ "KAS": 0.5, "USDC": 0.5 });
-                let reserves_json = json!({ "KAS": kas_leg, "USDC": usdc_leg });
-                let _ = sqlx::query(
-                    "INSERT INTO liquidity_providers (wallet_address, pool_pair, staked_asset_a, staked_asset_b, weights_json, reserves_json, lock_duration_days, unlock_date) VALUES ($1, 'KAS/USDC', $2, $3, $4, $5, 365, CURRENT_TIMESTAMP + INTERVAL '365 days')",
-                ).bind(&master_wallet).bind(kas_leg).bind(usdc_leg).bind(&weights_json).bind(&reserves_json).execute(pool).await;
-            }
-            let _: redis::RedisResult<()> = redis::cmd("SET")
-                .arg("perennia:fees:batch_accumulated:USDC").arg("0")
-                .query_async(&mut redis_conn).await;
-        }
-    }
-
-    let lp_rows = sqlx::query(
-        "SELECT lp_id::text AS lp_id, wallet_address, pool_pair, staked_asset_a, staked_asset_b, lock_duration_days FROM liquidity_providers",
-    ).fetch_all(pool).await?;
-    if lp_rows.is_empty() { return Ok(batch_receipt); }
-    let mut pair_weights: HashMap<String, f64> = HashMap::new();
-    let mut lp_entries: Vec<(String, String, String, f64)> = Vec::with_capacity(lp_rows.len());
-    for r in &lp_rows {
-        let lp_id: String = r.try_get("lp_id").unwrap_or_default();
-        let wallet: String = r.try_get("wallet_address").unwrap_or_default();
-        let pair: String = r.try_get("pool_pair").unwrap_or_else(|_| "KAS/USDC".to_string());
-        let amt_a: f64 = r.try_get("staked_asset_a").unwrap_or(0.0_f64).max(0.0_f64);
-        let days: i32 = r.try_get("lock_duration_days").unwrap_or(0);
-        let weighted_kas: f64 = amt_a * lock_multiplier_for_days(days);
-        if weighted_kas > 0.0_f64 && !wallet.trim().is_empty() {
-            *pair_weights.entry(pair.clone()).or_insert(0.0_f64) += weighted_kas;
-            lp_entries.push((lp_id, wallet, pair, weighted_kas));
-        }
-    }
-    for (pair, total_pair_weight) in pair_weights {
-        if total_pair_weight <= 0.0_f64 { continue; }
-        let pending_key = format!("perennia:lp:pending_yield_usd:{}", pair);
-        let pending_usd: f64 = redis::cmd("GET").arg(&pending_key)
-            .query_async::<_, Option<String>>(&mut redis_conn).await
-            .ok().flatten().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0_f64);
-        if pending_usd < 0.05_f64 { continue; }
-        let _: redis::RedisResult<()> = redis::cmd("SET").arg(&pending_key).arg("0").query_async(&mut redis_conn).await;
-        let total_yield_kas: f64 = pending_usd / kas_spot_usd;
-        for (lp_id, wallet, lp_pair, weight) in &lp_entries {
-            if *lp_pair != pair { continue; }
-            let share_kas: f64 = total_yield_kas * (*weight / total_pair_weight);
-            if share_kas <= 1e-6_f64 { continue; }
-            let clean_w = wallet.trim().to_lowercase().replace("kaspa:", "").trim().to_string();
-            let pref_w = format!("kaspa:{}", clean_w);
-            if crate::state_api::credit_user_token_balance(pool, &clean_w, &pref_w, "KAS", share_kas, true).await.is_ok() {
-                let _ = sqlx::query("UPDATE liquidity_providers SET last_yield_distribution = CURRENT_TIMESTAMP WHERE lp_id::text = $1")
-                    .bind(lp_id).execute(pool).await;
-            }
-        }
-    }
-    Ok(batch_receipt)
+    }))
 }
 
+/// Full 22:00 UTC Three-Tier Chronos Waterfall Entrypoint:
+/// Tier 1 (P2P CoW Cross) -> Tier 2 (Verified AI Bot Batch HTLCs) -> Tier 3 (Non-Custodial ChangeNOW v2 Split).
 pub async fn execute_epoch_delta_netting_and_lp_compounding(
     pool: &PgPool,
 ) -> anyhow::Result<Value> {
-    let kas_spot_usd: f64 = crate::fiat_rails::resolve_live_spot_price(pool, "KAS")
-        .await.map_err(|e| anyhow::anyhow!("Epoch netting aborted (fail-closed): {}", e))?;
-    let rows = sqlx::query("SELECT wallet_address, layout_state FROM user_command_centers").fetch_all(pool).await?;
+    let kas_usd_e8 = crate::state_api::resolve_strict_spot_price_e8(pool, "KAS")
+        .await
+        .map_err(|e| anyhow::anyhow!("Epoch waterfall aborted (fail-closed): {}", e))?;
+    let epoch_id = Utc::now().format("%Y-%m-%d").to_string();
 
-    let mut pooled_swap_kas: HashMap<String, f64> = HashMap::new();
-    for r in &rows {
-        let layout: Value = r.try_get("layout_state").unwrap_or_else(|_| json!({ "sectors": [] }));
-        if let Some(sectors) = layout.get("sectors").and_then(|v| v.as_array()) {
-            for sec in sectors {
-                let pending: f64 = sec.get("pendingKaspa").and_then(|v| v.as_f64()).unwrap_or(0.0_f64);
-                if pending <= 0.0_f64 { continue; }
-                let route_mode = sec.get("routeMode").and_then(|v| v.as_str()).unwrap_or("hold").to_lowercase();
-                if route_mode != "swap" && route_mode != "convert" { continue; }
-                let tick = sec.get("settlementConfig").and_then(|c| c.get("targetAsset"))
-                    .and_then(|t| t.get("ticker")).and_then(|v| v.as_str()).unwrap_or("KAS").trim().to_uppercase();
-                if !tick.is_empty() && tick != "KAS" {
-                    *pooled_swap_kas.entry(tick).or_insert(0.0_f64) += pending;
-                }
+    let tier1 = execute_tier1_cow_dark_pool_cross(pool, &epoch_id, kas_usd_e8)
+        .await
+        .unwrap_or_else(|e| json!({ "error": e }));
+
+    let tier2 = if let Ok(redis_url) = env::var("REDIS_URL") {
+        if let Ok(client) = redis::Client::open(redis_url.trim()) {
+            if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
+                finalize_tier2_chronos_auction_and_lock_htlcs(pool, &mut conn, &epoch_id)
+                    .await
+                    .unwrap_or_else(|e| json!({ "error": e }))
+            } else {
+                json!({ "skipped": "redis_unavailable" })
             }
-        }
-    }
-
-    let mut eligible_bucket_spot: HashMap<String, f64> = HashMap::new();
-    for (tick, total_bucket_kas) in &pooled_swap_kas {
-        let (min_prof_kas, _) = crate::fiat_rails::resolve_live_profitable_bucket_threshold(pool, tick, kas_spot_usd).await;
-        if *total_bucket_kas + 1e-6_f64 < min_prof_kas { continue; }
-        let spot_opt: Option<f64> = if tick == "USD" {
-            Some(1.0_f64)
         } else {
-            crate::fiat_rails::resolve_live_spot_price(pool, tick).await.ok().filter(|&p| p > 0.0_f64)
-        };
-        if let Some(sp) = spot_opt {
-            eligible_bucket_spot.insert(tick.clone(), sp);
+            json!({ "skipped": "invalid_redis_url" })
         }
-    }
+    } else {
+        json!({ "skipped": "redis_url_missing" })
+    };
 
-    let mut settled_sectors_count: usize = 0;
-    let mut total_swept_kas: f64 = 0.0_f64;
-    let mut total_epoch_fees_usd: f64 = 0.0_f64;
+    let tier3 = crate::fiat_rails::execute_tier3_changenow_vault_fallback(pool, &epoch_id)
+        .await
+        .unwrap_or_else(|e| json!({ "error": e }));
 
-    for row in rows {
-        let raw_wallet: String = row.try_get("wallet_address").unwrap_or_default();
-        let clean_wallet = raw_wallet.trim().to_lowercase().replace("kaspa:", "").trim().to_string();
-        if clean_wallet.is_empty() { continue; }
-        let prefixed_wallet = format!("kaspa:{}", clean_wallet);
-        let (user_fee_floor_rate, _, _) = crate::fiat_rails::resolve_wallet_swap_fee_floor_pct(pool, &prefixed_wallet).await;
-        let effective_swap_fee_rate: f64 = user_fee_floor_rate.max(crate::fiat_rails::HARD_PROFIT_FLOOR_PCT);
+    let epoch_telemetry = publish_live_epoch_bucket_telemetry(pool, 0.0)
+        .await
+        .unwrap_or_else(|_| json!({}));
 
-        let mut layout: Value = row.try_get("layout_state").unwrap_or_else(|_| json!({ "workers": [], "sectors": [] }));
-        let mut wallet_credited_kas: f64 = 0.0_f64;
-        let mut layout_mutated = false;
-
-        if let Some(sectors) = layout.get_mut("sectors").and_then(|v| v.as_array_mut()) {
-            for sec in sectors.iter_mut() {
-                let pending: f64 = sec.get("pendingKaspa").and_then(|v| v.as_f64()).unwrap_or(0.0_f64);
-                if pending <= 0.0_f64 { continue; }
-                let route_mode = sec.get("routeMode").and_then(|v| v.as_str()).unwrap_or("hold").to_lowercase();
-                let target_ticker = sec.get("settlementConfig").and_then(|c| c.get("targetAsset"))
-                    .and_then(|t| t.get("ticker")).and_then(|v| v.as_str()).unwrap_or("KAS").trim().to_uppercase();
-
-                if route_mode == "auto-lp" {
-                    let secondary_ticker = if target_ticker == "KAS" || target_ticker.is_empty() || target_ticker == "USD" {
-                        "USDC".to_string()
-                    } else { target_ticker.clone() };
-                    let Ok(secondary_spot_usd) = crate::fiat_rails::resolve_live_spot_price(pool, &secondary_ticker).await else { continue; };
-                    if secondary_spot_usd <= 0.0_f64 { continue; }
-                    let kas_leg: f64 = pending * 0.5_f64;
-                    let converted_leg_gross_usd: f64 = kas_leg * kas_spot_usd;
-                    let protocol_fee_usd: f64 = (converted_leg_gross_usd * effective_swap_fee_rate).max(0.01_f64);
-                    let secondary_leg: f64 = (converted_leg_gross_usd - protocol_fee_usd).max(0.0_f64) / secondary_spot_usd;
-                    if secondary_leg <= 0.0_f64 { continue; }
-                    let pair_name = format!("KAS/{}", secondary_ticker);
-                    let weights_json = json!({ "KAS": 0.5, secondary_ticker.clone(): 0.5 });
-                    let reserves_json = json!({ "KAS": kas_leg, secondary_ticker.clone(): secondary_leg });
-                    let _ = sqlx::query(
-                        "INSERT INTO liquidity_providers (wallet_address, pool_pair, staked_asset_a, staked_asset_b, weights_json, reserves_json, lock_duration_days, unlock_date) VALUES ($1, $2, $3, $4, $5, $6, 30, CURRENT_TIMESTAMP + INTERVAL '30 days')",
-                    ).bind(&prefixed_wallet).bind(&pair_name).bind(kas_leg).bind(secondary_leg).bind(&weights_json).bind(&reserves_json).execute(pool).await;
-                    total_epoch_fees_usd += protocol_fee_usd;
-                } else if (route_mode == "swap" || route_mode == "convert") && target_ticker != "KAS" && !target_ticker.is_empty() {
-                    let Some(&target_spot_usd) = eligible_bucket_spot.get(&target_ticker) else { continue; };
-                    let gross_usd: f64 = pending * kas_spot_usd;
-                    let fee_usd: f64 = (gross_usd * effective_swap_fee_rate).max(0.01_f64);
-                    let net_usd: f64 = (gross_usd - fee_usd).max(0.0_f64);
-                    if net_usd <= 0.0_f64 { continue; }
-                    let credit_ticker = if target_ticker == "USD" { "USDC" } else { target_ticker.as_str() };
-                    let out_tokens: f64 = ((net_usd / target_spot_usd) * 1e8_f64).round() / 1e8_f64;
-                    if out_tokens <= 0.0_f64 { continue; }
-                    if crate::state_api::credit_user_token_balance(pool, &clean_wallet, &prefixed_wallet, credit_ticker, out_tokens, false).await.is_err() {
-                        continue;
-                    }
-                    total_epoch_fees_usd += fee_usd;
-                    let _ = crate::sor::record_hifo_acquisition_lot(pool, &clean_wallet, credit_ticker, out_tokens, target_spot_usd, "EPOCH_BELL_SWAP", None).await;
-                    let _ = sqlx::query(
-                        "INSERT INTO tax_ledger_events (wallet_address, asset_ticker, event_type, gross_proceeds_usd, amount_tokens, spot_price_at_execution, cost_basis_usd, realized_gain_loss_usd, holding_period) VALUES ($1, $2, 'EPOCH_BELL_SWAP', $3, $4, $5, $3, 0.0, 'SHORT_TERM')",
-                    ).bind(&clean_wallet).bind(credit_ticker).bind(net_usd).bind(out_tokens).bind(target_spot_usd).execute(pool).await;
-                } else {
-                    wallet_credited_kas += pending;
-                }
-                sec["pendingKaspa"] = json!(0.0);
-                layout_mutated = true;
-                settled_sectors_count += 1;
-                total_swept_kas += pending;
-            }
-        }
-        if wallet_credited_kas > 0.0_f64 {
-            if crate::state_api::credit_user_token_balance(pool, &clean_wallet, &prefixed_wallet, "KAS", wallet_credited_kas, true).await.is_err() {
-                continue;
-            }
-            let _ = crate::sor::record_hifo_acquisition_lot(pool, &clean_wallet, "KAS", wallet_credited_kas, kas_spot_usd, "EPOCH_BELL_YIELD", None).await;
-            let gross_usd: f64 = wallet_credited_kas * kas_spot_usd;
-            let _ = sqlx::query(
-                "INSERT INTO tax_ledger_events (wallet_address, asset_ticker, event_type, gross_proceeds_usd, amount_tokens, spot_price_at_execution, cost_basis_usd, realized_gain_loss_usd, holding_period) VALUES ($1, 'KAS', 'YIELD', $2, $3, $4, $2, 0.0, 'SHORT_TERM')",
-            ).bind(&clean_wallet).bind(gross_usd).bind(wallet_credited_kas).bind(kas_spot_usd).execute(pool).await;
-        }
-        if layout_mutated {
-            let _ = sqlx::query("UPDATE user_command_centers SET layout_state = $2, last_updated = CURRENT_TIMESTAMP WHERE wallet_address = $1")
-                .bind(&raw_wallet).bind(&layout).execute(pool).await;
-        }
-    }
-
-    if total_epoch_fees_usd > 0.0_f64 {
-        if let Ok(redis_url) = env::var("REDIS_URL") {
-            if let Ok(client) = redis::Client::open(redis_url) {
-                if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
-                    let _: redis::RedisResult<()> = redis::cmd("INCRBYFLOAT")
-                        .arg("perennia:treasury:netting_profit_usd").arg(total_epoch_fees_usd).query_async(&mut conn).await;
-                    let _: redis::RedisResult<()> = redis::cmd("INCRBYFLOAT")
-                        .arg("perennia:fees:batch_accumulated:USDC").arg(total_epoch_fees_usd * 0.60_f64).query_async(&mut conn).await;
-                }
-            }
-        }
-    }
-
-    let epoch_telemetry = publish_live_epoch_bucket_telemetry(pool, kas_spot_usd).await.unwrap_or_else(|_| json!({}));
     Ok(json!({
-        "pooledBucketsCleared": eligible_bucket_spot.keys().cloned().collect::<Vec<String>>(),
-        "settledSectorsCount": settled_sectors_count,
-        "totalSweptKas": (total_swept_kas * 10000.0_f64).round() / 10000.0_f64,
-        "totalProtocolFeesUsd": (total_epoch_fees_usd * 10000.0_f64).round() / 10000.0_f64,
-        "executionKasSpotUsd": kas_spot_usd,
+        "epochId": epoch_id,
+        "kasSpotUsdE8": kas_usd_e8.to_string(),
+        "tier1CowCross": tier1,
+        "tier2BotBatchHtlc": tier2,
+        "tier3ChangeNowSplit": tier3,
         "epochTelemetry": epoch_telemetry,
         "settledAt": Utc::now().to_rfc3339()
     }))

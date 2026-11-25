@@ -19,9 +19,6 @@ use std::env;
 use uuid::Uuid;
 
 const DEFAULT_RESERVE_WHITELIST: &[&str] = &["KAS", "BTC", "ETH", "SOL", "USDC", "USDT", "SILO"];
-const LP_BASE_HURDLE_MIN_APR_PCT: f64 = 14.2;
-const LP_BASE_HURDLE_TARGET_APR_PCT: f64 = 14.6;
-const COMPETITOR_STANDARD_AMM_APR_PCT: f64 = 9.1;
 
 pub trait PayoutBatchEntry {
     fn recipient_address(&self) -> String;
@@ -37,15 +34,6 @@ impl PayoutBatchEntry for (String, u64) {
     }
 }
 
-impl PayoutBatchEntry for (String, f64) {
-    fn recipient_address(&self) -> String {
-        self.0.clone()
-    }
-    fn amount_sompi(&self) -> u64 {
-        (self.1.max(0.0) * 100_000_000.0).round() as u64
-    }
-}
-
 impl PayoutBatchEntry for Value {
     fn recipient_address(&self) -> String {
         self.get("address")
@@ -55,15 +43,12 @@ impl PayoutBatchEntry for Value {
             .to_string()
     }
     fn amount_sompi(&self) -> u64 {
-        if let Some(s) = self.get("sompi").and_then(|v| v.as_u64()) {
-            return s;
-        }
-        let kas = self
-            .get("amountKas")
-            .or_else(|| self.get("amount"))
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        (kas.max(0.0) * 100_000_000.0).round() as u64
+        self.get("sompi")
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+            })
+            .unwrap_or(0)
     }
 }
 
@@ -93,13 +78,26 @@ pub struct SorExecuteRequest {
     pub wallet: String,
     pub pay_asset: String,
     pub receive_asset: String,
-    pub amount: f64,
     #[serde(default)]
-    pub slippage_tolerance: Option<f64>,
+    pub target_network: Option<String>,
+    #[serde(default)]
+    pub amount_atomic: Option<String>,
+    #[serde(default)]
+    pub amount: Option<Value>,
+    #[serde(default)]
+    pub min_output_atomic: Option<String>,
+    #[serde(default)]
+    pub slippage_bps: Option<u16>,
+    #[serde(default)]
+    pub destination_address: Option<String>,
+    #[serde(default)]
+    pub refund_kaspa_address: Option<String>,
     #[serde(default)]
     pub utxos: Option<Vec<Value>>,
     #[serde(default)]
-    pub system_mode: Option<String>,
+    pub htlc_sha256_hashlock_hex: Option<String>,
+    #[serde(default)]
+    pub counterparty_pubkey_hex: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -119,20 +117,6 @@ pub struct TokenSteeringDecision {
     pub allow_dark_pool_internal_clearing: bool,
     pub fee_legs: Vec<SteeringFeeLeg>,
     pub explanation: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DynamicHurdleWaterfall {
-    pub hard_floor_perennia_usd: f64,
-    pub lp_allocated_fee_usd: f64,
-    pub perennia_total_cut_usd: f64,
-    pub perennia_lp_compound_60_usd: f64,
-    pub perennia_liquid_reserve_40_usd: f64,
-    pub projected_base_lp_apr_pct: f64,
-    pub projected_max_multiplier_apr_pct: f64,
-    pub competitor_amm_apr_pct: f64,
-    pub surplus_volume_sweep_active: bool,
 }
 
 async fn resolve_token_steering_and_firewall(
@@ -419,164 +403,78 @@ async fn resolve_token_steering_and_firewall(
     ))
 }
 
-async fn compute_dynamic_hurdle_waterfall(
-    pool: &PgPool,
-    pool_pair: &str,
-    gross_usd: f64,
-    total_protocol_fee_usd: f64,
-    kas_spot_usd: f64,
-) -> DynamicHurdleWaterfall {
-    let safe_gross = gross_usd.max(0.0);
-    let total_fee = total_protocol_fee_usd.max(0.0);
-
-    // Step 1: Lock Perennia's 0.10% hard cost-plus protocol floor above gas first
-    let hard_floor_perennia_usd = total_fee.min((safe_gross * crate::fiat_rails::HARD_PROFIT_FLOOR_PCT).max(0.01));
-    let remaining_distributable_usd = (total_fee - hard_floor_perennia_usd).max(0.0);
-
-    let staked_kas: f64 = sqlx::query_scalar(
-        r#"
-        SELECT COALESCE(SUM(staked_asset_a), 0.0)
-        FROM liquidity_providers
-        WHERE pool_pair = $1
-        "#,
-    )
-    .bind(pool_pair)
-    .fetch_one(pool)
-    .await
-    .unwrap_or(0.0);
-
-    let rolling_24h_lp_fees_usd: f64 = sqlx::query_scalar(
-        r#"
-        SELECT COALESCE(SUM(total_fees_distributed_usd), 0.0)
-        FROM yield_distributions
-        WHERE pool_pair = $1
-          AND distributed_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
-        "#,
-    )
-    .bind(pool_pair)
-    .fetch_one(pool)
-    .await
-    .unwrap_or(0.0);
-
-    let pair_tvl_usd = if staked_kas > 0.0 && kas_spot_usd > 0.0 {
-        (staked_kas * kas_spot_usd * 2.0).max(1_000.0)
-    } else {
-        25_000.0
-    };
-
-    let daily_hurdle_target_usd =
-        (pair_tvl_usd * (LP_BASE_HURDLE_TARGET_APR_PCT / 100.0)) / 365.0;
-    let daily_hurdle_min_usd =
-        (pair_tvl_usd * (LP_BASE_HURDLE_MIN_APR_PCT / 100.0)) / 365.0;
-
-    let (lp_share_of_remaining, surplus_volume_sweep_active) =
-        if rolling_24h_lp_fees_usd >= daily_hurdle_target_usd {
-            (0.20, true)
-        } else if rolling_24h_lp_fees_usd < daily_hurdle_min_usd {
-            (0.45, false)
-        } else {
-            (0.4444, false)
-        };
-
-    let lp_allocated_fee_usd =
-        ((remaining_distributable_usd * lp_share_of_remaining) * 1_000_000.0).round() / 1_000_000.0;
-    let perennia_total_cut_usd = ((total_fee - lp_allocated_fee_usd)
-        .max(hard_floor_perennia_usd)
-        * 1_000_000.0)
-        .round()
-        / 1_000_000.0;
-
-    // Internal Treasury 60/40 Reserve Split:
-    // 60% into Perennia-owned LP positions to compound, 40% in liquid USD/stablecoin clearing reserve
-    let perennia_lp_compound_60_usd =
-        ((perennia_total_cut_usd * 0.60) * 1_000_000.0).round() / 1_000_000.0;
-    let perennia_liquid_reserve_40_usd = ((perennia_total_cut_usd - perennia_lp_compound_60_usd)
-        .max(0.0)
-        * 1_000_000.0)
-        .round()
-        / 1_000_000.0;
-
-    let new_rolling_24h_lp_usd = rolling_24h_lp_fees_usd + lp_allocated_fee_usd;
-    let raw_apr = if pair_tvl_usd > 0.0 {
-        ((new_rolling_24h_lp_usd * 365.0) / pair_tvl_usd) * 100.0
-    } else {
-        14.4
-    };
-    let projected_base_lp_apr_pct =
-        ((raw_apr.clamp(LP_BASE_HURDLE_MIN_APR_PCT, 24.0)) * 100.0).round() / 100.0;
-    let projected_max_multiplier_apr_pct =
-        ((projected_base_lp_apr_pct * 2.5) * 100.0).round() / 100.0;
-
-    DynamicHurdleWaterfall {
-        hard_floor_perennia_usd,
-        lp_allocated_fee_usd,
-        perennia_total_cut_usd,
-        perennia_lp_compound_60_usd,
-        perennia_liquid_reserve_40_usd,
-        projected_base_lp_apr_pct,
-        projected_max_multiplier_apr_pct,
-        competitor_amm_apr_pct: COMPETITOR_STANDARD_AMM_APR_PCT,
-        surplus_volume_sweep_active,
+fn atomic_decimals_for_sor_asset(ticker: &str) -> u8 {
+    match ticker.trim().to_uppercase().as_str() {
+        "USDC" | "USDT" | "KUSDT" | "USD" | "XRP" | "TRX" | "ADA" => 6,
+        "SOL" | "SUI" | "TON" => 9,
+        "ETH" | "ARB" | "BASE" | "POL" | "AVAX" | "LINK" => 18,
+        _ => 8,
     }
 }
 
-fn estimate_modeled_gas_and_slippage_usd(
-    pay_asset: &str,
-    receive_asset: &str,
-    gross_usd: f64,
-    is_external_pass_through: bool,
-) -> (f64, f64) {
-    let gas_for_asset = |ticker: &str| -> f64 {
-        match ticker.trim().to_uppercase().as_str() {
-            "KAS" | "SILO" | "NACHO" | "BEDRCK" | "PERX" => 0.002,
-            "BTC" => 0.65,
-            "ETH" | "USDC" | "USDT" | "XAU" => 0.25,
-            "SOL" | "ARB" | "BASE" | "POL" | "AVAX" | "SUI" | "XRP" | "DOGE" | "TRX" => 0.02,
-            _ => 0.15,
-        }
-    };
-    let raw_gas_usd = gas_for_asset(pay_asset) + gas_for_asset(receive_asset);
-    let network_gas_usd = if !is_external_pass_through && gross_usd > 0.0 && gross_usd < 25.0 {
-        raw_gas_usd.min((gross_usd * 0.01).max(0.002))
+fn parse_decimal_or_json_to_atomic_u128(raw_str: &str, decimals: u8) -> Result<u128, String> {
+    let trimmed = raw_str.trim();
+    if trimmed.is_empty() || trimmed.starts_with('-') {
+        return Err("Empty or negative amount".to_string());
+    }
+    let mut parts = trimmed.split('.');
+    let int_part = parts.next().unwrap_or("");
+    let frac_part = parts.next().unwrap_or("");
+    if parts.next().is_some() {
+        return Err("Multiple decimal points in amount".to_string());
+    }
+    let scale = 10u128.pow(decimals as u32);
+    let whole: u128 = if int_part.is_empty() {
+        0
     } else {
-        raw_gas_usd
+        int_part
+            .parse::<u128>()
+            .map_err(|_| "Invalid whole integer amount".to_string())?
     };
-    let external_slip_usd = if is_external_pass_through {
-        gross_usd * 0.0015
-    } else {
-        0.0
-    };
-    (
-        (network_gas_usd * 10_000.0).round() / 10_000.0,
-        (external_slip_usd * 10_000.0).round() / 10_000.0,
-    )
+    let mut frac_buf = frac_part.as_bytes().to_vec();
+    frac_buf.truncate(decimals as usize);
+    while frac_buf.len() < decimals as usize {
+        frac_buf.push(b'0');
+    }
+    let frac: u128 = String::from_utf8(frac_buf)
+        .unwrap_or_default()
+        .parse::<u128>()
+        .unwrap_or(0);
+    whole
+        .checked_mul(scale)
+        .and_then(|v| v.checked_add(frac))
+        .ok_or_else(|| "Atomic amount overflow".to_string())
 }
 
-async fn resolve_user_fee_rate(
+async fn resolve_sor_fee_bps(
     pool: &PgPool,
     prefixed_wallet: &str,
     clean_wallet: &str,
-    usd_volume: f64,
+    gross_usd_micros: u128,
     pay_asset: &str,
     receive_asset: &str,
-    allow_dark_pool_internal_clearing: bool,
-) -> (f64, &'static str) {
-    let (wallet_floor_rate, tier_label, has_wholesale_perk) =
-        crate::fiat_rails::resolve_wallet_swap_fee_floor_pct(pool, prefixed_wallet).await;
-    if has_wholesale_perk {
-        return (
-            wallet_floor_rate.max(crate::fiat_rails::HARD_PROFIT_FLOOR_PCT),
-            tier_label,
-        );
+    allow_dark_pool: bool,
+) -> (u16, &'static str) {
+    let is_active_miner: bool = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*) FROM worker_profiles
+        WHERE (LOWER(REPLACE(TRIM(wallet_address), 'kaspa:', '')) = $1 OR wallet_address = $2)
+          AND status IN ('online', 'grace_period')
+        "#,
+    )
+    .bind(clean_wallet)
+    .bind(prefixed_wallet)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0)
+        > 0;
+    if is_active_miner {
+        return (10, "10 bps Active Stratum Miner Wholesale Floor");
     }
 
-    let pay_up = pay_asset.trim().to_uppercase();
-    let rec_up = receive_asset.trim().to_uppercase();
-    let is_buy_kas = rec_up == "KAS" && pay_up != "USD";
-
-    let staked_silo: f64 = sqlx::query_scalar(
+    let staked_silo_atomic: u128 = sqlx::query_scalar::<_, Option<String>>(
         r#"
-        SELECT COALESCE(SUM(amount_staked), 0.0)
+        SELECT COALESCE(SUM(COALESCE(amount_staked_atomic, TRUNC(GREATEST(amount_staked, 0) * 100000000))), 0)::NUMERIC(39,0)::TEXT
         FROM silo_staking_positions
         WHERE (wallet_address = $1 OR wallet_address = $2)
           AND status IN ('ACTIVE', 'COOLDOWN')
@@ -586,118 +484,32 @@ async fn resolve_user_fee_rate(
     .bind(clean_wallet)
     .fetch_one(pool)
     .await
-    .unwrap_or(0.0);
+    .ok()
+    .flatten()
+    .and_then(|s| s.parse::<u128>().ok())
+    .unwrap_or(0);
 
-    if staked_silo >= 1_000_000.0 {
-        return (
-            crate::fiat_rails::HARD_PROFIT_FLOOR_PCT,
-            "0.10% SILO Sovereign Staker Wholesale Floor",
-        );
-    } else if staked_silo >= 100_000.0 {
-        if is_buy_kas {
-            return (
-                crate::fiat_rails::BUY_KAS_INBOUND_FEE_PCT,
-                "0.20% Buy-KAS Inbound Tier",
-            );
-        }
-        return (
-            crate::fiat_rails::WHOLESALE_VOLUME_SWAP_FEE_PCT,
-            "0.25% SILO Vanguard Staker Tier",
-        );
-    } else if staked_silo >= 10_000.0 {
-        if is_buy_kas {
-            return (
-                crate::fiat_rails::BUY_KAS_INBOUND_FEE_PCT,
-                "0.20% Buy-KAS Inbound Tier",
-            );
-        }
-        return (
-            crate::fiat_rails::SILO_SHIELD_SWAP_FEE_PCT,
-            "0.35% SILO Shield Staker Tier",
-        );
+    let is_buy_kas = receive_asset == "KAS" && pay_asset != "USD";
+    if staked_silo_atomic >= 100_000_000_000_000 {
+        return (10, "10 bps SILO Sovereign Staker Floor");
     }
-
     if is_buy_kas {
-        return (
-            crate::fiat_rails::BUY_KAS_INBOUND_FEE_PCT,
-            "0.20% Buy-KAS Inbound Tier",
-        );
+        return (20, "20 bps Buy-KAS Inbound Tier");
     }
-
-    if usd_volume >= 2_500.0 {
-        return (
-            crate::fiat_rails::WHOLESALE_VOLUME_SWAP_FEE_PCT,
-            "0.25% Volume Wholesale Tier ($2,500+)",
-        );
+    if staked_silo_atomic >= 10_000_000_000_000 || gross_usd_micros >= 2_500_000_000 {
+        return (25, "25 bps Wholesale / Vanguard Tier");
     }
-
-    let is_dark_pool_major = allow_dark_pool_internal_clearing
-        && DEFAULT_RESERVE_WHITELIST.iter().any(|&t| t == pay_up)
-        && DEFAULT_RESERVE_WHITELIST.iter().any(|&t| t == rec_up);
-
-    if is_dark_pool_major {
-        (
-            crate::fiat_rails::STANDARD_PUBLIC_SWAP_FEE_PCT,
-            "0.50% Dark Pool Major Swap Tier",
-        )
+    if staked_silo_atomic >= 1_000_000_000_000 {
+        return (35, "35 bps SILO Shield Staker Tier");
+    }
+    let is_dp_major = allow_dark_pool
+        && DEFAULT_RESERVE_WHITELIST.iter().any(|&t| t == pay_asset)
+        && DEFAULT_RESERVE_WHITELIST.iter().any(|&t| t == receive_asset);
+    if is_dp_major {
+        (50, "50 bps Dark Pool CoW Major Tier")
     } else {
-        (
-            crate::fiat_rails::PASS_THROUGH_SWAP_FEE_PCT,
-            "0.85% External Pass-Through Swap Tier",
-        )
+        (85, "85 bps External Non-Custodial Pass-Through Tier")
     }
-}
-
-async fn has_sufficient_local_lp_depth(
-    pool: &PgPool,
-    pay_asset: &str,
-    receive_asset: &str,
-    required_receive_tokens: f64,
-) -> (bool, String) {
-    let direct_pair = format!("{}/{}", pay_asset, receive_asset);
-    let reverse_pair = format!("{}/{}", receive_asset, pay_asset);
-    let kas_pair = format!("KAS/{}", receive_asset);
-    let rows = sqlx::query(
-        r#"
-        SELECT pool_pair, staked_asset_a, staked_asset_b, COALESCE(reserves_json, '{}'::jsonb) AS reserves_json
-        FROM liquidity_providers
-        WHERE pool_pair = $1 OR pool_pair = $2 OR pool_pair = $3 OR pool_pair LIKE '%' || $4 || '%'
-        "#,
-    )
-    .bind(&direct_pair)
-    .bind(&reverse_pair)
-    .bind(&kas_pair)
-    .bind(receive_asset)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
-    let mut available_receive_reserve = 0.0_f64;
-    let mut matched_pair_label = format!("KAS/{}", receive_asset);
-    for r in rows {
-        let pair: String = r.try_get("pool_pair").unwrap_or_default();
-        let reserves: Value = r.try_get("reserves_json").unwrap_or_else(|_| json!({}));
-        if let Some(res_amt) = reserves.get(receive_asset).and_then(|v| v.as_f64()) {
-            available_receive_reserve += res_amt.max(0.0);
-            matched_pair_label = pair;
-            continue;
-        }
-        let parts: Vec<&str> = pair.split('/').collect();
-        if parts.first().copied() == Some(receive_asset) {
-            available_receive_reserve += r
-                .try_get::<f64, _>("staked_asset_a")
-                .unwrap_or(0.0)
-                .max(0.0);
-            matched_pair_label = pair;
-        } else if parts.get(1).copied() == Some(receive_asset) {
-            available_receive_reserve += r
-                .try_get::<f64, _>("staked_asset_b")
-                .unwrap_or(0.0)
-                .max(0.0);
-            matched_pair_label = pair;
-        }
-    }
-    let has_depth = available_receive_reserve >= (required_receive_tokens * 2.0).max(1e-6);
-    (has_depth, matched_pair_label)
 }
 
 pub async fn handle_sor_execute(
@@ -714,15 +526,53 @@ pub async fn handle_sor_execute(
     let prefixed_wallet = format!("kaspa:{}", clean_wallet);
     let pay_asset = req.pay_asset.trim().to_uppercase();
     let receive_asset = req.receive_asset.trim().to_uppercase();
-    let amount = req.amount;
-    if clean_wallet.is_empty() || amount <= 0.0 || pay_asset == receive_asset {
+    let pay_decimals = atomic_decimals_for_sor_asset(&pay_asset);
+    let rec_decimals = atomic_decimals_for_sor_asset(&receive_asset);
+
+    if clean_wallet.is_empty()
+        || crate::state_api::decode_kaspa_address_payload(&prefixed_wallet).is_none()
+        || pay_asset == receive_asset
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
-                "error": "Invalid swap parameters: amount must be > 0 and assets must differ."
+                "error": "Invalid non-custodial swap parameters or Kaspa Bech32m wallet."
             })),
         );
     }
+
+    let amount_in_atomic: u128 = if let Some(ref s) = req.amount_atomic {
+        match s.trim().parse::<u128>() {
+            Ok(v) if v > 0 => v,
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "amountAtomic must be a positive integer string." })),
+                );
+            }
+        }
+    } else if let Some(ref val) = req.amount {
+        let raw_s = val
+            .as_str()
+            .map(|s| s.to_string())
+            .or_else(|| val.as_u64().map(|n| n.to_string()))
+            .or_else(|| val.as_f64().filter(|f| f.is_finite() && *f > 0.0).map(|f| format!("{:.8}", f)))
+            .unwrap_or_default();
+        match parse_decimal_or_json_to_atomic_u128(&raw_s, pay_decimals) {
+            Ok(v) if v > 0 => v,
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "amount must be positive." })),
+                );
+            }
+        }
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Provide amountAtomic or amount." })),
+        );
+    };
 
     let (steering, dark_pool_paused, _external_dex_paused) =
         match resolve_token_steering_and_firewall(
@@ -738,8 +588,15 @@ pub async fn handle_sor_execute(
             Err(err_resp) => return err_resp,
         };
 
-    let pay_spot = match crate::fiat_rails::resolve_live_spot_price(&pool, &pay_asset).await {
-        Ok(p) => p,
+    // Strict live oracles (zero 0.15 fallback — fail closed with 503)
+    let pay_usd_e8 = match crate::state_api::resolve_strict_spot_price_e8(&pool, &pay_asset).await {
+        Ok(p) if p > 0 => p,
+        Ok(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": format!("ORACLE_HALT: {} oracle returned 0.", pay_asset) })),
+            );
+        }
         Err(e) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -747,9 +604,15 @@ pub async fn handle_sor_execute(
             );
         }
     };
-    let receive_spot =
-        match crate::fiat_rails::resolve_live_spot_price(&pool, &receive_asset).await {
-            Ok(p) => p,
+    let receive_usd_e8 =
+        match crate::state_api::resolve_strict_spot_price_e8(&pool, &receive_asset).await {
+            Ok(p) if p > 0 => p,
+            Ok(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": format!("ORACLE_HALT: {} oracle returned 0.", receive_asset) })),
+                );
+            }
             Err(e) => {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -757,450 +620,235 @@ pub async fn handle_sor_execute(
                 );
             }
         };
-    let kas_spot = if pay_asset == "KAS" {
-        pay_spot
-    } else if receive_asset == "KAS" {
-        receive_spot
-    } else {
-        crate::fiat_rails::resolve_live_spot_price(&pool, "KAS")
-            .await
-            .unwrap_or(0.15)
-            .max(0.01)
+    let kas_usd_e8 = match crate::state_api::resolve_strict_spot_price_e8(&pool, "KAS").await {
+        Ok(p) if p > 0 => p,
+        Ok(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "ORACLE_HALT: KAS oracle returned 0." })),
+            );
+        }
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": e })),
+            );
+        }
     };
-    let gross_usd = amount * pay_spot;
-    if gross_usd < 1.0 {
+
+    let pay_scale = 10u128.pow(pay_decimals as u32);
+    let rec_scale = 10u128.pow(rec_decimals as u32);
+    // usd_micros = amount_in_atomic * pay_usd_e8 / (pay_scale * 100)
+    let gross_usd_micros = amount_in_atomic.saturating_mul(pay_usd_e8) / (pay_scale.saturating_mul(100));
+    if gross_usd_micros < 1_000_000 {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
-                "error": format!(
-                    "ANTI_DUST_FLOOR: Minimum swap value is $1.00 USD (submitted ${:.2} USD).",
-                    gross_usd
-                )
+                "error": "ANTI_DUST_FLOOR: Minimum non-custodial swap notional is $1.00 USD (1000000 usdMicros)."
             })),
         );
     }
-    let allow_dp_pair = steering.allow_dark_pool_internal_clearing
-        && !dark_pool_paused
-        && DEFAULT_RESERVE_WHITELIST.iter().any(|&t| t == pay_asset)
-        && DEFAULT_RESERVE_WHITELIST.iter().any(|&t| t == receive_asset);
-    let (fee_rate, fee_tier_label) = resolve_user_fee_rate(
+
+    let allow_dp = steering.allow_dark_pool_internal_clearing && !dark_pool_paused;
+    let (fee_bps, fee_tier_label) = resolve_sor_fee_bps(
         &pool,
         &prefixed_wallet,
         &clean_wallet,
-        gross_usd,
+        gross_usd_micros,
         &pay_asset,
         &receive_asset,
-        allow_dp_pair,
+        allow_dp,
     )
     .await;
-    let (network_gas_usd, external_slip_usd) =
-        estimate_modeled_gas_and_slippage_usd(&pay_asset, &receive_asset, gross_usd, !allow_dp_pair);
-    let hard_floor_usd = (gross_usd * crate::fiat_rails::HARD_PROFIT_FLOOR_PCT).max(0.01);
-    let protocol_fee_usd = (gross_usd * fee_rate).max(hard_floor_usd);
-    let fee_usd = (protocol_fee_usd + network_gas_usd + external_slip_usd).min(gross_usd);
-    let net_usd = (gross_usd - fee_usd).max(0.0);
-    if net_usd <= 0.0 {
+
+    let protocol_fee_atomic = (amount_in_atomic.saturating_mul(fee_bps as u128) + 9_999) / 10_000;
+    let net_in_atomic = amount_in_atomic.saturating_sub(protocol_fee_atomic);
+    if net_in_atomic == 0 {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({
-                "error": "ZERO_LOSS_INVARIANT_VIOLATION: Net swap value after protocol fee must be > $0.00."
-            })),
+            Json(json!({ "error": "ZERO_LOSS_INVARIANT_VIOLATION: Net swap input after fee is 0." })),
         );
     }
-    let mut estimated_output = if receive_spot > 0.0 {
-        net_usd / receive_spot
-    } else {
-        0.0
-    };
-    let (raw_has_local_lp, matched_pool_pair) =
-        has_sufficient_local_lp_depth(&pool, &pay_asset, &receive_asset, estimated_output).await;
-    let has_local_lp =
-        raw_has_local_lp && steering.allow_dark_pool_internal_clearing && !dark_pool_paused;
 
-    let provider_label = if has_local_lp {
-        "Perennia 50%-KAS Liquidity Pool"
-    } else if receive_asset != "KAS" && receive_asset != "SILO" && receive_asset != "USDC" {
-        if let Ok(cn_net_out) =
-            crate::fiat_rails::fetch_changenow_estimated_amount("USDC", &receive_asset, net_usd)
-                .await
-        {
-            if cn_net_out > 0.0 {
-                estimated_output = estimated_output.min(cn_net_out);
-            }
-        }
-        "Perennia Hybrid SOR + Wholesale Pass-Through"
-    } else {
-        "Perennia 50%-KAS Liquidity Pool"
-    };
-    estimated_output = (estimated_output * 100_000_000.0).round() / 100_000_000.0;
-    let unified_rate = if amount > 0.0 {
-        estimated_output / amount
-    } else {
-        0.0
-    };
+    let net_usd_micros = net_in_atomic.saturating_mul(pay_usd_e8) / (pay_scale.saturating_mul(100));
+    let estimated_out_atomic =
+        (net_in_atomic.saturating_mul(pay_usd_e8) / receive_usd_e8.max(1)).saturating_mul(rec_scale)
+            / pay_scale.max(1);
+    let slippage_bps = req.slippage_bps.unwrap_or(50).clamp(1, 2500) as u128;
+    let computed_min_out = estimated_out_atomic.saturating_mul(10_000 - slippage_bps) / 10_000;
+    let min_out_atomic = req
+        .min_output_atomic
+        .as_deref()
+        .and_then(|s| s.trim().parse::<u128>().ok())
+        .map(|u| u.max(computed_min_out))
+        .unwrap_or(computed_min_out);
+
+    let sys_cfg = crate::chronos::load_system_treasury_config(&pool).await;
+    let house_revenue_addr = crate::chronos::resolve_house_revenue_kas_address(&sys_cfg)
+        .unwrap_or_else(|| sys_cfg.cold_kas_address.clone());
     let tx_uuid = format!(
         "PER-SOR-{}",
-        Uuid::new_v4()
-            .to_string()
-            .replace('-', "")
-            .chars()
-            .take(12)
-            .collect::<String>()
-            .to_uppercase()
+        &Uuid::new_v4().simple().to_string().to_uppercase()[..12]
     );
-    let anchor_kas_volume = if pay_asset == "KAS" {
-        amount
-    } else if kas_spot > 0.0 {
-        gross_usd / kas_spot
-    } else {
-        0.0
+
+    if pay_asset != "KAS" {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "success": true,
+                "transactionUuid": tx_uuid,
+                "routeType": "CROSS_CHAIN_DEPOSIT_INTENT",
+                "amountInAtomic": amount_in_atomic.to_string(),
+                "protocolFeeAtomic": protocol_fee_atomic.to_string(),
+                "networkFeeSompi": "0",
+                "estimatedOutputAtomic": estimated_out_atomic.to_string(),
+                "minOutputAtomic": min_out_atomic.to_string(),
+                "feeBps": fee_bps,
+                "feeTierLabel": fee_tier_label,
+                "grossUsdMicros": gross_usd_micros.to_string(),
+                "netUsdMicros": net_usd_micros.to_string(),
+                "payOracleUsdE8": pay_usd_e8.to_string(),
+                "receiveOracleUsdE8": receive_usd_e8.to_string(),
+                "kasOracleUsdE8": kas_usd_e8.to_string(),
+                "targetNetwork": req.target_network.clone().unwrap_or_else(|| crate::state_api::resolve_network_for_asset(&receive_asset)),
+                "destinationAddress": req.destination_address.clone().unwrap_or_else(|| prefixed_wallet.clone()),
+                "refundKaspaAddress": req.refund_kaspa_address.clone().unwrap_or_else(|| prefixed_wallet.clone()),
+                "tokenSteering": steering,
+                "pskt": Value::Null,
+                "htlcCovenant": Value::Null,
+                "formattedUtxos": []
+            })),
+        );
+    }
+
+    let utxo_list = match req.utxos {
+        Some(ref list) if !list.is_empty() => list.clone(),
+        _ => crate::kaspad_client::get_utxos_by_address_grpc(&prefixed_wallet)
+            .await
+            .unwrap_or_default(),
     };
-
-    let target_distribution_pair = if has_local_lp {
-        matched_pool_pair
-    } else if pay_asset == "KAS" {
-        format!("KAS/{}", receive_asset)
-    } else if receive_asset == "KAS" {
-        format!("KAS/{}", pay_asset)
-    } else {
-        format!("{}/{}", pay_asset, receive_asset)
-    };
-
-    let waterfall = compute_dynamic_hurdle_waterfall(
-        &pool,
-        &target_distribution_pair,
-        gross_usd,
-        fee_usd,
-        kas_spot,
-    )
-    .await;
-
-    if let Err(ledger_debit_err) = crate::state_api::debit_user_token_balance(
-        &pool,
-        &clean_wallet,
-        &prefixed_wallet,
-        &pay_asset,
-        amount,
-    )
-    .await
-    {
-        if pay_asset == "KAS" {
-            if let Some(ref utxo_list) = req.utxos {
-                if !utxo_list.is_empty() {
-                    let sys_cfg = crate::chronos::load_system_treasury_config(&pool).await;
-                    let treasury_dest = crate::chronos::resolve_hot_dispatcher_address()
-                        .filter(|s| !s.trim().is_empty())
-                        .unwrap_or(sys_cfg.cold_kas_address);
-                    if !treasury_dest.trim().is_empty() {
-                        let amount_sompi = (amount * 100_000_000.0).round() as u64;
-                        if let Some((psbt, formatted_utxos)) = assemble_unsigned_kaspa_psbt(
-                            &prefixed_wallet,
-                            &treasury_dest,
-                            amount_sompi,
-                            utxo_list,
-                        ) {
-                            if let Ok(redis_url) = env::var("REDIS_URL") {
-                                if let Ok(client) = redis::Client::open(redis_url) {
-                                    if let Ok(mut conn) =
-                                        client.get_multiplexed_async_connection().await
-                                    {
-                                        let pending_order = json!({
-                                            "wallet": prefixed_wallet,
-                                            "direction": "SELL_KAS",
-                                            "amount_kas": amount,
-                                            "spot_price": pay_spot,
-                                            "fee_captured_usd": fee_usd,
-                                            "target_asset": receive_asset,
-                                            "estimated_output": estimated_output,
-                                            "transaction_uuid": tx_uuid
-                                        });
-                                        let _: redis::RedisResult<()> = redis::cmd("SETEX")
-                                            .arg(format!("perennia:pending_swap:{}", clean_wallet))
-                                            .arg(900u64)
-                                            .arg(pending_order.to_string())
-                                            .query_async(&mut conn)
-                                            .await;
-                                    }
-                                }
-                            }
-                            let anchor_layer_sweep =
-                                crate::chronos::sweep_layered_buckets_on_anchor_order(
-                                    &pool,
-                                    &receive_asset,
-                                    anchor_kas_volume,
-                                    kas_spot,
-                                    receive_spot,
-                                )
-                                .await
-                                .unwrap_or_else(|_| json!({ "layeredBucketsCleared": 0 }));
-                            return (
-                                StatusCode::OK,
-                                Json(json!({
-                                    "success": true,
-                                    "transaction_uuid": tx_uuid,
-                                    "unifiedRate": unified_rate,
-                                    "unified_rate": unified_rate,
-                                    "estimatedOutput": estimated_output,
-                                    "estimated_output": estimated_output,
-                                    "feeRate": fee_rate,
-                                    "fee_rate": fee_rate,
-                                    "feeTierLabel": fee_tier_label,
-                                    "feeUsd": fee_usd,
-                                    "fee_usd": fee_usd,
-                                    "tokenSteering": steering,
-                                    "dynamicHurdleWaterfall": waterfall,
-                                    "anchorLayerSweep": anchor_layer_sweep,
-                                    "legs": [
-                                        {
-                                            "tier": 1,
-                                            "provider": "Perennia L1 Atomic Settlement Router",
-                                            "filledAmount": amount,
-                                            "executionRate": unified_rate,
-                                            "marginCaptured": fee_usd
-                                        }
-                                    ],
-                                    "psbt": psbt,
-                                    "formattedUtxos": formatted_utxos
-                                })),
-                            );
-                        }
-                    }
-                }
-            }
-        }
+    if utxo_list.is_empty() {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({
-                "error": ledger_debit_err
+                "error": "NON_CUSTODIAL_UTXOS_REQUIRED: Wallet has 0 live L1 UTXOs on local kaspad (custodial DB/Redis balances are retired)."
             })),
         );
     }
 
-    if let Err(credit_err) = crate::state_api::credit_user_token_balance(
-        &pool,
-        &clean_wallet,
-        &prefixed_wallet,
-        &receive_asset,
-        estimated_output,
-        false,
-    )
-    .await
-    {
-        let _ = crate::state_api::credit_user_token_balance(
-            &pool,
-            &clean_wallet,
-            &prefixed_wallet,
-            &pay_asset,
-            amount,
-            false,
-        )
-        .await;
+    let pay_sompi = u64::try_from(amount_in_atomic).unwrap_or(0);
+    if pay_sompi == 0 {
         return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": format!("Failed to credit {} output after debit: {}", receive_asset, credit_err)
-            })),
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "KAS input sompi exceeds u64 consensus cap." })),
         );
     }
 
-    let anchor_layer_sweep = if !has_local_lp {
-        crate::chronos::sweep_layered_buckets_on_anchor_order(
-            &pool, &receive_asset, anchor_kas_volume, kas_spot, receive_spot,
-        ).await.unwrap_or_else(|_| json!({ "layeredBucketsCleared": 0 }))
-    } else {
-        json!({ "layeredBucketsCleared": 0, "deferredTo10sDarkPoolBatch": true })
-    };
-
-    let hifo_summary = match_and_consume_hifo_lots(
-        &pool,
-        &clean_wallet,
-        &pay_asset,
-        amount,
-        pay_spot,
-        Some(&tx_uuid),
-    )
-    .await
-    .ok();
-    let _ = record_hifo_acquisition_lot(
-        &pool,
-        &clean_wallet,
-        &receive_asset,
-        estimated_output,
-        receive_spot,
-        "DEX_SWAP",
-        Some(&tx_uuid),
-    )
-    .await;
-    let cost_basis_usd = hifo_summary
-        .as_ref()
-        .map(|s| s.matched_cost_basis_usd)
-        .unwrap_or(gross_usd);
-    let realized_gain_usd = hifo_summary
-        .as_ref()
-        .map(|s| s.realized_gain_loss_usd)
-        .unwrap_or(0.0);
-    let holding_period = hifo_summary
-        .as_ref()
-        .map(|s| s.holding_period.as_str())
-        .unwrap_or("SHORT_TERM");
-    let _ = sqlx::query(
-        r#"
-        INSERT INTO tax_ledger_events (
-            wallet_address, asset_ticker, event_type, gross_proceeds_usd,
-            amount_tokens, spot_price_at_execution, tx_hash,
-            cost_basis_usd, realized_gain_loss_usd, holding_period
-        ) VALUES ($1, $2, 'DEX_SWAP', $3, $4, $5, $6, $7, $8, $9)
-        "#,
-    )
-    .bind(&clean_wallet)
-    .bind(&pay_asset)
-    .bind(gross_usd)
-    .bind(amount)
-    .bind(pay_spot)
-    .bind(&tx_uuid)
-    .bind(cost_basis_usd)
-    .bind(realized_gain_usd)
-    .bind(holding_period)
-    .execute(&pool)
-    .await;
-
-    let _ = sqlx::query(
-        r#"
-        INSERT INTO yield_distributions (pool_pair, total_fees_distributed_usd)
-        VALUES ($1, $2)
-        "#,
-    )
-    .bind(&target_distribution_pair)
-    .bind(waterfall.lp_allocated_fee_usd)
-    .execute(&pool)
-    .await;
-
-    let _ = sqlx::query(
-        r#"
-        UPDATE fiat_float_ledger
-        SET dark_pool_lp_vault_usd = dark_pool_lp_vault_usd + $1,
-            master_treasury_usdc_reserve = COALESCE(master_treasury_usdc_reserve, 0.0) + $2,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE ledger_id IN ('BOOTSTRAP_PRIMARY', 'PRIMARY_FLOAT')
-        "#,
-    )
-    .bind(waterfall.perennia_lp_compound_60_usd)
-    .bind(waterfall.perennia_liquid_reserve_40_usd)
-    .execute(&pool)
-    .await;
-
-    if let Ok(redis_url) = env::var("REDIS_URL") {
-        if let Ok(client) = redis::Client::open(redis_url) {
-            if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
-                let _: redis::RedisResult<()> = redis::cmd("INCRBYFLOAT")
-                    .arg("perennia:treasury:netting_profit_usd")
-                    .arg(waterfall.perennia_total_cut_usd)
-                    .query_async(&mut conn)
-                    .await;
-                let _: redis::RedisResult<()> = redis::cmd("INCRBYFLOAT")
-                    .arg("perennia:fees:batch_accumulated:USDC")
-                    .arg(waterfall.perennia_lp_compound_60_usd)
-                    .query_async(&mut conn)
-                    .await;
-                for leg in &steering.fee_legs {
-                    let leg_usd = waterfall.perennia_total_cut_usd * leg.share_ratio;
-                    let leg_spot = if leg.asset == pay_asset {
-                        pay_spot
-                    } else if leg.asset == receive_asset {
-                        receive_spot
-                    } else if leg.asset == "KAS" {
-                        kas_spot
-                    } else {
-                        1.0
-                    };
-                    let leg_tokens = if leg_spot > 0.0 {
-                        leg_usd / leg_spot
-                    } else {
-                        leg_usd
-                    };
-                    if leg.asset != "USDC" {
-                        let _: redis::RedisResult<()> = redis::cmd("INCRBYFLOAT")
-                            .arg(format!("perennia:fees:batch_accumulated:{}", leg.asset))
-                            .arg(leg_tokens)
-                            .query_async(&mut conn)
-                            .await;
-                    }
-                }
-                let _: redis::RedisResult<()> = redis::cmd("INCRBYFLOAT")
-                    .arg(format!("perennia:lp:pending_yield_usd:{}", target_distribution_pair))
-                    .arg(waterfall.lp_allocated_fee_usd)
-                    .query_async(&mut conn)
-                    .await;
-                let direction = if pay_asset == "KAS" {
-                    "SELL_KAS"
-                } else if receive_asset == "KAS" {
-                    "BUY_KAS"
-                } else {
-                    "CROSS_ASSET"
-                };
-                let kas_equiv: f64 = if pay_asset == "KAS" {
-                    amount
-                } else if kas_spot > 0.0_f64 {
-                    gross_usd / kas_spot
-                } else {
-                    estimated_output
-                };
-                let queued_at_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as i64;
-                let netting_order = json!({
-                    "tx_uuid": tx_uuid,
-                    "wallet": prefixed_wallet,
-                    "direction": direction,
-                    "pay_asset": pay_asset,
-                    "receive_asset": receive_asset,
-                    "pay_amount": amount,
-                    "receive_amount": estimated_output,
-                    "amount_kas": kas_equiv,
-                    "gross_usd": gross_usd,
-                    "net_usd": net_usd,
-                    "fee_captured_usd": waterfall.perennia_total_cut_usd,
-                    "total_fee_usd": fee_usd,
-                    "queued_at_ms": queued_at_ms
-                });
-                let _: redis::RedisResult<()> = redis::cmd("RPUSH")
-                    .arg("perennia:sor:netting_queue")
-                    .arg(netting_order.to_string())
-                    .query_async(&mut conn)
-                    .await;
+    let is_l1_cow_token = matches!(
+        receive_asset.as_str(),
+        "SILO" | "PERX" | "KUSDT" | "NACHO" | "BEDRCK"
+    );
+    let mut htlc_covenant_json = Value::Null;
+    let (route_type, target_l1_dest) = if req.htlc_sha256_hashlock_hex.is_some()
+        || (!is_l1_cow_token
+            && matches!(receive_asset.as_str(), "USDC" | "USDT")
+            && matches!(
+                req.target_network.as_deref().map(|s| s.to_uppercase()).as_deref(),
+                Some("BASE") | Some("SOL") | Some("ARB")
+            ))
+    {
+        let hl_hex = req.htlc_sha256_hashlock_hex.clone().unwrap_or_else(|| {
+            blake3::hash(format!("SOR-HTLC:{}:{}", tx_uuid, clean_wallet).as_bytes())
+                .to_hex()
+                .to_string()
+        });
+        let mut hl_arr = [0u8; 32];
+        if let Ok(b) = hex::decode(hl_hex.trim().trim_start_matches("0x")) {
+            if b.len() == 32 {
+                hl_arr.copy_from_slice(&b);
             }
         }
+        let (_, owner_pk) =
+            crate::state_api::decode_kaspa_address_payload(&prefixed_wallet).unwrap();
+        let mut cp_pk = owner_pk;
+        if let Some(ref cpk) = req.counterparty_pubkey_hex {
+            if let Ok(b) = hex::decode(cpk.trim().trim_start_matches("0x")) {
+                if b.len() == 32 {
+                    cp_pk.copy_from_slice(&b);
+                }
+            }
+        }
+        let v_daa = crate::kaspad_client::get_virtual_daa_score_grpc()
+            .await
+            .unwrap_or(0);
+        let htlc = crate::chronos::build_kaspa_opsha256_htlc_covenant(
+            &hl_arr,
+            &cp_pk,
+            &owner_pk,
+            v_daa.saturating_add(crate::chronos::DEFAULT_HTLC_DAA_REFUND_DELTA),
+        );
+        let p2sh_addr = htlc.p2sh_address.clone();
+        htlc_covenant_json = serde_json::to_value(htlc).unwrap_or(Value::Null);
+        ("CROSS_CHAIN_OPSHA256_HTLC", p2sh_addr)
+    } else if is_l1_cow_token {
+        let dest = if house_revenue_addr.starts_with("kaspa:") {
+            house_revenue_addr.clone()
+        } else {
+            prefixed_wallet.clone()
+        };
+        ("L1_COW_ATOMIC_PSKT", dest)
+    } else {
+        let dest = req
+            .destination_address
+            .clone()
+            .filter(|s| s.starts_with("kaspa:"))
+            .unwrap_or_else(|| {
+                if house_revenue_addr.starts_with("kaspa:") {
+                    house_revenue_addr.clone()
+                } else {
+                    prefixed_wallet.clone()
+                }
+            });
+        ("TIER3_CHANGENOW_SPLIT_PSKT", dest)
+    };
+
+    let Some((mut psbt, formatted_utxos)) =
+        assemble_unsigned_kaspa_psbt(&prefixed_wallet, &target_l1_dest, pay_sompi, &utxo_list)
+    else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "INSUFFICIENT_CONFIRMED_UTXOS: Wallet UTXOs do not cover requested KAS sompi + Post-Toccata Transaction v1 fee."
+            })),
+        );
+    };
+    if let Some(obj) = psbt.as_object_mut() {
+        obj.insert("version".to_string(), json!(1));
     }
-    let _ = (&req.slippage_tolerance, &req.system_mode);
+
     (
         StatusCode::OK,
         Json(json!({
             "success": true,
-            "transaction_uuid": tx_uuid,
-            "unifiedRate": unified_rate,
-            "unified_rate": unified_rate,
-            "estimatedOutput": estimated_output,
-            "estimated_output": estimated_output,
-            "feeRate": fee_rate,
-            "fee_rate": fee_rate,
+            "transactionUuid": tx_uuid,
+            "routeType": route_type,
+            "amountInAtomic": amount_in_atomic.to_string(),
+            "protocolFeeAtomic": protocol_fee_atomic.to_string(),
+            "networkFeeSompi": "0",
+            "estimatedOutputAtomic": estimated_out_atomic.to_string(),
+            "minOutputAtomic": min_out_atomic.to_string(),
+            "feeBps": fee_bps,
             "feeTierLabel": fee_tier_label,
-            "feeUsd": fee_usd,
-            "fee_usd": fee_usd,
+            "grossUsdMicros": gross_usd_micros.to_string(),
+            "netUsdMicros": net_usd_micros.to_string(),
+            "payOracleUsdE8": pay_usd_e8.to_string(),
+            "receiveOracleUsdE8": receive_usd_e8.to_string(),
+            "kasOracleUsdE8": kas_usd_e8.to_string(),
+            "refundKaspaAddress": req.refund_kaspa_address.unwrap_or_else(|| prefixed_wallet.clone()),
             "tokenSteering": steering,
-            "dynamicHurdleWaterfall": waterfall,
-            "anchorLayerSweep": anchor_layer_sweep,
-            "legs": [
-                {
-                    "tier": 1,
-                    "provider": provider_label,
-                    "filledAmount": amount,
-                    "executionRate": unified_rate,
-                    "marginCaptured": fee_usd
-                }
-            ],
-            "psbt": Value::Null,
-            "formattedUtxos": []
+            "pskt": psbt,
+            "htlcCovenant": htlc_covenant_json,
+            "formattedUtxos": formatted_utxos
         })),
     )
 }

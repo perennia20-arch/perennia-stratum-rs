@@ -272,3 +272,104 @@ fn rehearsal_4_verify_batch2_toccata_vault_zk_guard_and_changenow_split() {
     assert_eq!(payin_sompi, 9_949_700_000);
     assert_eq!(payin_sompi + house_fee_sompi + 300_000, 10_000_000_000);
 }
+
+#[test]
+fn rehearsal_5_verify_batch3_cow_htlc_tier2_bid_invariants_and_zktls_0x20() {
+    let hl = [0x11u8; 32];
+    let claim_pk = [0x22u8; 32];
+    let refund_pk = [0x33u8; 32];
+    let htlc = chronos::build_kaspa_opsha256_htlc_covenant(&hl, &claim_pk, &refund_pk, 123_456_789);
+    let script_bytes = hex::decode(&htlc.redeem_script_hex).unwrap();
+    assert!(htlc.p2sh_address.starts_with("kaspa:"));
+    assert!(htlc.p2sh_spk_hex.starts_with("a9"));
+    assert!(htlc.p2sh_spk_hex.ends_with("87"));
+    assert_eq!(htlc.sig_op_count, 2);
+    // Exact OpIf OpSHA256 ... OpElse <daa> OpCheckLockTimeVerify OpDrop ... OpEndIf
+    assert_eq!(script_bytes[0], 0x63);
+    assert_eq!(script_bytes[1], 0xa8);
+    assert!(script_bytes.windows(3).any(|w| w == [0xb0, 0x75, 0x20]));
+    assert_eq!(*script_bytes.last().unwrap(), 0x68);
+
+    // Tier 2 Solver Bid Invariants: must beat ChangeNOW floor by >= 10 bps, house fee 50..=75 bps
+    assert!(chronos::verify_tier2_solver_bid_invariants(
+        100_000_000,
+        100_050_000, // only +5 bps
+        100_000_000_000,
+        50,
+    )
+    .is_err());
+    assert!(chronos::verify_tier2_solver_bid_invariants(
+        100_000_000,
+        100_200_000,
+        100_000_000_000,
+        49, // below 50 bps
+    )
+    .is_err());
+    let (min_req, house_fee) = chronos::verify_tier2_solver_bid_invariants(
+        100_000_000,
+        100_150_000, // +15 bps
+        100_000_000_000,
+        60, // 0.60%
+    )
+    .unwrap();
+    assert_eq!(min_req, 100_100_000);
+    assert_eq!(house_fee, 600_000_000);
+
+    // Sequential 4-Valve Thermostat Conservation
+    let valves = vec![
+        chronos::ThermostatValveRule {
+            priority_order: 2,
+            valve_type: "VALVE_2_AGENT_X402_FLOOR".to_string(),
+            target_asset: "USDC".to_string(),
+            target_network: "BASE".to_string(),
+            destination_address: "0xagent".to_string(),
+            target_cap_sompi: 2_000_000_000,
+            target_cap_usd_micros: 0,
+            filled_epoch_sompi: 0,
+            filled_epoch_usd_micros: 0,
+            zktls_biller_commitment_hex: None,
+            is_enabled: true,
+        },
+        chronos::ThermostatValveRule {
+            priority_order: 1,
+            valve_type: "VALVE_1_ELECTRIC_BILL".to_string(),
+            target_asset: "USD".to_string(),
+            target_network: "ZKTLS".to_string(),
+            destination_address: "biller_1".to_string(),
+            target_cap_sompi: 3_000_000_000,
+            target_cap_usd_micros: 0,
+            filled_epoch_sompi: 500_000_000,
+            filled_epoch_usd_micros: 0,
+            zktls_biller_commitment_hex: Some("aa".repeat(32)),
+            is_enabled: true,
+        },
+        chronos::ThermostatValveRule {
+            priority_order: 4,
+            valve_type: "VALVE_4_TANGEM_COLD_OR_PLANT".to_string(),
+            target_asset: "KAS".to_string(),
+            target_network: "KAS".to_string(),
+            destination_address: "kaspa:cold".to_string(),
+            target_cap_sompi: 0,
+            target_cap_usd_micros: 0,
+            filled_epoch_sompi: 0,
+            filled_epoch_usd_micros: 0,
+            zktls_biller_commitment_hex: None,
+            is_enabled: true,
+        },
+    ];
+    let allocs = chronos::route_sompi_across_thermostat_valves(10_000_000_000, 15_000_000, &valves);
+    assert_eq!(allocs.len(), 3);
+    assert_eq!(allocs[0].priority_order, 1);
+    assert_eq!(allocs[0].allocated_sompi, 2_500_000_000);
+    assert_eq!(allocs[1].priority_order, 2);
+    assert_eq!(allocs[1].allocated_sompi, 2_000_000_000);
+    assert_eq!(allocs[2].priority_order, 4);
+    assert_eq!(allocs[2].allocated_sompi, 5_500_000_000);
+    assert_eq!(
+        allocs.iter().map(|a| a.allocated_sompi).sum::<u128>(),
+        10_000_000_000
+    );
+
+    assert_eq!(state_api::validate_zk_precompile_tag(0x20), Ok(0x20));
+    assert!(state_api::validate_zk_precompile_tag(0x21).is_err());
+}

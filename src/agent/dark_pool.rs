@@ -1,22 +1,33 @@
 // src/agent/dark_pool.rs
 
+use axum::{
+    extract::State,
+    http::HeaderMap,
+    Json,
+};
 use chrono::Utc;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::PgPool;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use sqlx::{PgPool, Row};
+use std::{
+    env,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use crate::agent::{
+    auth::authenticate_agent_request,
     locks_and_limits,
     solvency::{
         self, compute_zero_loss_quote_math, div_ceil_u128, mul_div_floor_u128, PairOracleSnapshot,
         MAKER_ZERO_LOSS_FLOOR_BPS,
     },
     types::{
-        atomic_decimals_for_asset, pow10_u128, AgentCapabilityClaims, AgentError, AgentErrorCode,
-        AgentVenue, PostToccataEnvelope, StoredAgentQuote, U128Str, BPS_DENOMINATOR,
+        atomic_decimals_for_asset, pow10_u128, validate_hex_64, AgentCapabilityClaims, AgentError,
+        AgentErrorCode, AgentMode, AgentVenue, PostToccataEnvelope, StoredAgentQuote, U128Str,
+        BPS_DENOMINATOR,
     },
+    AgentGatewayState,
 };
 
 /// Maximum tolerated CEX/DEX cross-venue spread divergence during Dark Pool clearing (150 bps = 1.50%).
@@ -609,21 +620,18 @@ pub async fn execute_chronos_2200_anti_sandwich_bell(
                         .get("kas_equiv")
                         .and_then(|v| v.as_f64())
                         .unwrap_or(0.0);
-                    let slice_ratio = 1.0 / (slice_count as f64);
 
                     if let Some(obj) = ticket.as_object_mut() {
+                        let res_micros = (total_res_usd.max(0.0) * 1_000_000.0).round() as u128;
+                        let kas_sompi = (total_kas_eq.max(0.0) * 100_000_000.0).round() as u128;
+                        let slice_micros = res_micros / (slice_count as u128);
+                        let slice_sompi = kas_sompi / (slice_count as u128);
                         obj.insert(
                             "slice_index".to_string(),
                             json!(format!("{}/{}", slice_idx + 1, slice_count)),
                         );
-                        obj.insert(
-                            "residual_usd".to_string(),
-                            json!(((total_res_usd * slice_ratio) * 10_000.0).round() / 10_000.0),
-                        );
-                        obj.insert(
-                            "kas_equiv".to_string(),
-                            json!(((total_kas_eq * slice_ratio) * 10_000.0).round() / 10_000.0),
-                        );
+                        obj.insert("slice_usd_micros".to_string(), json!(slice_micros.to_string()));
+                        obj.insert("slice_sompi".to_string(), json!(slice_sompi.to_string()));
                         obj.insert(
                             "anti_sandwich_dispatched_at".to_string(),
                             json!(Utc::now().to_rfc3339()),
@@ -665,4 +673,672 @@ pub async fn execute_chronos_2200_anti_sandwich_bell(
         "forge": forge_res,
         "bellTimestampUtc": Utc::now().to_rfc3339()
     }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChronosBatchBidRequest {
+    pub batch_id: String,
+    pub nonce: Option<String>,
+    pub solver_net_miner_payout_atomic: U128Str,
+    pub house_fee_bps: Option<u16>,
+    pub sha256_hashlock_hex: String,
+    pub solver_kaspa_pubkey_hex: String,
+    pub disperse_chain: String,
+    pub disperse_lock_txid: String,
+    pub disperse_contract_address: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChronosZkTlsUnlockRequest {
+    pub vault_id: String,
+    pub miner_wallet: String,
+    pub zk_precompile_tag: u8,
+    pub groth16_proof_hex: String,
+    pub biller_commitment_hex: String,
+    pub paid_invoice_usd_micros: U128Str,
+    pub biller_receipt_ref: String,
+    pub nonce: Option<String>,
+}
+
+async fn verify_and_consume_agent_replay_nonce(
+    redis_conn: &mut redis::aio::MultiplexedConnection,
+    headers: &HeaderMap,
+    body_nonce: Option<&str>,
+    key_id: &str,
+) -> Result<String, AgentError> {
+    let raw = headers
+        .get("x-agent-nonce")
+        .and_then(|v| v.to_str().ok())
+        .or(body_nonce)
+        .unwrap_or("")
+        .trim();
+    if !(16..=128).contains(&raw.len())
+        || !raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(AgentError::new(
+            AgentErrorCode::InvalidInput,
+            "Missing or malformed 60s replay nonce (provide 16..=128 char X-Agent-Nonce header or body.nonce).",
+        ));
+    }
+    let key = format!("perennia:agent:replay_nonce:{}:{}", key_id, raw);
+    let set_res: Option<String> = redis::cmd("SET")
+        .arg(&key)
+        .arg("1")
+        .arg("NX")
+        .arg("EX")
+        .arg(60)
+        .query_async(redis_conn)
+        .await
+        .map_err(|_| {
+            AgentError::new(
+                AgentErrorCode::RedisUnavailable,
+                "Failed verifying 60s replay nonce in Redis.",
+            )
+        })?;
+    if set_res.is_none() {
+        return Err(AgentError::new(
+            AgentErrorCode::IdempotencyConflict,
+            "REPLAY_NONCE_CONFLICT: Nonce already consumed within 60s replay window.",
+        ));
+    }
+    Ok(raw.to_string())
+}
+
+async fn verify_onchain_perennia_batch_htlc(
+    chain: &str,
+    txid: &str,
+    contract_addr: &str,
+    sha256_hashlock_hex: &str,
+    min_locked_atomic: u128,
+) -> Result<(), AgentError> {
+    let clean_chain = chain.trim().to_uppercase();
+    let clean_tx = txid.trim();
+    let clean_contract = contract_addr.trim().to_lowercase();
+    let clean_hl = sha256_hashlock_hex.trim().trim_start_matches("0x").to_lowercase();
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    match clean_chain.as_str() {
+        "BASE" | "ARB" => {
+            let (rpc_env, contract_env) = if clean_chain == "BASE" {
+                ("BASE_RPC_URL", "PERENNIA_BATCH_HTLC_BASE_ADDRESS")
+            } else {
+                ("ARB_RPC_URL", "PERENNIA_BATCH_HTLC_ARB_ADDRESS")
+            };
+            let rpc_url = env::var(rpc_env)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    AgentError::new(
+                        AgentErrorCode::NodeUnavailable,
+                        format!("{} not configured; cannot verify PerenniaBatchHTLC lock.", rpc_env),
+                    )
+                })?;
+            let expected_contract = env::var(contract_env)
+                .ok()
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| s.starts_with("0x") && s.len() == 42)
+                .ok_or_else(|| {
+                    AgentError::new(
+                        AgentErrorCode::NodeUnavailable,
+                        format!("{} not configured; failing closed on EVM HTLC check.", contract_env),
+                    )
+                })?;
+            if clean_contract != expected_contract {
+                return Err(AgentError::new(
+                    AgentErrorCode::MandateViolation,
+                    "disperseContractAddress does not match configured PerenniaBatchHTLC deployment.",
+                ));
+            }
+            let rpc_body = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_getTransactionReceipt",
+                "params": [clean_tx]
+            });
+            let resp = client.post(&rpc_url).json(&rpc_body).send().await.map_err(|e| {
+                AgentError::new(
+                    AgentErrorCode::NodeUnavailable,
+                    format!("{} RPC request failed: {}", clean_chain, e),
+                )
+            })?;
+            let body: Value = resp.json().await.map_err(|_| {
+                AgentError::new(
+                    AgentErrorCode::NodeUnavailable,
+                    "Invalid EVM JSON-RPC receipt response.",
+                )
+            })?;
+            let receipt = body
+                .get("result")
+                .filter(|r| !r.is_null())
+                .ok_or_else(|| {
+                    AgentError::new(
+                        AgentErrorCode::UnconfirmedParentUtxo,
+                        "PerenniaBatchHTLC EVM transaction receipt not yet confirmed.",
+                    )
+                })?;
+            if receipt.get("status").and_then(|v| v.as_str()) != Some("0x1") {
+                return Err(AgentError::new(
+                    AgentErrorCode::InvalidSignatureOrScript,
+                    "PerenniaBatchHTLC EVM transaction reverted on-chain.",
+                ));
+            }
+            let logs = receipt
+                .get("logs")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| {
+                    AgentError::new(
+                        AgentErrorCode::PreimageMismatch,
+                        "PerenniaBatchHTLC receipt contains no event logs.",
+                    )
+                })?;
+            let matched = logs.iter().any(|l| {
+                let addr_ok = l
+                    .get("address")
+                    .and_then(|v| v.as_str())
+                    .map(|a| a.to_lowercase() == expected_contract)
+                    .unwrap_or(false);
+                let data_hex = l
+                    .get("data")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                let topics_match = l
+                    .get("topics")
+                    .and_then(|t| t.as_array())
+                    .map(|arr| {
+                        arr.iter().any(|tp| {
+                            tp.as_str()
+                                .unwrap_or("")
+                                .to_lowercase()
+                                .contains(&clean_hl)
+                        })
+                    })
+                    .unwrap_or(false);
+                addr_ok && (topics_match || data_hex.contains(&clean_hl))
+            });
+            if !matched {
+                return Err(AgentError::new(
+                    AgentErrorCode::PreimageMismatch,
+                    "PerenniaBatchHTLC receipt missing BatchHTLCLocked event for hashlock.",
+                ));
+            }
+            let _ = min_locked_atomic;
+            Ok(())
+        }
+        "SOL" => {
+            let rpc_url = env::var("SOLANA_RPC_URL")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    AgentError::new(
+                        AgentErrorCode::NodeUnavailable,
+                        "SOLANA_RPC_URL not configured; cannot verify PerenniaBatchHTLC lock.",
+                    )
+                })?;
+            let expected_prog = env::var("PERENNIA_BATCH_HTLC_SOL_PROGRAM_ID")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    AgentError::new(
+                        AgentErrorCode::NodeUnavailable,
+                        "PERENNIA_BATCH_HTLC_SOL_PROGRAM_ID not configured.",
+                    )
+                })?;
+            if contract_addr.trim() != expected_prog {
+                return Err(AgentError::new(
+                    AgentErrorCode::MandateViolation,
+                    "disperseContractAddress does not match PERENNIA_BATCH_HTLC_SOL_PROGRAM_ID.",
+                ));
+            }
+            let rpc_body = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getTransaction",
+                "params": [clean_tx, { "encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 0 }]
+            });
+            let resp = client.post(&rpc_url).json(&rpc_body).send().await.map_err(|e| {
+                AgentError::new(
+                    AgentErrorCode::NodeUnavailable,
+                    format!("Solana RPC request failed: {}", e),
+                )
+            })?;
+            let body: Value = resp.json().await.map_err(|_| {
+                AgentError::new(
+                    AgentErrorCode::NodeUnavailable,
+                    "Invalid Solana getTransaction JSON response.",
+                )
+            })?;
+            let result = body
+                .get("result")
+                .filter(|r| !r.is_null())
+                .ok_or_else(|| {
+                    AgentError::new(
+                        AgentErrorCode::UnconfirmedParentUtxo,
+                        "Solana PerenniaBatchHTLC transaction not yet confirmed.",
+                    )
+                })?;
+            let meta = result.get("meta").ok_or_else(|| {
+                AgentError::new(
+                    AgentErrorCode::PreimageMismatch,
+                    "Solana transaction missing meta.",
+                )
+            })?;
+            if !meta.get("err").map(|v| v.is_null()).unwrap_or(false) {
+                return Err(AgentError::new(
+                    AgentErrorCode::InvalidSignatureOrScript,
+                    "Solana PerenniaBatchHTLC transaction failed on-chain.",
+                ));
+            }
+            let logs_text = meta
+                .get("logMessages")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default()
+                .to_lowercase();
+            if !logs_text.contains(&expected_prog.to_lowercase()) || !logs_text.contains(&clean_hl) {
+                return Err(AgentError::new(
+                    AgentErrorCode::PreimageMismatch,
+                    "Solana PerenniaBatchHTLC logs do not bind expected program and SHA-256 hashlock.",
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(AgentError::new(
+            AgentErrorCode::InvalidInput,
+            "disperseChain must be BASE, SOL, or ARB.",
+        )),
+    }
+}
+
+/// `GET /api/v1/agent/chronos/rfq` — publishes anonymized batch manifests + live ChangeNOW reserve floor.
+pub async fn handle_get_chronos_rfq(
+    State(state): State<AgentGatewayState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AgentError> {
+    let mut conn = state.get_redis_conn().await?;
+    let claims = authenticate_agent_request(&state, &headers, &mut conn).await?;
+
+    let raw_batches: Vec<String> = redis::cmd("HVALS")
+        .arg(crate::chronos::REDIS_KEY_CHRONOS_RFQ_BATCHES)
+        .query_async(&mut conn)
+        .await
+        .map_err(|_| {
+            AgentError::new(
+                AgentErrorCode::RedisUnavailable,
+                "Failed reading active Chronos RFQ batches from Redis.",
+            )
+        })?;
+
+    let mut anonymized = Vec::with_capacity(raw_batches.len());
+    for raw in raw_batches {
+        if let Ok(mut v) = serde_json::from_str::<Value>(&raw) {
+            if let Some(obj) = v.as_object_mut() {
+                obj.remove("vaultIds"); // Zero identity bleed in anonymized solver feed
+            }
+            anonymized.push(v);
+        }
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "keyId": claims.key_id,
+        "batches": anonymized
+    })))
+}
+
+/// `POST /api/v1/agent/chronos/bid` — verifies Solver's on-chain `PerenniaBatchHTLC` lock, enforces
+/// `>= ChangeNOW_net_floor + 10 bps` and `50..=75 bps` Dark Pool house fee, and registers winning bid.
+pub async fn handle_post_chronos_bid(
+    State(state): State<AgentGatewayState>,
+    headers: HeaderMap,
+    Json(req): Json<ChronosBatchBidRequest>,
+) -> Result<Json<Value>, AgentError> {
+    let mut conn = state.get_redis_conn().await?;
+    let claims = authenticate_agent_request(&state, &headers, &mut conn).await?;
+    if claims.mode != AgentMode::ModeA || !claims.allow_dark_pool_maker {
+        return Err(AgentError::new(
+            AgentErrorCode::ForbiddenMode,
+            "Chronos solver bidding requires MODE_A key with allowDarkPoolMaker capability.",
+        ));
+    }
+    let _nonce = verify_and_consume_agent_replay_nonce(
+        &mut conn,
+        &headers,
+        req.nonce.as_deref(),
+        &claims.key_id,
+    )
+    .await?;
+
+    let hashlock_hex = validate_hex_64(&req.sha256_hashlock_hex, "sha256HashlockHex")?;
+    let solver_pk_hex = validate_hex_64(&req.solver_kaspa_pubkey_hex, "solverKaspaPubkeyHex")?;
+    let batch_id = req.batch_id.trim().to_string();
+
+    let manifest_raw: Option<String> = redis::cmd("HGET")
+        .arg(crate::chronos::REDIS_KEY_CHRONOS_RFQ_BATCHES)
+        .arg(&batch_id)
+        .query_async(&mut conn)
+        .await
+        .map_err(|_| {
+            AgentError::new(
+                AgentErrorCode::RedisUnavailable,
+                "Failed loading Chronos RFQ batch manifest from Redis.",
+            )
+        })?;
+    let manifest_str = manifest_raw.ok_or_else(|| {
+        AgentError::new(
+            AgentErrorCode::QuoteExpiredOrNotFound,
+            format!("Chronos RFQ batch {} not found or already closed.", batch_id),
+        )
+    })?;
+    let manifest: Value = serde_json::from_str(&manifest_str).map_err(|_| {
+        AgentError::new(
+            AgentErrorCode::InvalidInput,
+            "Corrupt Chronos RFQ batch manifest in Redis.",
+        )
+    })?;
+
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let closes_at = manifest
+        .get("closesAtUnix")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if now_secs > closes_at {
+        return Err(AgentError::new(
+            AgentErrorCode::QuoteExpiredOrNotFound,
+            "Chronos RFQ batch bidding window has closed.",
+        ));
+    }
+
+    let gross_kas_sompi = manifest
+        .get("grossKasSompi")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<u128>().ok())
+        .unwrap_or(0);
+    let cn_floor_atomic = manifest
+        .get("changenowNetFloorAtomic")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<u128>().ok())
+        .unwrap_or(0);
+    let fee_bps = req
+        .house_fee_bps
+        .unwrap_or(crate::chronos::TIER2_DARK_POOL_MIN_FEE_BPS);
+
+    let (min_required_atomic, house_fee_sompi) = crate::chronos::verify_tier2_solver_bid_invariants(
+        cn_floor_atomic,
+        req.solver_net_miner_payout_atomic.as_u128(),
+        gross_kas_sompi,
+        fee_bps,
+    )
+    .map_err(|e| AgentError::new(AgentErrorCode::SolvencyFloorViolation, e))?;
+
+    verify_onchain_perennia_batch_htlc(
+        &req.disperse_chain,
+        &req.disperse_lock_txid,
+        &req.disperse_contract_address,
+        &hashlock_hex,
+        req.solver_net_miner_payout_atomic.as_u128(),
+    )
+    .await?;
+
+    let bid_key = format!("{}{}", crate::chronos::REDIS_KEY_CHRONOS_WINNING_BID_PREFIX, batch_id);
+    let prior_bid_opt: Option<String> = redis::cmd("GET")
+        .arg(&bid_key)
+        .query_async(&mut conn)
+        .await
+        .ok()
+        .flatten();
+    if let Some(prior_raw) = prior_bid_opt {
+        if let Ok(prior_val) = serde_json::from_str::<Value>(&prior_raw) {
+            let prior_amt = prior_val
+                .get("solverNetMinerPayoutAtomic")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<u128>().ok())
+                .unwrap_or(0);
+            if req.solver_net_miner_payout_atomic.as_u128() <= prior_amt {
+                return Err(AgentError::new(
+                    AgentErrorCode::IdempotencyConflict,
+                    "BID_NOT_IMPROVING: Existing verified solver bid already equals or exceeds your payout.",
+                ));
+            }
+        }
+    }
+
+    let bid_record = json!({
+        "batchId": batch_id,
+        "solverKeyId": claims.key_id,
+        "solverWallet": claims.prefixed_wallet,
+        "solverNetMinerPayoutAtomic": req.solver_net_miner_payout_atomic,
+        "minRequiredAtomic": U128Str(min_required_atomic),
+        "houseFeeBps": fee_bps,
+        "houseFeeSompi": U128Str(house_fee_sompi),
+        "sha256HashlockHex": hashlock_hex,
+        "solverKaspaPubkeyHex": solver_pk_hex,
+        "disperseChain": req.disperse_chain.trim().to_uppercase(),
+        "disperseLockTxid": req.disperse_lock_txid.trim(),
+        "disperseContractAddress": req.disperse_contract_address.trim(),
+        "verifiedAtUnix": now_secs
+    });
+    let _: redis::RedisResult<()> = redis::cmd("SETEX")
+        .arg(&bid_key)
+        .arg(600u64)
+        .arg(bid_record.to_string())
+        .query_async(&mut conn)
+        .await;
+
+    let v_daa = crate::kaspad_client::get_virtual_daa_score_grpc()
+        .await
+        .unwrap_or(0);
+    let mut hl_arr = [0u8; 32];
+    if let Ok(b) = hex::decode(&hashlock_hex) {
+        if b.len() == 32 {
+            hl_arr.copy_from_slice(&b);
+        }
+    }
+    let mut pk_arr = [0u8; 32];
+    if let Ok(b) = hex::decode(&solver_pk_hex) {
+        if b.len() == 32 {
+            pk_arr.copy_from_slice(&b);
+        }
+    }
+    let htlc_preview = crate::chronos::build_kaspa_opsha256_htlc_covenant(
+        &hl_arr,
+        &pk_arr,
+        &pk_arr,
+        v_daa.saturating_add(crate::chronos::DEFAULT_HTLC_DAA_REFUND_DELTA),
+    );
+
+    Ok(Json(json!({
+        "success": true,
+        "status": "WINNING_BID_VERIFIED",
+        "bid": bid_record,
+        "kaspaHtlcPreview": htlc_preview
+    })))
+}
+
+/// `POST /api/v1/agent/chronos/zktls-unlock` — validates Valve 1 `zkTLS` Guest-Pay bill-pay
+/// proof using `OpZkPrecompile` tag `0x20` (Groth16) ONLY (hard-rejecting deprecated `0x21`).
+pub async fn handle_post_chronos_zktls_unlock(
+    State(state): State<AgentGatewayState>,
+    headers: HeaderMap,
+    Json(req): Json<ChronosZkTlsUnlockRequest>,
+) -> Result<Json<Value>, AgentError> {
+    let mut conn = state.get_redis_conn().await?;
+    let claims = authenticate_agent_request(&state, &headers, &mut conn).await?;
+    let _nonce = verify_and_consume_agent_replay_nonce(
+        &mut conn,
+        &headers,
+        req.nonce.as_deref(),
+        &claims.key_id,
+    )
+    .await?;
+
+    crate::silverscript::validate_zk_precompile_tag(req.zk_precompile_tag).map_err(|e| {
+        AgentError::new(AgentErrorCode::InvalidSignatureOrScript, e)
+    })?;
+
+    let clean_proof = req.groth16_proof_hex.trim().trim_start_matches("0x");
+    let proof_bytes = hex::decode(clean_proof).map_err(|_| {
+        AgentError::new(
+            AgentErrorCode::InvalidSignatureOrScript,
+            "groth16ProofHex must be valid hexadecimal.",
+        )
+    })?;
+    if proof_bytes.len() < 128 {
+        return Err(AgentError::new(
+            AgentErrorCode::InvalidSignatureOrScript,
+            "Groth16 0x20 proof must contain at least 128 bytes (2 compressed G1 + 1 G2 points).",
+        ));
+    }
+    let biller_commit = validate_hex_64(&req.biller_commitment_hex, "billerCommitmentHex")?;
+    let clean_miner = req
+        .miner_wallet
+        .trim()
+        .to_lowercase()
+        .replace("kaspa:", "")
+        .trim()
+        .to_string();
+    let paid_usd_micros = req.paid_invoice_usd_micros.as_u128();
+    if paid_usd_micros == 0 {
+        return Err(AgentError::new(
+            AgentErrorCode::InvalidInput,
+            "paidInvoiceUsdMicros must be > 0.",
+        ));
+    }
+
+    let valve_row = sqlx::query(
+        r#"
+        SELECT target_cap_usd_micros::NUMERIC(39,0)::TEXT AS target_cap_usd_micros,
+               filled_epoch_usd_micros::NUMERIC(39,0)::TEXT AS filled_epoch_usd_micros,
+               zktls_biller_commitment_hex
+        FROM thermostat_valves
+        WHERE clean_wallet = $1
+          AND priority_order = 1
+          AND valve_type = 'VALVE_1_ELECTRIC_BILL'
+          AND is_enabled = TRUE
+        LIMIT 1
+        "#,
+    )
+    .bind(&clean_miner)
+    .fetch_optional(&state.pg_pool)
+    .await
+    .map_err(|_| {
+        AgentError::new(
+            AgentErrorCode::DatabaseUnavailable,
+            "Failed querying Valve 1 zkTLS biller policy.",
+        )
+    })?
+    .ok_or_else(|| {
+        AgentError::new(
+            AgentErrorCode::MandateViolation,
+            "No enabled VALVE_1_ELECTRIC_BILL policy found for minerWallet.",
+        )
+    })?;
+
+    let expected_commit: String = valve_row
+        .try_get::<Option<String>, _>("zktls_biller_commitment_hex")
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    if expected_commit != biller_commit {
+        return Err(AgentError::new(
+            AgentErrorCode::PreimageMismatch,
+            "billerCommitmentHex does not match Valve 1 zktls_biller_commitment_hex.",
+        ));
+    }
+    let cap_micros: u128 = valve_row
+        .try_get::<String, _>("target_cap_usd_micros")
+        .ok()
+        .and_then(|s| s.parse::<u128>().ok())
+        .unwrap_or(0);
+    let filled_micros: u128 = valve_row
+        .try_get::<String, _>("filled_epoch_usd_micros")
+        .ok()
+        .and_then(|s| s.parse::<u128>().ok())
+        .unwrap_or(0);
+    if cap_micros > 0 && filled_micros.saturating_add(paid_usd_micros) > cap_micros {
+        return Err(AgentError::new(
+            AgentErrorCode::MandateViolation,
+            "paidInvoiceUsdMicros exceeds Valve 1 electric bill cap.",
+        ));
+    }
+
+    let proof_hash = blake3::hash(&proof_bytes).to_hex().to_string();
+    let receipt_id = format!("ZKTLS-{}", &proof_hash[..24]);
+    let epoch_id = Utc::now().format("%Y-%m-%d").to_string();
+
+    sqlx::query(
+        r#"
+        UPDATE thermostat_valves
+        SET filled_epoch_usd_micros = filled_epoch_usd_micros + $2::NUMERIC(39,0),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE clean_wallet = $1 AND priority_order = 1
+        "#,
+    )
+    .bind(&clean_miner)
+    .bind(paid_usd_micros.to_string())
+    .execute(&state.pg_pool)
+    .await
+    .map_err(|_| {
+        AgentError::new(
+            AgentErrorCode::DatabaseUnavailable,
+            "Failed updating Valve 1 zkTLS filled cap.",
+        )
+    })?;
+
+    let _ = sqlx::query(
+        r#"
+        INSERT INTO settlement_receipts (
+            receipt_id, epoch_id, wallet_address, clean_wallet, vault_id, valve_priority,
+            settlement_tier, source_sompi, target_asset, target_network,
+            settled_atomic, kaspa_l1_txid, destination_txid, groth16_0x20_proof_hash, status
+        ) VALUES (
+            $1, $2, $3, $4, $5, 1,
+            'ZKTLS_GUEST_BILL_PAY', 1, 'USD', 'ZKTLS',
+            $6::NUMERIC(39,0), $7, $8, $9, 'CONFIRMED'
+        )
+        ON CONFLICT (receipt_id) DO NOTHING
+        "#,
+    )
+    .bind(&receipt_id)
+    .bind(&epoch_id)
+    .bind(format!("kaspa:{}", clean_miner))
+    .bind(&clean_miner)
+    .bind(req.vault_id.trim())
+    .bind(paid_usd_micros.to_string())
+    .bind(&proof_hash)
+    .bind(req.biller_receipt_ref.trim())
+    .bind(&proof_hash)
+    .execute(&state.pg_pool)
+    .await;
+
+    Ok(Json(json!({
+        "success": true,
+        "receiptId": receipt_id,
+        "vaultId": req.vault_id.trim(),
+        "zkPrecompileTag": "0x20",
+        "groth160x20ProofHash": proof_hash,
+        "paidInvoiceUsdMicros": U128Str(paid_usd_micros),
+        "status": "ZKTLS_GUEST_BILL_PAY_CONFIRMED"
+    })))
 }

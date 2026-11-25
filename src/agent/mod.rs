@@ -614,6 +614,18 @@ pub fn agent_public_router(state: AgentGatewayState) -> Router {
         .route("/api/v1/agent/quote", post(handlers::handle_post_quote))
         .route("/api/v1/agent/execute", post(handlers::handle_post_execute))
         .route(
+            "/api/v1/agent/chronos/rfq",
+            get(dark_pool::handle_get_chronos_rfq),
+        )
+        .route(
+            "/api/v1/agent/chronos/bid",
+            post(dark_pool::handle_post_chronos_bid),
+        )
+        .route(
+            "/api/v1/agent/chronos/zktls-unlock",
+            post(dark_pool::handle_post_chronos_zktls_unlock),
+        )
+        .route(
             "/api/v1/agent/me/telemetry",
             get(handlers::handle_get_me_telemetry),
         )

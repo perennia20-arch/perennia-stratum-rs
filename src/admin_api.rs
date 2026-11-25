@@ -63,14 +63,6 @@ struct L1PayoutAdminReq {
     txHash: Option<String>,
 }
 
-const LUA_CLAMPED_FEE_REVERSAL: &str = r#"
-local cur = tonumber(redis.call('GET', KEYS[1]) or '0')
-local rev = tonumber(ARGV[1] or '0')
-local next_val = math.max(0, cur - rev)
-redis.call('SET', KEYS[1], tostring(next_val))
-return tostring(next_val)
-"#;
-
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -190,144 +182,13 @@ async fn handle_netting_lab(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
 
     if action == "SEED_COHORT" {
-        let profit_before: Option<String> = redis::cmd("GET")
-            .arg("perennia:treasury:netting_profit_usd")
-            .query_async(&mut r_conn)
-            .await
-            .unwrap_or(None);
-        let delta_before: Option<String> = redis::cmd("GET")
-            .arg("perennia:treasury:unhedged_delta_kas")
-            .query_async(&mut r_conn)
-            .await
-            .unwrap_or(None);
-        let fees_before: Option<String> = redis::cmd("GET")
-            .arg("perennia:fees:batch_accumulated:USDC")
-            .query_async(&mut r_conn)
-            .await
-            .unwrap_or(None);
-        let _: redis::RedisResult<()> = redis::cmd("DEL")
-            .arg("perennia:sor:netting_queue")
-            .query_async(&mut r_conn)
-            .await;
-
-        if let Some(lp_w) = payload.get("lpAnchorWallet").and_then(|v| v.as_str()) {
-            let lp_clean = lp_w
-                .trim()
-                .to_lowercase()
-                .replace("kaspa:", "")
-                .trim()
-                .to_string();
-            if !lp_clean.is_empty() && lp_clean != master_clean {
-                let lp_pref = format!("kaspa:{}", lp_clean);
-                let _ = sqlx::query(
-                    "DELETE FROM liquidity_providers WHERE wallet_address = $1 OR wallet_address = $2",
-                )
-                .bind(&lp_pref)
-                .bind(&lp_clean)
-                .execute(&pool)
-                .await;
-                for (pair, b_tick, b_amt) in [
-                    ("KAS/USDC", "USDC", 250_000.0_f64),
-                    ("KAS/BTC", "BTC", 5.0_f64),
-                    ("KAS/ETH", "ETH", 80.0_f64),
-                    ("KAS/SOL", "SOL", 1_500.0_f64),
-                ] {
-                    let wj = json!({"KAS": 0.5, b_tick: 0.5});
-                    let rj = json!({"KAS": 1_500_000.0_f64, b_tick: b_amt});
-                    let _ = sqlx::query(
-                        "INSERT INTO liquidity_providers (wallet_address, pool_pair, staked_asset_a, staked_asset_b, weights_json, reserves_json, lock_duration_days, unlock_date) VALUES ($1, $2, 1500000.0, $3, $4, $5, 90, CURRENT_TIMESTAMP + INTERVAL '90 days')",
-                    )
-                    .bind(&lp_pref)
-                    .bind(pair)
-                    .bind(b_amt)
-                    .bind(&wj)
-                    .bind(&rj)
-                    .execute(&pool)
-                    .await;
-                }
-            }
-        }
-
-        let empty_s = vec![];
-        let seats = payload
-            .get("seats")
-            .and_then(|v| v.as_array())
-            .unwrap_or(&empty_s);
-        let mut seeded_count: usize = 0;
-        for s in seats {
-            let clean = s
-                .get("wallet")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_lowercase()
-                .replace("kaspa:", "")
-                .trim()
-                .to_string();
-            if clean.is_empty() || clean == master_clean {
-                continue;
-            }
-            let pref = format!("kaspa:{}", clean);
-            let _ = sqlx::query(
-                "DELETE FROM yield_reservoirs WHERE wallet_address = $1 OR wallet_address = $2",
-            )
-            .bind(&pref)
-            .bind(&clean)
-            .execute(&pool)
-            .await;
-            let _ = sqlx::query(
-                "DELETE FROM user_command_centers WHERE wallet_address = $1 OR wallet_address = $2",
-            )
-            .bind(&pref)
-            .bind(&clean)
-            .execute(&pool)
-            .await;
-            let _: redis::RedisResult<()> = redis::cmd("DEL")
-                .arg(format!("dev:sor:treasury:balances:{}", clean))
-                .query_async(&mut r_conn)
-                .await;
-            if let Some(bals) = s.get("balances").and_then(|v| v.as_object()) {
-                for (tick, val) in bals {
-                    let amt: f64 = val.as_f64().unwrap_or(0.0_f64);
-                    if amt > 0.0_f64 {
-                        let _ = crate::state_api::credit_user_token_balance(
-                            &pool,
-                            &clean,
-                            &pref,
-                            tick,
-                            amt,
-                            tick.eq_ignore_ascii_case("KAS"),
-                        )
-                        .await;
-                    }
-                }
-            }
-            if let Some(sectors) = s.get("sectors") {
-                let layout = json!({ "workers": [], "sectors": sectors, "systemMode": "base" });
-                let _ = sqlx::query(
-                    "INSERT INTO user_command_centers (wallet_address, layout_state, last_updated) VALUES ($1, $2, CURRENT_TIMESTAMP) ON CONFLICT (wallet_address) DO UPDATE SET layout_state = EXCLUDED.layout_state, last_updated = CURRENT_TIMESTAMP",
-                )
-                .bind(&pref)
-                .bind(&layout)
-                .execute(&pool)
-                .await;
-            }
-            seeded_count += 1;
-        }
-        let kas_spot: f64 = crate::fiat_rails::resolve_live_spot_price(&pool, "KAS")
-            .await
-            .unwrap_or(0.15_f64);
-        let _ = crate::chronos::publish_live_epoch_bucket_telemetry(&pool, kas_spot).await;
-        return Ok(Json(json!({
-            "success": true,
-            "seededCount": seeded_count,
-            "kasSpotUsd": kas_spot,
-            "baseline": {
-                "nettingProfitUsd": profit_before,
-                "unhedgedDeltaKas": delta_before,
-                "feesUsdc": fees_before
-            }
-        })));
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "NON_CUSTODIAL_L1_ONLY",
+                "message": "Synthetic yield_reservoirs cohort seeding is retired. Register real Kaspa L1 Vault Locks via REGISTER_VAULT_LOCK."
+            })),
+        ));
     }
 
     if action == "INSPECT_COHORT" {
@@ -352,131 +213,86 @@ async fn handle_netting_lab(
                 }
             }
         }
-        let res_rows = sqlx::query(
-            "SELECT wallet_address, streaming_balance_kas, total_yield_kas, COALESCE(lp_tokens, '{}'::jsonb) AS lp_tokens, COALESCE(row_hmac_sig, '') AS row_hmac_sig, COALESCE(quarantined, FALSE) AS quarantined FROM yield_reservoirs WHERE wallet_address = ANY($1) OR wallet_address = ANY($2)",
+        let vault_rows = sqlx::query(
+            r#"
+            SELECT vault_id, clean_wallet, vault_kind, covenant_address, target_asset, target_network,
+                   threshold_sompi::NUMERIC(39,0)::TEXT AS threshold_sompi,
+                   confirmed_utxo_sompi::NUMERIC(39,0)::TEXT AS confirmed_utxo_sompi,
+                   status
+            FROM vault_locks
+            WHERE clean_wallet = ANY($1) OR wallet_address = ANY($2)
+            "#,
         )
-        .bind(&pref_list)
         .bind(&clean_list)
+        .bind(&pref_list)
         .fetch_all(&pool)
         .await
         .unwrap_or_default();
 
-        let mut reservoirs = serde_json::Map::new();
-        for r in res_rows {
-            let c = r
-                .try_get::<String, _>("wallet_address")
-                .unwrap_or_default()
-                .trim()
-                .to_lowercase()
-                .replace("kaspa:", "")
-                .trim()
-                .to_string();
-            let pref = format!("kaspa:{}", c);
-            let sk: f64 = r.try_get("streaming_balance_kas").unwrap_or(0.0_f64);
-            let ty: f64 = r.try_get("total_yield_kas").unwrap_or(0.0_f64);
-            let lpt: Value = r.try_get("lp_tokens").unwrap_or_else(|_| json!({}));
-            let sig: String = r.try_get("row_hmac_sig").unwrap_or_default();
-            let exp_sig =
-                crate::chronos::compute_reservoir_hmac(&pref, sk, ty, &lpt).unwrap_or_default();
-            reservoirs.insert(
-                pref,
+        let vaults: Vec<Value> = vault_rows
+            .into_iter()
+            .map(|r| {
                 json!({
-                    "streamingKas": sk,
-                    "totalYieldKas": ty,
-                    "lpTokens": lpt,
-                    "hmacValid": !sig.is_empty() && sig == exp_sig,
-                    "quarantined": r.try_get::<bool, _>("quarantined").unwrap_or(false)
-                }),
-            );
-        }
-        let cc_rows = sqlx::query(
-            "SELECT wallet_address, layout_state FROM user_command_centers WHERE wallet_address = ANY($1) OR wallet_address = ANY($2)",
+                    "vaultId": r.try_get::<String, _>("vault_id").unwrap_or_default(),
+                    "cleanWallet": r.try_get::<String, _>("clean_wallet").unwrap_or_default(),
+                    "vaultKind": r.try_get::<String, _>("vault_kind").unwrap_or_default(),
+                    "covenantAddress": r.try_get::<String, _>("covenant_address").unwrap_or_default(),
+                    "targetAsset": r.try_get::<String, _>("target_asset").unwrap_or_default(),
+                    "targetNetwork": r.try_get::<String, _>("target_network").unwrap_or_default(),
+                    "thresholdSompi": r.try_get::<String, _>("threshold_sompi").unwrap_or_else(|_| "0".to_string()),
+                    "confirmedUtxoSompi": r.try_get::<String, _>("confirmed_utxo_sompi").unwrap_or_else(|_| "0".to_string()),
+                    "status": r.try_get::<String, _>("status").unwrap_or_default()
+                })
+            })
+            .collect();
+
+        let accrual_rows = sqlx::query(
+            r#"
+            SELECT clean_wallet,
+                   immature_sompi::NUMERIC(39,0)::TEXT AS immature_sompi,
+                   unpaid_mature_sompi::NUMERIC(39,0)::TEXT AS unpaid_mature_sompi,
+                   lifetime_flushed_sompi::NUMERIC(39,0)::TEXT AS lifetime_flushed_sompi
+            FROM stratum_mature_accruals
+            WHERE clean_wallet = ANY($1)
+            "#,
         )
-        .bind(&pref_list)
         .bind(&clean_list)
         .fetch_all(&pool)
         .await
         .unwrap_or_default();
-        let mut sectors_map = serde_json::Map::new();
-        for r in cc_rows {
-            let c = r
-                .try_get::<String, _>("wallet_address")
-                .unwrap_or_default()
-                .trim()
-                .to_lowercase()
-                .replace("kaspa:", "")
-                .trim()
-                .to_string();
-            let ls: Value = r.try_get("layout_state").unwrap_or_else(|_| json!({}));
-            sectors_map.insert(
-                format!("kaspa:{}", c),
-                ls.get("sectors").cloned().unwrap_or_else(|| json!([])),
-            );
-        }
-        let hifo_cnt: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM hifo_tax_lots WHERE wallet_address = ANY($1) OR wallet_address = ANY($2)",
-        )
-        .bind(&pref_list)
-        .bind(&clean_list)
-        .fetch_one(&pool)
-        .await
-        .unwrap_or(0);
-        let lp_cnt: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM liquidity_providers WHERE wallet_address = ANY($1) OR wallet_address = ANY($2)",
-        )
-        .bind(&pref_list)
-        .bind(&clean_list)
-        .fetch_one(&pool)
-        .await
-        .unwrap_or(0);
-        let q_len: usize = redis::cmd("LLEN")
-            .arg("perennia:sor:netting_queue")
+        let accruals: Vec<Value> = accrual_rows
+            .into_iter()
+            .map(|r| {
+                json!({
+                    "cleanWallet": r.try_get::<String, _>("clean_wallet").unwrap_or_default(),
+                    "immatureSompi": r.try_get::<String, _>("immature_sompi").unwrap_or_else(|_| "0".to_string()),
+                    "unpaidMatureSompi": r.try_get::<String, _>("unpaid_mature_sompi").unwrap_or_else(|_| "0".to_string()),
+                    "lifetimeFlushedSompi": r.try_get::<String, _>("lifetime_flushed_sompi").unwrap_or_else(|_| "0".to_string())
+                })
+            })
+            .collect();
+
+        let solvency = crate::chronos::evaluate_pool_solvency_invariant(&pool)
+            .await
+            .map(|s| serde_json::to_value(s).unwrap_or_else(|_| json!({})))
+            .unwrap_or_else(|e| json!({ "error": e }));
+        let rfq_len: i64 = redis::cmd("HLEN")
+            .arg(crate::chronos::REDIS_KEY_CHRONOS_RFQ_BATCHES)
             .query_async(&mut r_conn)
             .await
             .unwrap_or(0);
-        let last_batch_raw: Option<String> = redis::cmd("GET")
-            .arg("perennia:settlement:last_netting_batch")
-            .query_async(&mut r_conn)
-            .await
-            .unwrap_or(None);
-        let profit_str: Option<String> = redis::cmd("GET")
-            .arg("perennia:treasury:netting_profit_usd")
-            .query_async(&mut r_conn)
-            .await
-            .unwrap_or(None);
-        let delta_str: Option<String> = redis::cmd("GET")
-            .arg("perennia:treasury:unhedged_delta_kas")
-            .query_async(&mut r_conn)
-            .await
-            .unwrap_or(None);
-        let pt_raw: Vec<String> = redis::cmd("LRANGE")
-            .arg("perennia:sor:third_party_passthrough_queue")
-            .arg(0)
-            .arg(25)
-            .query_async(&mut r_conn)
-            .await
-            .unwrap_or_default();
-        let pt_parsed: Vec<Value> = pt_raw
-            .iter()
-            .filter_map(|s| serde_json::from_str::<Value>(s).ok())
-            .collect();
         return Ok(Json(json!({
             "success": true,
-            "reservoirs": reservoirs,
-            "sectorsByWallet": sectors_map,
-            "hifoLotCount": hifo_cnt,
-            "lpPositionsCount": lp_cnt,
+            "vaultLocks": vaults,
+            "stratumMatureAccruals": accruals,
+            "solvencySnapshot": solvency,
             "redis": {
-                "nettingQueueLen": q_len,
-                "lastNettingBatch": last_batch_raw.and_then(|s| serde_json::from_str::<Value>(&s).ok()),
-                "nettingProfitUsd": profit_str.and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0_f64),
-                "unhedgedDeltaKas": delta_str.and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0_f64),
-                "passthroughQueue": pt_parsed
+                "activeChronosRfqBatches": rfq_len
             }
         })));
     }
 
-    if action == "TEARDOWN_COHORT" {
+    if action == "TEARDOWN_COHORT" || action == "PURGE_COHORT" {
         let empty_w = vec![];
         let wallets = payload
             .get("wallets")
@@ -494,88 +310,24 @@ async fn handle_netting_lab(
                     .to_string();
                 if !c.is_empty() && c != master_clean {
                     pref_list.push(format!("kaspa:{}", c));
-                    clean_list.push(c.clone());
-                    let _: redis::RedisResult<()> = redis::cmd("DEL")
-                        .arg(format!("dev:sor:treasury:balances:{}", c))
-                        .query_async(&mut r_conn)
-                        .await;
+                    clean_list.push(c);
                 }
             }
         }
-        for tbl in [
-            "hifo_disposal_matches",
-            "hifo_tax_lots",
-            "tax_ledger_events",
-            "liquidity_providers",
-            "silo_staking_positions",
-            "user_command_centers",
-            "yield_reservoirs",
-        ] {
-            let q = format!(
-                "DELETE FROM {} WHERE wallet_address = ANY($1) OR wallet_address = ANY($2)",
-                tbl
-            );
-            let _ = sqlx::query(&q)
-                .bind(&pref_list)
-                .bind(&clean_list)
-                .execute(&pool)
-                .await;
-        }
-        if let Some(base) = payload.get("restoreBaseline").and_then(|v| v.as_object()) {
-            for (field, r_key) in [
-                ("nettingProfitUsd", "perennia:treasury:netting_profit_usd"),
-                ("unhedgedDeltaKas", "perennia:treasury:unhedged_delta_kas"),
-                ("feesUsdc", "perennia:fees:batch_accumulated:USDC"),
-            ] {
-                if let Some(val) = base.get(field) {
-                    if let Some(s) = val.as_str() {
-                        let _: redis::RedisResult<()> = redis::cmd("SET")
-                            .arg(r_key)
-                            .arg(s)
-                            .query_async(&mut r_conn)
-                            .await;
-                    } else if val.is_null() {
-                        let _: redis::RedisResult<()> = redis::cmd("DEL")
-                            .arg(r_key)
-                            .query_async(&mut r_conn)
-                            .await;
-                    }
-                }
-            }
-        }
-        let pt_all: Vec<String> = redis::cmd("LRANGE")
-            .arg("perennia:sor:third_party_passthrough_queue")
-            .arg(0)
-            .arg(-1)
-            .query_async(&mut r_conn)
+        let kas_usd_e8 = crate::state_api::resolve_strict_spot_price_e8(&pool, "KAS")
             .await
-            .unwrap_or_default();
-        let _: redis::RedisResult<()> = redis::cmd("DEL")
-            .arg("perennia:sor:third_party_passthrough_queue")
-            .query_async(&mut r_conn)
-            .await;
-        for raw_item in pt_all.into_iter().rev() {
-            let is_lab = serde_json::from_str::<Value>(&raw_item)
-                .ok()
-                .and_then(|v| {
-                    v.get("type")
-                        .and_then(|t| t.as_str())
-                        .map(|s| s == "NET_RESIDUAL_AUTOBALANCE")
-                })
-                .unwrap_or(false);
-            if !is_lab {
-                let _: redis::RedisResult<()> = redis::cmd("LPUSH")
-                    .arg("perennia:sor:third_party_passthrough_queue")
-                    .arg(raw_item)
-                    .query_async(&mut r_conn)
-                    .await;
-            }
-        }
-        let kas_spot: f64 = crate::fiat_rails::resolve_live_spot_price(&pool, "KAS")
-            .await
-            .unwrap_or(0.15_f64);
-        let _ = crate::chronos::publish_live_epoch_bucket_telemetry(&pool, kas_spot).await;
-        return Ok(Json(json!({ "success": true, "purgedWallets": pref_list.len() })));
+            .map_err(|e| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": e })),
+                )
+            })?;
+        let _ = crate::chronos::publish_live_epoch_bucket_telemetry(&pool, 0.0).await;
+        return Ok(Json(json!({
+            "success": true,
+            "checkedWallets": pref_list.len(),
+            "kasSpotUsdE8": kas_usd_e8.to_string()
+        })));
     }
 
     Err((
@@ -612,7 +364,12 @@ async fn get_table_data(
         "system_treasury_config",
         "user_cold_vault_rules",
         "worker_profiles",
-        "yield_reservoirs",
+        "stratum_mature_accruals",
+        "epoch_payout_outbox",
+        "vault_locks",
+        "thermostat_valves",
+        "settlement_receipts",
+        "solvency_circuit_events",
         "micro_shares",
         "network_blocks",
         "user_command_centers",
@@ -970,36 +727,29 @@ async fn handle_l1_payout_action(
             "status": "DISPATCHED_ONCHAIN"
         })));
     } else if mode == "REFUND_L1_PAYOUT" {
-        let user_ledger_key = format!("dev:sor:treasury:balances:{}", clean_wallet);
-        let _: () = redis::cmd("HINCRBYFLOAT")
-            .arg(&user_ledger_key)
-            .arg(&asset_ticker)
-            .arg(amount_tokens)
-            .query_async(&mut redis_conn)
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("Failed to refund ledger: {}", e)})),
-                )
-            })?;
+        let Some(refund_tx_hash) = req
+            .txHash
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+        else {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": "NON_CUSTODIAL_L1_ONLY",
+                    "message": "Custodial ledger refunds are retired. Supply an on-chain refund txHash settled directly to the user's self-custodial wallet."
+                })),
+            ));
+        };
         let _ = sqlx::query(
-            "UPDATE l1_payout_queue SET status = 'REFUNDED_TO_LEDGER', updated_at = CURRENT_TIMESTAMP WHERE payout_id = $1",
+            "UPDATE l1_payout_queue SET status = 'REFUNDED_ONCHAIN_TO_USER', tx_hash = $2, updated_at = CURRENT_TIMESTAMP WHERE payout_id = $1",
         )
         .bind(&payout_id)
+        .bind(&refund_tx_hash)
         .execute(&pool)
         .await;
-        let _ = sqlx::query(
-            "INSERT INTO tax_ledger_events (wallet_address, asset_ticker, event_type, gross_proceeds_usd, amount_tokens, spot_price_at_execution, tx_hash) VALUES ($1, $2, 'L1_REFUND', $3, $4, $5, $6)",
-        )
-        .bind(&clean_wallet)
-        .bind(&asset_ticker)
-        .bind(gross_usd)
-        .bind(amount_tokens)
-        .bind(spot_price)
-        .bind(&payout_id)
-        .execute(&pool)
-        .await;
+        let _ = (gross_usd, spot_price);
         let sse_evt = json!({
             "l1_event": true,
             "fiat_event": true,
@@ -1007,7 +757,8 @@ async fn handle_l1_payout_action(
             "wallet": clean_wallet,
             "payoutId": payout_id,
             "assetTicker": asset_ticker,
-            "amountTokens": amount_tokens
+            "amountTokens": amount_tokens,
+            "txHash": refund_tx_hash
         });
         let _: () = redis::cmd("PUBLISH")
             .arg("telemetry:updates")
@@ -1254,55 +1005,29 @@ async fn handle_passthrough_action(
             "txHash": resolved_tx
         })));
     } else if mode == "REFUND_PASSTHROUGH_ORDER" {
-        if clean_wallet.is_empty() || gross_kas <= 0.0 {
+        let Some(refund_tx_hash) = req
+            .txHash
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+        else {
             return Err((
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "Invalid pass-through wallet or gross_kas amount to refund."})),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": "NON_CUSTODIAL_L1_ONLY",
+                    "message": "Custodial passthrough ledger refunds are retired. Supply an on-chain refund txHash."
+                })),
             ));
-        }
-        let user_ledger_key = format!("dev:sor:treasury:balances:{}", clean_wallet);
-        let _: () = redis::cmd("HINCRBYFLOAT")
-            .arg(&user_ledger_key)
-            .arg("KAS")
-            .arg(gross_kas)
-            .query_async(&mut redis_conn)
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("Failed to credit miner ledger: {}", e)})),
-                )
-            })?;
-        if upfront_fee_kas > 0.0 {
-            let _: Result<String, _> = redis::cmd("EVAL")
-                .arg(LUA_CLAMPED_FEE_REVERSAL)
-                .arg(1)
-                .arg("perennia:fees:batch_accumulated:KAS")
-                .arg(upfront_fee_kas)
-                .query_async(&mut redis_conn)
-                .await;
-        }
-        let refund_kas_spot = if live_kas_spot > 0.0 {
-            live_kas_spot
-        } else {
-            spot_price
         };
-        let _ = sqlx::query(
-            "INSERT INTO tax_ledger_events (wallet_address, asset_ticker, event_type, gross_proceeds_usd, amount_tokens, spot_price_at_execution)
-             VALUES ($1, 'KAS', 'PASSTHROUGH_REFUND', $2, $3, $4)",
-        )
-        .bind(&clean_wallet)
-        .bind(gross_kas * refund_kas_spot)
-        .bind(gross_kas)
-        .bind(refund_kas_spot)
-        .execute(&pool)
-        .await;
+        let _ = (upfront_fee_kas, live_kas_spot, spot_price);
         let sse_event = json!({
             "fiat_event": true,
             "eventType": "PASSTHROUGH_REFUND",
             "wallet": clean_wallet,
             "assetTicker": "KAS",
-            "amountTokens": gross_kas
+            "amountKas": gross_kas,
+            "txHash": refund_tx_hash
         });
         let _: () = redis::cmd("PUBLISH")
             .arg("telemetry:updates")
@@ -1314,8 +1039,7 @@ async fn handle_passthrough_action(
             "success": true,
             "action": "REFUND_PASSTHROUGH_ORDER",
             "wallet": prefixed_wallet,
-            "refundedKas": gross_kas,
-            "reversedFeeKas": upfront_fee_kas
+            "txHash": refund_tx_hash
         })));
     }
     Err((
@@ -1628,8 +1352,23 @@ async fn handle_fiat_action(
                 Json(json!({"error": "payoutId is required"})),
             ));
         }
+        let Some(refund_tx_hash) = req
+            .txHash
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+        else {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": "NON_CUSTODIAL_L1_ONLY",
+                    "message": "Custodial ledger fiat refunds are retired. Provide an on-chain refund txHash settled directly to the user's self-custodial wallet."
+                })),
+            ));
+        };
         let row_opt = sqlx::query(
-            "SELECT wallet_address, source_asset, amount_crypto, gross_usd, fee_usd, status FROM fiat_payout_queue WHERE payout_id = $1 LIMIT 1",
+            "SELECT wallet_address, source_asset, amount_crypto, status FROM fiat_payout_queue WHERE payout_id = $1 LIMIT 1",
         )
         .bind(&payout_id)
         .fetch_optional(&pool)
@@ -1659,38 +1398,15 @@ async fn handle_fiat_action(
             .unwrap_or_else(|_| "KAS".to_string())
             .to_uppercase();
         let amount_crypto: f64 = row.try_get("amount_crypto").unwrap_or(0.0);
-        let gross_usd: f64 = row.try_get("gross_usd").unwrap_or(0.0);
-        let fee_usd: f64 = row.try_get("fee_usd").unwrap_or(0.0);
         let clean_wallet = wallet_address
             .trim()
             .to_lowercase()
             .replace("kaspa:", "");
-        let user_ledger_key = format!("dev:sor:treasury:balances:{}", clean_wallet);
-        let _: () = redis::cmd("HINCRBYFLOAT")
-            .arg(&user_ledger_key)
-            .arg(&source_asset)
-            .arg(amount_crypto)
-            .query_async(&mut redis_conn)
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("Failed to refund ledger: {}", e)})),
-                )
-            })?;
-        if fee_usd > 0.0 {
-            let _: Result<String, _> = redis::cmd("EVAL")
-                .arg(LUA_CLAMPED_FEE_REVERSAL)
-                .arg(1)
-                .arg("perennia:treasury:netting_profit_usd")
-                .arg(fee_usd)
-                .query_async(&mut redis_conn)
-                .await;
-        }
         sqlx::query(
-            "UPDATE fiat_payout_queue SET status = 'REFUNDED_TO_LEDGER', updated_at = CURRENT_TIMESTAMP WHERE payout_id = $1",
+            "UPDATE fiat_payout_queue SET status = 'REFUNDED_ONCHAIN_TO_USER', tx_id = $2, updated_at = CURRENT_TIMESTAMP WHERE payout_id = $1",
         )
         .bind(&payout_id)
+        .bind(&refund_tx_hash)
         .execute(&pool)
         .await
         .map_err(|e| {
@@ -1699,30 +1415,14 @@ async fn handle_fiat_action(
                 Json(json!({"error": format!("Failed to update payout status: {}", e)})),
             )
         })?;
-        let spot = if amount_crypto > 0.0 {
-            gross_usd / amount_crypto
-        } else {
-            1.0
-        };
-        let _ = sqlx::query(
-            "INSERT INTO tax_ledger_events (wallet_address, asset_ticker, event_type, gross_proceeds_usd, amount_tokens, spot_price_at_execution, tx_hash)
-             VALUES ($1, $2, 'FIAT_REFUND', $3, $4, $5, $6)",
-        )
-        .bind(&clean_wallet)
-        .bind(&source_asset)
-        .bind(gross_usd)
-        .bind(amount_crypto)
-        .bind(spot)
-        .bind(&payout_id)
-        .execute(&pool)
-        .await;
         let sse_event = json!({
             "fiat_event": true,
             "eventType": "FIAT_REFUND",
             "wallet": clean_wallet,
             "payoutId": payout_id,
             "assetTicker": source_asset,
-            "amountTokens": amount_crypto
+            "amountTokens": amount_crypto,
+            "txHash": refund_tx_hash
         });
         let _: () = redis::cmd("PUBLISH")
             .arg("telemetry:updates")
@@ -1733,7 +1433,8 @@ async fn handle_fiat_action(
         return Ok(Json(json!({
             "success": true,
             "payoutId": payout_id,
-            "status": "REFUNDED_TO_LEDGER",
+            "status": "REFUNDED_ONCHAIN_TO_USER",
+            "txHash": refund_tx_hash,
             "refundedAsset": source_asset,
             "refundedAmount": amount_crypto
         })));
@@ -1885,7 +1586,8 @@ async fn handle_fiat_action(
                     .as_secs()
                     / 60
             );
-            let payouts_vec = vec![(prefixed_wallet.clone(), delivered_tokens)];
+            let sompi_u64 = (delivered_tokens.max(0.0) * 100_000_000.0).round() as u64;
+            let payouts_vec = vec![(prefixed_wallet.clone(), sompi_u64)];
             match crate::sor::execute_idempotent_mass_physical_settlement(
                 &pool,
                 &idemp_key,
@@ -1903,20 +1605,14 @@ async fn handle_fiat_action(
                     ));
                 }
             }
-        } else {
-            let _ = crate::state_api::credit_user_token_balance(
-                &pool,
-                &clean_wallet,
-                &prefixed_wallet,
-                &target_asset,
-                delivered_tokens,
-                false,
-            )
-            .await;
-            if resolved_tx_hash.is_empty() {
-                let hex_str = uuid::Uuid::new_v4().simple().to_string().to_uppercase();
-                resolved_tx_hash = format!("LEDGER-ONRAMP-{}", &hex_str[..10]);
-            }
+        } else if resolved_tx_hash.is_empty() {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": "NON_CUSTODIAL_L1_ONLY",
+                    "message": "Custodial synthetic ledger credits are retired. Use settlementTarget=L1_KAS or supply an on-chain dropship txHash."
+                })),
+            ));
         }
         sqlx::query(
             "UPDATE fiat_onramp_orders
