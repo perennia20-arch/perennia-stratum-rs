@@ -17,3 +17,6 @@ test-wrpc.js
 *.key
 kaspa-keygen/
 repomix*.xml
+.perennia-backend-full.md
+live-db-schema.sql
+test-results/
