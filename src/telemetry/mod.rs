@@ -1,39 +1,48 @@
-use prometheus::{GaugeVec, IntCounterVec, Opts, Registry, TextEncoder, Encoder};
 use lazy_static::lazy_static;
-use tokio::net::TcpListener;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
-use std::collections::{HashMap, HashSet, VecDeque};
+use prometheus::{Encoder, GaugeVec, IntCounterVec, Opts, Registry, TextEncoder};
 use serde_json::{json, Value};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::env;
 use sqlx::Row;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::env;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 
-const KASPA_DIFF_CONSTANT: f64 = 4_294_967_296.0;
-const DEFAULT_FPPS_MAX_HOUSE_FLOAT_KAS: f64 = 50.0;
+const KASPA_DIFF_CONSTANT_U128: u128 = 4_294_967_296;
+const KASPA_DIFF_CONSTANT_F64: f64 = 4_294_967_296.0;
 const DEFAULT_COINBASE_MATURITY_DAA: i64 = 1_000;
-const LAYOUT_CACHE_TTL: Duration = Duration::from_secs(5);
 
-pub const BASE_POOL_FEE_RATE: f64 = 0.01;
-pub const MIN_POOL_FEE_RATE: f64 = 0.005;
-pub const WEEKLY_FEE_DECAY_RATE: f64 = 0.0005;
+pub const BASE_POOL_FEE_BPS: u16 = 100;
+pub const MIN_POOL_FEE_BPS: u16 = 50;
+pub const MAX_POOL_FEE_BPS: u16 = 200;
+pub const WEEKLY_FEE_DECAY_BPS: u16 = 5;
 pub const SECONDS_PER_WEEK: u64 = 604_800;
 pub const DISCONNECT_GRACE_WINDOW_SECS: u64 = 7_200;
 pub const DISCONNECT_GRACE_WINDOW_MS: u64 = 7_200_000;
 pub const MAINTENANCE_SHIELD_GRACE_WINDOW_SECS: u64 = 86_400;
 pub const MAINTENANCE_SHIELD_GRACE_WINDOW_MS: u64 = 86_400_000;
-pub const MINER_PERK_SWAP_FEE_FLOOR_RATE: f64 = 0.001;
+pub const MINER_PERK_SWAP_FEE_FLOOR_BPS: u16 = 10;
+pub const STAGE1_FLUSH_FLOOR_SOMPI: u128 = 2_500_000_000;
 
 lazy_static! {
     pub static ref REGISTRY: Registry = Registry::new();
     pub static ref WORKER_HASHRATE: GaugeVec = GaugeVec::new(
-        Opts::new("ks_worker_hashrate", "Strictly verified unsimulated hashrate per worker in TH/s"),
+        Opts::new(
+            "ks_worker_hashrate",
+            "Strictly verified unsimulated hashrate per worker in TH/s"
+        ),
         &["worker"]
-    ).expect("Metric setup failed");
+    )
+    .expect("Metric setup failed");
     pub static ref WORKER_SHARES: IntCounterVec = IntCounterVec::new(
-        Opts::new("ks_worker_shares", "Cryptographically validated shares per worker"),
+        Opts::new(
+            "ks_worker_shares",
+            "Cryptographically validated shares per worker"
+        ),
         &["worker", "type"]
-    ).expect("Metric setup failed");
+    )
+    .expect("Metric setup failed");
 }
 
 pub fn init_telemetry() {
@@ -41,27 +50,33 @@ pub fn init_telemetry() {
     REGISTRY.register(Box::new(WORKER_SHARES.clone())).unwrap();
 }
 
-pub fn compute_miner_loyalty_fee_rate(
+pub fn compute_miner_loyalty_fee_bps(
     streak_started_ms: u64,
     now_ms: u64,
-    configured_base_fee_rate: f64,
-) -> (u64, f64) {
-    let base_rate = configured_base_fee_rate.clamp(MIN_POOL_FEE_RATE, 0.05);
+    configured_base_fee_bps: u16,
+) -> (u64, u16) {
+    let base_bps = configured_base_fee_bps.clamp(MIN_POOL_FEE_BPS, MAX_POOL_FEE_BPS);
     if streak_started_ms == 0 || now_ms <= streak_started_ms {
-        return (0, base_rate);
+        return (0, base_bps);
     }
     let elapsed_secs = now_ms.saturating_sub(streak_started_ms) / 1000;
     let consecutive_weeks = elapsed_secs / SECONDS_PER_WEEK;
-    let discount = (consecutive_weeks as f64) * WEEKLY_FEE_DECAY_RATE;
-    let effective_rate = (base_rate - discount).max(MIN_POOL_FEE_RATE);
-    let rounded_rate = (effective_rate * 100_000.0).round() / 100_000.0;
-    (consecutive_weeks, rounded_rate)
+    let discount_bps = consecutive_weeks
+        .saturating_mul(WEEKLY_FEE_DECAY_BPS as u64)
+        .min(u16::MAX as u64) as u16;
+    let effective_bps = base_bps.saturating_sub(discount_bps).max(MIN_POOL_FEE_BPS);
+    (consecutive_weeks, effective_bps)
 }
 
 pub async fn start_prometheus_exporter(_bind_addr: String) {
     let addr = "0.0.0.0:8081";
-    let listener = TcpListener::bind(addr).await.expect("Failed to bind Prometheus port");
-    tracing::info!("📊 Zero-Simulation Telemetry exporter natively active on http://{}/metrics", addr);
+    let listener = TcpListener::bind(addr)
+        .await
+        .expect("Failed to bind Prometheus port");
+    tracing::info!(
+        "📊 Zero-Simulation Telemetry exporter natively active on http://{}/metrics",
+        addr
+    );
     loop {
         if let Ok((mut socket, _)) = listener.accept().await {
             tokio::spawn(async move {
@@ -85,7 +100,7 @@ pub async fn start_prometheus_exporter(_bind_addr: String) {
 struct WorkerState {
     last_share_ts: u64,
     streak_started_ts: u64,
-    effective_fee_rate: f64,
+    effective_fee_bps: u16,
     share_history: VecDeque<(u64, f64)>,
     shares_contributed: f64,
     valid_share_count: u64,
@@ -107,13 +122,25 @@ struct WorkerDbSnapshot {
     blocks_found: i64,
     last_share_ts: i64,
     streak_started_ts: i64,
-    effective_fee_rate: f64,
+    effective_fee_bps: u16,
     status: String,
 }
 
-struct CachedSectorLayout {
-    layout_state: Value,
-    fetched_at: Instant,
+struct PendingMicroShare {
+    worker_id: String,
+    difficulty_weight: f64,
+    network_diff: f64,
+    sompi_delta: i64,
+    pool_fee_sompi: i64,
+    block_daa_score: i64,
+    is_settled: bool,
+}
+
+struct WalletAccrualDelta {
+    prefixed_wallet: String,
+    miner_net_sompi: u128,
+    pool_fee_sompi: u128,
+    pool_fee_bps: u16,
 }
 
 fn normalize_timestamp_ms(raw_ts: i64, fallback_ms: u64) -> u64 {
@@ -129,7 +156,9 @@ fn normalize_timestamp_ms(raw_ts: i64, fallback_ms: u64) -> u64 {
 }
 
 pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String, f64, bool)>) {
-    tracing::info!("🏦 Institutional Accounting, Miner Loyalty Decay (1.0% -> 0.5%, 2h Grace + Maintenance Shield) & Elastic Solvency-Gated FPPS Engine Booted...");
+    tracing::info!(
+        "🏦 Sovereign L1 Sompi Accounting, Loyalty Decay (100->50 bps) & 1,000-DAA Maturity Engine Booted..."
+    );
     let redis_url = env::var("REDIS_URL")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
@@ -151,20 +180,16 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
     {
         Ok(pool) => pool,
         Err(e) => {
-            tracing::error!("❌ CRITICAL: Failed to connect to Postgres! Yield splitting will fail. {}", e);
+            tracing::error!("❌ CRITICAL: Failed to connect to Postgres! {}", e);
             return;
         }
     };
-    let pool_fee_rate: f64 = env::var("POOL_FEE_RATE")
+
+    let pool_fee_bps: u16 = env::var("POOL_FEE_BPS")
         .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|&v| v >= MIN_POOL_FEE_RATE && v < 1.0)
-        .unwrap_or(BASE_POOL_FEE_RATE);
-    let max_house_float_kas: f64 = env::var("FPPS_MAX_FLOAT_KAS")
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|&v| v > 0.0)
-        .unwrap_or(DEFAULT_FPPS_MAX_HOUSE_FLOAT_KAS);
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .filter(|&v| (MIN_POOL_FEE_BPS..=MAX_POOL_FEE_BPS).contains(&v))
+        .unwrap_or(BASE_POOL_FEE_BPS);
     let coinbase_maturity_daa: i64 = env::var("COINBASE_MATURITY_DAA")
         .ok()
         .and_then(|v| v.trim().parse::<i64>().ok())
@@ -173,7 +198,6 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
     let corp_kas_clean = crate::chronos::resolve_master_treasury_address();
     let mut flush_interval = tokio::time::interval(Duration::from_millis(1000));
     let mut worker_states: HashMap<String, WorkerState> = HashMap::new();
-    let mut sector_layout_cache: HashMap<String, CachedSectorLayout> = HashMap::new();
     let mut maintenance_grace_shield_active = false;
     let mut blacklisted_wallets_cache: HashSet<String> = HashSet::new();
     let mut blacklisted_workers_cache: HashSet<String> = HashSet::new();
@@ -182,11 +206,12 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
+
     if let Ok(existing_workers) = sqlx::query(
         r#"
-        SELECT COALESCE(NULLIF(worker_identity, ''), worker_id) AS worker_identity, valid_shares, rejected_shares, blocks_found,
-               last_share_ts, COALESCE(streak_started_ts, 0) AS streak_started_ts,
-               COALESCE(effective_fee_rate, 0.01) AS effective_fee_rate
+        SELECT COALESCE(NULLIF(worker_identity, ''), worker_id) AS worker_identity,
+               valid_shares, rejected_shares, blocks_found,
+               last_share_ts, COALESCE(streak_started_ts, 0) AS streak_started_ts
         FROM worker_profiles
         WHERE last_share_ts > 0
         "#,
@@ -204,8 +229,8 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
             if boot_now_ms.saturating_sub(last_ms) <= MAINTENANCE_SHIELD_GRACE_WINDOW_MS {
                 let raw_streak_ts: i64 = r.try_get("streak_started_ts").unwrap_or(raw_last_ts);
                 let streak_ms = normalize_timestamp_ms(raw_streak_ts, last_ms);
-                let (_, eff_fee) =
-                    compute_miner_loyalty_fee_rate(streak_ms, boot_now_ms, pool_fee_rate);
+                let (_, eff_bps) =
+                    compute_miner_loyalty_fee_bps(streak_ms, boot_now_ms, pool_fee_bps);
                 let valid_sh = r.try_get::<i64, _>("valid_shares").unwrap_or(0).max(0) as u64;
                 let rej_sh = r.try_get::<i64, _>("rejected_shares").unwrap_or(0).max(0) as u64;
                 let blks = r.try_get::<i64, _>("blocks_found").unwrap_or(0).max(0) as u64;
@@ -214,7 +239,7 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                     WorkerState {
                         last_share_ts: last_ms,
                         streak_started_ts: streak_ms,
-                        effective_fee_rate: eff_fee,
+                        effective_fee_bps: eff_bps,
                         share_history: VecDeque::new(),
                         shares_contributed: valid_sh as f64,
                         valid_share_count: valid_sh,
@@ -228,16 +253,18 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
         }
     }
 
-    let mut cached_l1_blocks_won_kas: f64 = 0.0;
-    let mut cached_immature_blocks_kas: f64 = 0.0;
+    let mut cached_l1_blocks_won_sompi: u128 = 0;
+    let mut cached_immature_blocks_sompi: u128 = 0;
     let mut cached_total_blocks_count: i64 = 0;
+    let mut cached_unpaid_mature_sompi: u128 = 0;
+    let mut cached_immature_accruals_sompi: u128 = 0;
     let mut tick_counter: u64 = 0;
-    let mut pending_micro_shares: Vec<(String, f64, f64)> = Vec::new();
+    let mut pending_micro_shares: Vec<PendingMicroShare> = Vec::new();
 
     loop {
         tokio::select! {
             Some((full_worker_name, difficulty, is_network_block)) = valid_share_rx.recv() => {
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
                 let active_grace_ms = if maintenance_grace_shield_active {
                     MAINTENANCE_SHIELD_GRACE_WINDOW_MS
                 } else {
@@ -246,7 +273,7 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                 let state = worker_states.entry(full_worker_name.clone()).or_insert_with(|| WorkerState {
                     last_share_ts: now,
                     streak_started_ts: now,
-                    effective_fee_rate: pool_fee_rate,
+                    effective_fee_bps: pool_fee_bps,
                     share_history: VecDeque::new(),
                     shares_contributed: 0.0,
                     valid_share_count: 0,
@@ -264,18 +291,17 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                     } else if state.streak_started_ts == 0 {
                         state.streak_started_ts = now;
                     }
-                    let (_, eff_rate) = compute_miner_loyalty_fee_rate(
+                    let (_, eff_bps) = compute_miner_loyalty_fee_bps(
                         state.streak_started_ts,
                         now,
-                        pool_fee_rate,
+                        pool_fee_bps,
                     );
-                    state.effective_fee_rate = eff_rate;
+                    state.effective_fee_bps = eff_bps;
                     state.share_history.push_back((now, difficulty));
                     state.last_share_ts = now;
                     state.shares_contributed += difficulty;
                     state.valid_share_count += 1;
                     state.unflushed_difficulty += difficulty;
-                    pending_micro_shares.push((full_worker_name.clone(), difficulty, eff_rate));
                     WORKER_SHARES.with_label_values(&[&full_worker_name, "valid"]).inc_by(difficulty as u64);
                 } else if difficulty < 0.0 {
                     state.rejected_share_count += 1;
@@ -289,7 +315,7 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
             }
             _ = flush_interval.tick() => {
                 tick_counter = tick_counter.wrapping_add(1);
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
                 let now_secs = now / 1000;
 
                 if tick_counter % 5 == 1 {
@@ -342,81 +368,101 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                     .unwrap_or(None);
                 let net_diff = net_diff_str
                     .and_then(|s| s.parse::<f64>().ok())
-                    .filter(|&v| v > 0.0)
+                    .filter(|&v| v.is_finite() && v > 0.0)
                     .unwrap_or(0.0);
-                let reward_str: Option<String> = redis::cmd("GET")
-                    .arg("pool:block_reward")
+                let net_diff_e6 = if net_diff > 0.0 {
+                    (net_diff * 1_000_000.0).round().max(1.0) as u128
+                } else {
+                    0
+                };
+
+                let reward_sompi_str: Option<String> = redis::cmd("GET")
+                    .arg("pool:block_reward_sompi")
                     .query_async(&mut redis_conn)
                     .await
                     .unwrap_or(None);
-                let block_reward = reward_str
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .filter(|&v| v > 0.0)
-                    .unwrap_or(0.0);
+                let block_reward_sompi = reward_sompi_str
+                    .and_then(|s| s.trim().parse::<u128>().ok())
+                    .unwrap_or(0);
+
                 let virtual_daa_str: Option<String> = redis::cmd("GET")
                     .arg("pool:virtual_daa_score")
                     .query_async(&mut redis_conn)
                     .await
                     .unwrap_or(None);
                 let current_virtual_daa = virtual_daa_str
-                    .and_then(|s| s.parse::<i64>().ok())
+                    .and_then(|s| s.trim().parse::<i64>().ok())
                     .unwrap_or(0);
 
+                // Strictly DAA-gated 1,000-block coinbase maturity (zero wall-clock timer fallback)
                 if tick_counter % 5 == 1 {
                     if let Ok(row) = sqlx::query(
                         r#"
                         SELECT
                             COUNT(*)::BIGINT AS total_blocks_count,
                             COALESCE(SUM(CASE
-                                WHEN (
-                                    ($1 > $2 AND COALESCE(daa_score, 0) > 0 AND ($1 - COALESCE(daa_score, 0)) >= $2)
-                                    OR (COALESCE(daa_score, 0) = 0 AND discovered_at <= CURRENT_TIMESTAMP - INTERVAL '120 seconds')
-                                    OR ($1 <= $2 AND discovered_at <= CURRENT_TIMESTAMP - INTERVAL '120 seconds')
-                                ) THEN reward_kas
-                                ELSE 0.0
-                            END), 0.0) AS matured_blocks_kas,
+                                WHEN $1 > 0
+                                 AND COALESCE(daa_score, 0) > 0
+                                 AND ($1 - COALESCE(daa_score, 0)) >= $2
+                                THEN reward_sompi
+                                ELSE 0
+                            END), 0)::NUMERIC(39, 0)::TEXT AS matured_blocks_sompi,
                             COALESCE(SUM(CASE
                                 WHEN NOT (
-                                    ($1 > $2 AND COALESCE(daa_score, 0) > 0 AND ($1 - COALESCE(daa_score, 0)) >= $2)
-                                    OR (COALESCE(daa_score, 0) = 0 AND discovered_at <= CURRENT_TIMESTAMP - INTERVAL '120 seconds')
-                                    OR ($1 <= $2 AND discovered_at <= CURRENT_TIMESTAMP - INTERVAL '120 seconds')
-                                ) THEN reward_kas
-                                ELSE 0.0
-                            END), 0.0) AS immature_blocks_kas
+                                    $1 > 0
+                                    AND COALESCE(daa_score, 0) > 0
+                                    AND ($1 - COALESCE(daa_score, 0)) >= $2
+                                )
+                                THEN reward_sompi
+                                ELSE 0
+                            END), 0)::NUMERIC(39, 0)::TEXT AS immature_blocks_sompi
                         FROM network_blocks
-                        WHERE COALESCE(is_orphaned, false) = false
-                        "#
+                        WHERE COALESCE(is_orphaned, FALSE) = FALSE
+                        "#,
                     )
                     .bind(current_virtual_daa)
                     .bind(coinbase_maturity_daa)
                     .fetch_one(&pg_pool)
                     .await
                     {
-                        cached_total_blocks_count = row.try_get::<i64, _>("total_blocks_count").unwrap_or(0);
-                        cached_l1_blocks_won_kas = row.try_get::<f64, _>("matured_blocks_kas").unwrap_or(0.0).max(0.0);
-                        cached_immature_blocks_kas = row.try_get::<f64, _>("immature_blocks_kas").unwrap_or(0.0).max(0.0);
+                        cached_total_blocks_count =
+                            row.try_get::<i64, _>("total_blocks_count").unwrap_or(0);
+                        cached_l1_blocks_won_sompi = row
+                            .try_get::<String, _>("matured_blocks_sompi")
+                            .ok()
+                            .and_then(|s| s.trim().parse::<u128>().ok())
+                            .unwrap_or(0);
+                        cached_immature_blocks_sompi = row
+                            .try_get::<String, _>("immature_blocks_sompi")
+                            .ok()
+                            .and_then(|s| s.trim().parse::<u128>().ok())
+                            .unwrap_or(0);
+                    }
+
+                    if let Ok(acc_row) = sqlx::query(
+                        r#"
+                        SELECT
+                            COALESCE(SUM(unpaid_mature_sompi), 0)::NUMERIC(39, 0)::TEXT AS unpaid_mature,
+                            COALESCE(SUM(immature_sompi), 0)::NUMERIC(39, 0)::TEXT AS immature_accrual
+                        FROM stratum_mature_accruals
+                        "#,
+                    )
+                    .fetch_one(&pg_pool)
+                    .await
+                    {
+                        cached_unpaid_mature_sompi = acc_row
+                            .try_get::<String, _>("unpaid_mature")
+                            .ok()
+                            .and_then(|s| s.trim().parse::<u128>().ok())
+                            .unwrap_or(0);
+                        cached_immature_accruals_sompi = acc_row
+                            .try_get::<String, _>("immature_accrual")
+                            .ok()
+                            .and_then(|s| s.trim().parse::<u128>().ok())
+                            .unwrap_or(0);
                     }
                 }
-                if tick_counter % 60 == 0 {
-                    sector_layout_cache.retain(|_, entry| entry.fetched_at.elapsed() < Duration::from_secs(60));
-                }
-                let ext_streamed_str: Option<String> = redis::cmd("GET")
-                    .arg("perennia:pool:external_streamed_kas")
-                    .query_async(&mut redis_conn)
-                    .await
-                    .unwrap_or(None);
-                let mut total_external_streamed_kas = ext_streamed_str
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(0.0)
-                    .max(0.0);
-                let total_solvency_ceiling_kas = cached_l1_blocks_won_kas + max_house_float_kas;
-                let mut available_headroom_kas = (total_solvency_ceiling_kas - total_external_streamed_kas).max(0.0);
-                let soft_knee_kas = (max_house_float_kas * 0.50).max(1.0);
-                let elastic_streaming_factor = if available_headroom_kas >= soft_knee_kas {
-                    1.0
-                } else {
-                    (available_headroom_kas / soft_knee_kas).clamp(0.0, 1.0)
-                };
+
                 let epoch_telemetry_raw: Option<String> = redis::cmd("GET")
                     .arg("perennia:settlement:epoch_telemetry")
                     .query_async(&mut redis_conn)
@@ -429,20 +475,24 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                     crate::chronos::compute_jerusalem_epoch_window(now_secs);
                 if let Some(obj) = epoch_telemetry_val.as_object_mut() {
                     obj.insert("anchorUtcHour".to_string(), json!(22));
-                    obj.insert("anchorLabel".to_string(), json!("22:00 UTC Global Settlement"));
+                    obj.insert(
+                        "anchorLabel".to_string(),
+                        json!("22:00 UTC Global Settlement"),
+                    );
                     obj.insert("currentEpochBellTs".to_string(), json!(current_epoch_bell_ts));
                     obj.insert("nextEpochBellTs".to_string(), json!(next_epoch_bell_ts));
                     obj.insert("secondsRemaining".to_string(), json!(seconds_remaining));
                 }
-                let can_calculate_yields = net_diff > 0.0 && block_reward > 0.0;
+
+                let can_calculate_yields = net_diff_e6 > 0 && block_reward_sompi > 0;
                 let mut pipeline = redis::pipe();
                 let mut total_hashrate = 0.0;
                 let mut workers_array = Vec::new();
                 let mut keys_to_remove = Vec::new();
-                let mut yield_updates_to_publish = Vec::new();
-                let mut streamed_kas_by_wallet: HashMap<String, f64> = HashMap::new();
+                let mut accruals_by_wallet: HashMap<String, WalletAccrualDelta> = HashMap::new();
                 let mut wallet_hashrate_ths_map: HashMap<String, f64> = HashMap::new();
-                let mut wallet_best_loyalty_map: HashMap<String, (u64, u64, f64, bool, u64)> = HashMap::new();
+                let mut wallet_best_loyalty_map: HashMap<String, (u64, u64, u16, bool, u64)> =
+                    HashMap::new();
                 let mut db_worker_snapshots: Vec<WorkerDbSnapshot> = Vec::new();
                 let cutoff_300s = now.saturating_sub(300_000);
                 let cutoff_60s = now.saturating_sub(60_000);
@@ -462,7 +512,7 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                         let mut work_300s = 0.0;
                         let mut oldest_ts = now;
                         for &(ts, diff) in state.share_history.iter() {
-                            let work = diff * KASPA_DIFF_CONSTANT;
+                            let work = diff * KASPA_DIFF_CONSTANT_F64;
                             work_300s += work;
                             if ts >= cutoff_60s {
                                 work_60s += work;
@@ -471,14 +521,8 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                                 oldest_ts = ts;
                             }
                         }
-                        let mut elapsed_total = ((now - oldest_ts) as f64) / 1000.0;
-                        if elapsed_total < 1.0 {
-                            elapsed_total = 1.0;
-                        }
-                        let mut elapsed_60s = elapsed_total.min(60.0);
-                        if elapsed_60s < 1.0 {
-                            elapsed_60s = 1.0;
-                        }
+                        let elapsed_total = (((now - oldest_ts) as f64) / 1000.0).max(1.0);
+                        let elapsed_60s = elapsed_total.min(60.0).max(1.0);
                         let hr_300s = work_300s / elapsed_total;
                         let hr_60s = work_60s / elapsed_60s;
                         let current_hashrate = if state.share_history.is_empty() {
@@ -491,12 +535,17 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                             maintenance_grace_shield_active || dt_idle_ms <= active_grace_window_ms;
                         let total_attempts = state.valid_share_count + state.rejected_share_count;
                         let acceptance_pct = if total_attempts > 0 {
-                            ((state.valid_share_count as f64 / total_attempts as f64) * 100.0).clamp(0.0, 100.0)
+                            ((state.valid_share_count as f64 / total_attempts as f64) * 100.0)
+                                .clamp(0.0, 100.0)
                         } else {
                             100.0
                         };
                         let parts: Vec<&str> = full_worker.split('.').collect();
-                        let wallet_address = if !parts.is_empty() { parts[0] } else { full_worker.as_str() };
+                        let wallet_address = if !parts.is_empty() {
+                            parts[0]
+                        } else {
+                            full_worker.as_str()
+                        };
                         let worker_name = if parts.len() > 1 {
                             parts[1..].join(".")
                         } else {
@@ -517,10 +566,9 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                         }
 
                         if !is_online && !within_grace_window {
-                            // 2-hour disconnect grace window expired -> reset streak & evict
                             keys_to_remove.push(full_worker.clone());
                             state.streak_started_ts = 0;
-                            state.effective_fee_rate = pool_fee_rate;
+                            state.effective_fee_bps = pool_fee_bps;
                             WORKER_HASHRATE.with_label_values(&[full_worker]).set(0.0);
                             pipeline
                                 .cmd("SET")
@@ -543,16 +591,16 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                                 blocks_found: state.blocks_found as i64,
                                 last_share_ts: state.last_share_ts as i64,
                                 streak_started_ts: 0,
-                                effective_fee_rate: pool_fee_rate,
+                                effective_fee_bps: pool_fee_bps,
                                 status: "offline".to_string(),
                             });
                         } else if !is_online && within_grace_window {
-                            let (consecutive_weeks, eff_fee_rate) = compute_miner_loyalty_fee_rate(
+                            let (consecutive_weeks, eff_fee_bps) = compute_miner_loyalty_fee_bps(
                                 state.streak_started_ts,
                                 now,
-                                pool_fee_rate,
+                                pool_fee_bps,
                             );
-                            state.effective_fee_rate = eff_fee_rate;
+                            state.effective_fee_bps = eff_fee_bps;
                             let grace_remaining_secs = if maintenance_grace_shield_active {
                                 active_grace_window_secs
                             } else {
@@ -566,8 +614,8 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                                 .ignore();
                             pipeline
                                 .cmd("SET")
-                                .arg(format!("worker:{}:effective_fee_rate", full_worker))
-                                .arg(eff_fee_rate)
+                                .arg(format!("worker:{}:effective_fee_bps", full_worker))
+                                .arg(eff_fee_bps)
                                 .ignore();
                             pipeline
                                 .cmd("SET")
@@ -577,15 +625,17 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                             let entry = wallet_best_loyalty_map.entry(clean_wallet.clone()).or_insert((
                                 state.streak_started_ts,
                                 consecutive_weeks,
-                                eff_fee_rate,
+                                eff_fee_bps,
                                 false,
                                 grace_remaining_secs,
                             ));
-                            if eff_fee_rate < entry.2 || (state.streak_started_ts > 0 && state.streak_started_ts < entry.0) {
+                            if eff_fee_bps < entry.2
+                                || (state.streak_started_ts > 0 && state.streak_started_ts < entry.0)
+                            {
                                 *entry = (
                                     state.streak_started_ts,
                                     consecutive_weeks,
-                                    eff_fee_rate,
+                                    eff_fee_bps,
                                     entry.3,
                                     grace_remaining_secs.max(entry.4),
                                 );
@@ -601,37 +651,40 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                                 blocks_found: state.blocks_found as i64,
                                 last_share_ts: state.last_share_ts as i64,
                                 streak_started_ts: state.streak_started_ts as i64,
-                                effective_fee_rate: eff_fee_rate,
+                                effective_fee_bps: eff_fee_bps,
                                 status: "grace_period".to_string(),
                             });
                         } else {
                             if state.streak_started_ts == 0 {
                                 state.streak_started_ts = now;
                             }
-                            let (consecutive_weeks, eff_fee_rate) = compute_miner_loyalty_fee_rate(
+                            let (consecutive_weeks, eff_fee_bps) = compute_miner_loyalty_fee_bps(
                                 state.streak_started_ts,
                                 now,
-                                pool_fee_rate,
+                                pool_fee_bps,
                             );
-                            state.effective_fee_rate = eff_fee_rate;
+                            state.effective_fee_bps = eff_fee_bps;
                             let grace_remaining_secs = active_grace_window_secs;
                             let entry = wallet_best_loyalty_map.entry(clean_wallet.clone()).or_insert((
                                 state.streak_started_ts,
                                 consecutive_weeks,
-                                eff_fee_rate,
+                                eff_fee_bps,
                                 true,
                                 grace_remaining_secs,
                             ));
                             entry.3 = true;
                             entry.4 = active_grace_window_secs;
-                            if eff_fee_rate <= entry.2 {
+                            if eff_fee_bps <= entry.2 {
                                 entry.0 = state.streak_started_ts;
                                 entry.1 = consecutive_weeks;
-                                entry.2 = eff_fee_rate;
+                                entry.2 = eff_fee_bps;
                             }
                             total_hashrate += current_hashrate;
-                            *wallet_hashrate_ths_map.entry(clean_wallet.clone()).or_insert(0.0) += current_hashrate / 1e12;
-                            WORKER_HASHRATE.with_label_values(&[full_worker]).set(current_hashrate / 1e12);
+                            *wallet_hashrate_ths_map.entry(clean_wallet.clone()).or_insert(0.0) +=
+                                current_hashrate / 1e12;
+                            WORKER_HASHRATE
+                                .with_label_values(&[full_worker])
+                                .set(current_hashrate / 1e12);
                             pipeline
                                 .cmd("SET")
                                 .arg(format!("worker:{}:hashrate", full_worker))
@@ -674,66 +727,65 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                                 .ignore();
                             pipeline
                                 .cmd("SET")
-                                .arg(format!("worker:{}:effective_fee_rate", full_worker))
-                                .arg(eff_fee_rate)
+                                .arg(format!("worker:{}:effective_fee_bps", full_worker))
+                                .arg(eff_fee_bps)
                                 .ignore();
                             pipeline
                                 .cmd("SADD")
                                 .arg("pool:workers")
                                 .arg(full_worker.clone())
                                 .ignore();
+
                             if can_calculate_yields && state.unflushed_difficulty > 0.0 {
-                                let is_house_anchor = !corp_kas_clean.is_empty() && clean_wallet == corp_kas_clean;
-                                let work_hashes = state.unflushed_difficulty * KASPA_DIFF_CONSTANT;
-                                let expected_block_hashes = net_diff * 2.0;
-                                let gross_kas_yield = (work_hashes * block_reward) / expected_block_hashes;
-                                let pool_fee_kas = if is_house_anchor {
-                                    0.0
+                                let is_house_anchor =
+                                    !corp_kas_clean.is_empty() && clean_wallet == corp_kas_clean;
+                                let diff_e6 =
+                                    (state.unflushed_difficulty * 1_000_000.0).round().max(0.0)
+                                        as u128;
+                                let gross_sompi = crate::agent::solvency::mul_div_floor_u128(
+                                    diff_e6.saturating_mul(KASPA_DIFF_CONSTANT_U128),
+                                    block_reward_sompi,
+                                    net_diff_e6.saturating_mul(2),
+                                )
+                                .unwrap_or(0);
+                                let share_fee_sompi = if is_house_anchor {
+                                    0
                                 } else {
-                                    gross_kas_yield * eff_fee_rate
+                                    gross_sompi.saturating_mul(eff_fee_bps as u128) / 10_000
                                 };
-                                let theoretical_net_kas_yield = (gross_kas_yield - pool_fee_kas).max(0.0);
-                                let streamed_kas_now = if is_house_anchor {
-                                    theoretical_net_kas_yield
-                                } else {
-                                    let deferred_key = format!("worker:{}:deferred_yield_kas", full_worker);
-                                    let deferred_str: Option<String> = redis::cmd("GET")
-                                        .arg(&deferred_key)
-                                        .query_async(&mut redis_conn)
-                                        .await
-                                        .unwrap_or(None);
-                                    let existing_deferred = deferred_str
-                                        .and_then(|s| s.parse::<f64>().ok())
-                                        .unwrap_or(0.0)
-                                        .max(0.0);
-                                    let deferred_release = if elastic_streaming_factor >= 0.99 && existing_deferred > 0.0 {
-                                        (existing_deferred * 0.10).min(available_headroom_kas * 0.25)
+                                let miner_net_sompi = gross_sompi.saturating_sub(share_fee_sompi);
+
+                                pending_micro_shares.push(PendingMicroShare {
+                                    worker_id: full_worker.clone(),
+                                    difficulty_weight: state.unflushed_difficulty,
+                                    network_diff: net_diff,
+                                    sompi_delta: miner_net_sompi.min(i64::MAX as u128) as i64,
+                                    pool_fee_sompi: share_fee_sompi.min(i64::MAX as u128) as i64,
+                                    block_daa_score: current_virtual_daa,
+                                    is_settled: miner_net_sompi > 0,
+                                });
+
+                                if (miner_net_sompi > 0 || share_fee_sompi > 0)
+                                    && !clean_wallet.is_empty()
+                                {
+                                    let prefixed = if wallet_address.starts_with("kaspa:") {
+                                        wallet_address.to_string()
                                     } else {
-                                        0.0
+                                        format!("kaspa:{}", clean_wallet)
                                     };
-                                    let target_stream = (theoretical_net_kas_yield * elastic_streaming_factor) + deferred_release;
-                                    let actual_stream = target_stream.min(available_headroom_kas * 0.50).max(0.0);
-                                    let newly_deferred = (theoretical_net_kas_yield - (actual_stream - deferred_release)).max(0.0);
-                                    let next_deferred = (existing_deferred - deferred_release + newly_deferred).max(0.0);
-                                    pipeline.cmd("SET").arg(&deferred_key).arg(next_deferred).ignore();
-                                    if actual_stream > 0.0 {
-                                        available_headroom_kas = (available_headroom_kas - actual_stream).max(0.0);
-                                        total_external_streamed_kas += actual_stream;
-                                        pipeline
-                                            .cmd("INCRBYFLOAT")
-                                            .arg("perennia:pool:external_streamed_kas")
-                                            .arg(actual_stream)
-                                            .ignore();
-                                    }
-                                    actual_stream
-                                };
-                                if streamed_kas_now > 0.0 {
-                                    pipeline
-                                        .cmd("INCRBYFLOAT")
-                                        .arg(format!("worker:{}:unpaid_yield", full_worker))
-                                        .arg(streamed_kas_now)
-                                        .ignore();
-                                    *streamed_kas_by_wallet.entry(clean_wallet).or_insert(0.0) += streamed_kas_now;
+                                    let acc = accruals_by_wallet
+                                        .entry(clean_wallet.clone())
+                                        .or_insert_with(|| WalletAccrualDelta {
+                                            prefixed_wallet: prefixed,
+                                            miner_net_sompi: 0,
+                                            pool_fee_sompi: 0,
+                                            pool_fee_bps: eff_fee_bps,
+                                        });
+                                    acc.miner_net_sompi =
+                                        acc.miner_net_sompi.saturating_add(miner_net_sompi);
+                                    acc.pool_fee_sompi =
+                                        acc.pool_fee_sompi.saturating_add(share_fee_sompi);
+                                    acc.pool_fee_bps = eff_fee_bps.min(acc.pool_fee_bps);
                                 }
                                 state.unflushed_difficulty = 0.0;
                             }
@@ -751,7 +803,7 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                                 blocks_found: state.blocks_found as i64,
                                 last_share_ts: state.last_share_ts as i64,
                                 streak_started_ts: state.streak_started_ts as i64,
-                                effective_fee_rate: eff_fee_rate,
+                                effective_fee_bps: eff_fee_bps,
                                 status: "online".to_string(),
                             });
                             workers_array.push(json!({
@@ -766,11 +818,10 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                                 "lastShareTimestamp": state.last_share_ts,
                                 "streakStartedTs": state.streak_started_ts,
                                 "consecutiveWeeks": consecutive_weeks,
-                                "effectiveFeeRate": eff_fee_rate,
-                                "effectiveFeePct": (eff_fee_rate * 10000.0).round() / 100.0,
+                                "effectiveFeeBps": eff_fee_bps,
                                 "graceWindowSecsRemaining": grace_remaining_secs,
                                 "maintenanceGraceShieldActive": maintenance_grace_shield_active,
-                                "swapFeeFloorPct": 0.10,
+                                "swapFeeFloorBps": MINER_PERK_SWAP_FEE_FLOOR_BPS,
                                 "blocksFound": state.blocks_found,
                                 "status": "online"
                             }));
@@ -780,7 +831,10 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                         worker_states.remove(&key);
                     }
                 }
-                for (clean_w, (streak_ms, weeks, eff_fee_rate, is_actively_online, grace_rem_secs)) in &wallet_best_loyalty_map {
+
+                for (clean_w, (streak_ms, weeks, eff_fee_bps, is_actively_online, grace_rem_secs)) in
+                    &wallet_best_loyalty_map
+                {
                     if clean_w.is_empty() {
                         continue;
                     }
@@ -793,10 +847,8 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                         "maintenanceGraceShieldActive": maintenance_grace_shield_active,
                         "streakStartedTs": *streak_ms,
                         "consecutiveWeeks": *weeks,
-                        "effectivePoolFeeRate": *eff_fee_rate,
-                        "effectivePoolFeePct": (*eff_fee_rate * 10000.0).round() / 100.0,
-                        "unlockedSwapFeeFloorRate": MINER_PERK_SWAP_FEE_FLOOR_RATE,
-                        "unlockedSwapFeeFloorPct": 0.10,
+                        "effectivePoolFeeBps": *eff_fee_bps,
+                        "unlockedSwapFeeFloorBps": MINER_PERK_SWAP_FEE_FLOOR_BPS,
                         "graceWindowSecsRemaining": *grace_rem_secs,
                         "updatedAt": now_secs
                     });
@@ -807,91 +859,41 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                         .arg(loyalty_payload.to_string())
                         .ignore();
                 }
-                for (clean_wallet, wallet_streamed_kas) in streamed_kas_by_wallet {
-                    if wallet_streamed_kas <= 0.0 {
-                        continue;
-                    }
-                    let prefixed_wallet = format!("kaspa:{}", clean_wallet);
-                    let needs_db_refresh = match sector_layout_cache.get(&clean_wallet) {
-                        Some(cached) => cached.fetched_at.elapsed() >= LAYOUT_CACHE_TTL,
-                        None => true,
-                    };
-                    if needs_db_refresh {
-                        if let Ok(Some(row)) = sqlx::query(
-                            "SELECT layout_state FROM user_command_centers WHERE wallet_address = $1 OR wallet_address = $2 LIMIT 1"
-                        )
-                        .bind(&prefixed_wallet)
-                        .bind(&clean_wallet)
-                        .fetch_optional(&pg_pool)
-                        .await
-                        {
-                            if let Ok(layout_state) = row.try_get::<Value, _>("layout_state") {
-                                sector_layout_cache.insert(
-                                    clean_wallet.clone(),
-                                    CachedSectorLayout {
-                                        layout_state,
-                                        fetched_at: Instant::now(),
-                                    },
-                                );
-                            }
-                        }
-                    }
-                    let mut allocated_pct_sum = 0.0_f64;
-                    if let Some(cached) = sector_layout_cache.get_mut(&clean_wallet) {
-                        if let Some(sectors_array) = cached
-                            .layout_state
-                            .get_mut("sectors")
-                            .and_then(|s| s.as_array_mut())
-                        {
-                            for sector in sectors_array.iter_mut() {
-                                if let Some(pct) = sector.get("allocationPercentage").and_then(|v| v.as_f64()) {
-                                    let clamped_pct = pct.clamp(0.0, 100.0);
-                                    allocated_pct_sum += clamped_pct;
-                                    let projected_micro_yield = wallet_streamed_kas * (clamped_pct / 100.0);
-                                    let current_pending = sector.get("pendingKaspa").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                    sector["pendingKaspa"] = json!(current_pending + projected_micro_yield);
-                                }
-                            }
-                            if let Some(sectors_val) = cached.layout_state.get("sectors") {
-                                yield_updates_to_publish.push(json!({
-                                    "wallet": clean_wallet,
-                                    "yield_update": true,
-                                    "sectors": sectors_val
-                                }));
-                            }
-                        }
-                        let layout_to_save = cached.layout_state.clone();
-                        let pool_layout = pg_pool.clone();
-                        let pref_w = prefixed_wallet.clone();
-                        tokio::spawn(async move {
-                            let _ = sqlx::query(
-                                "UPDATE user_command_centers SET layout_state = $2, last_updated = CURRENT_TIMESTAMP WHERE wallet_address = $1"
+
+                // Persist deterministic immature sompi accruals into stratum_mature_accruals
+                // (promoted to unpaid_mature_sompi strictly on 1,000-DAA coinbase maturity)
+                if !accruals_by_wallet.is_empty() {
+                    let pool_acc = pg_pool.clone();
+                    tokio::spawn(async move {
+                        for (clean_w, delta) in accruals_by_wallet {
+                            if let Err(e) = sqlx::query(
+                                r#"
+                                INSERT INTO stratum_mature_accruals (
+                                    clean_wallet, wallet_address, immature_sompi,
+                                    lifetime_pool_fee_sompi, pool_fee_bps, updated_at
+                                ) VALUES ($1, $2, $3::NUMERIC(39, 0), $4::NUMERIC(39, 0), $5, CURRENT_TIMESTAMP)
+                                ON CONFLICT (clean_wallet) DO UPDATE SET
+                                    wallet_address = EXCLUDED.wallet_address,
+                                    immature_sompi = stratum_mature_accruals.immature_sompi + EXCLUDED.immature_sompi,
+                                    lifetime_pool_fee_sompi = stratum_mature_accruals.lifetime_pool_fee_sompi + EXCLUDED.lifetime_pool_fee_sompi,
+                                    pool_fee_bps = EXCLUDED.pool_fee_bps,
+                                    updated_at = CURRENT_TIMESTAMP
+                                "#,
                             )
-                            .bind(&pref_w)
-                            .bind(&layout_to_save)
-                            .execute(&pool_layout)
-                            .await;
-                        });
-                    }
-                    let unallocated_ratio = ((100.0 - allocated_pct_sum).max(0.0) / 100.0).clamp(0.0, 1.0);
-                    let unassigned_kas_delta = wallet_streamed_kas * unallocated_ratio;
-                    if unassigned_kas_delta > 0.0 {
-                        let _ = crate::chronos::upsert_signed_yield_reservoir_kas(
-                            &pg_pool,
-                            &prefixed_wallet,
-                            unassigned_kas_delta,
-                            unassigned_kas_delta,
-                            unassigned_kas_delta,
-                        )
-                        .await;
-                        pipeline
-                            .cmd("HINCRBYFLOAT")
-                            .arg(format!("dev:sor:treasury:balances:{}", clean_wallet))
-                            .arg("Unassigned KAS")
-                            .arg(unassigned_kas_delta)
-                            .ignore();
-                    }
+                            .bind(&clean_w)
+                            .bind(&delta.prefixed_wallet)
+                            .bind(delta.miner_net_sompi.to_string())
+                            .bind(delta.pool_fee_sompi.to_string())
+                            .bind(delta.pool_fee_bps as i32)
+                            .execute(&pool_acc)
+                            .await
+                            {
+                                tracing::error!("stratum_mature_accruals upsert failed: {}", e);
+                            }
+                        }
+                    });
                 }
+
                 if tick_counter % 15 == 0 {
                     let global_point = json!({
                         "ts": now_secs,
@@ -914,70 +916,143 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                             "hashrateThs": *w_ths
                         });
                         let w_key = format!("perennia:hashrate:history:{}", w_clean);
-                        pipeline.cmd("RPUSH").arg(&w_key).arg(w_point.to_string()).ignore();
+                        pipeline
+                            .cmd("RPUSH")
+                            .arg(&w_key)
+                            .arg(w_point.to_string())
+                            .ignore();
                         pipeline.cmd("LTRIM").arg(&w_key).arg(-2880).arg(-1).ignore();
                     }
                 }
+
                 if !pending_micro_shares.is_empty() {
                     let batch = std::mem::take(&mut pending_micro_shares);
-                    let (mut w_ids, mut diffs, mut deltas, mut ndiffs, mut settled) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
-                    for (w_id, diff_w, eff_fee) in batch {
-                        let cw = w_id.split('.').next().unwrap_or("").to_lowercase().replace("kaspa:", "");
-                        let is_house = !corp_kas_clean.is_empty() && cw == corp_kas_clean;
-                        let kd = if can_calculate_yields {
-                            let g = (diff_w * KASPA_DIFF_CONSTANT * block_reward) / (net_diff * 2.0);
-                            if is_house { g.max(0.0) } else { (g * (1.0 - eff_fee) * elastic_streaming_factor).max(0.0) }
-                        } else { 0.0 };
-                        w_ids.push(w_id); diffs.push(diff_w); deltas.push(kd); ndiffs.push(net_diff); settled.push(kd > 0.0);
+                    let mut w_ids = Vec::with_capacity(batch.len());
+                    let mut diffs = Vec::with_capacity(batch.len());
+                    let mut legacy_zeros = Vec::with_capacity(batch.len());
+                    let mut ndiffs = Vec::with_capacity(batch.len());
+                    let mut settled = Vec::with_capacity(batch.len());
+                    let mut sompis = Vec::with_capacity(batch.len());
+                    let mut fees = Vec::with_capacity(batch.len());
+                    let mut daas = Vec::with_capacity(batch.len());
+                    for item in batch {
+                        w_ids.push(item.worker_id);
+                        diffs.push(item.difficulty_weight);
+                        legacy_zeros.push(0.0_f64);
+                        ndiffs.push(item.network_diff);
+                        settled.push(item.is_settled);
+                        sompis.push(item.sompi_delta);
+                        fees.push(item.pool_fee_sompi);
+                        daas.push(item.block_daa_score);
                     }
                     let pool_ms = pg_pool.clone();
                     let prune = tick_counter % 300 == 0;
                     tokio::spawn(async move {
-                        if let Err(e) = sqlx::query("INSERT INTO micro_shares (worker_id, difficulty_weight, kas_value_delta, network_diff, is_settled) SELECT * FROM UNNEST($1::text[], $2::float8[], $3::float8[], $4::float8[], $5::bool[])")
-                            .bind(&w_ids).bind(&diffs).bind(&deltas).bind(&ndiffs).bind(&settled).execute(&pool_ms).await {
+                        if let Err(e) = sqlx::query(
+                            r#"
+                            INSERT INTO micro_shares (
+                                worker_id, difficulty_weight, kas_value_delta,
+                                network_diff, is_settled, sompi_delta, pool_fee_sompi, block_daa_score
+                            )
+                            SELECT * FROM UNNEST(
+                                $1::text[], $2::float8[], $3::float8[],
+                                $4::float8[], $5::bool[], $6::bigint[], $7::bigint[], $8::bigint[]
+                            )
+                            "#,
+                        )
+                        .bind(&w_ids)
+                        .bind(&diffs)
+                        .bind(&legacy_zeros)
+                        .bind(&ndiffs)
+                        .bind(&settled)
+                        .bind(&sompis)
+                        .bind(&fees)
+                        .bind(&daas)
+                        .execute(&pool_ms)
+                        .await
+                        {
                             tracing::error!("micro_shares insert failed: {}", e);
                         }
-                        if prune { let _ = sqlx::query("DELETE FROM micro_shares WHERE recorded_at < CURRENT_TIMESTAMP - INTERVAL '24 hours'").execute(&pool_ms).await; }
+                        if prune {
+                            let _ = sqlx::query(
+                                "DELETE FROM micro_shares WHERE recorded_at < CURRENT_TIMESTAMP - INTERVAL '24 hours'",
+                            )
+                            .execute(&pool_ms)
+                            .await;
+                        }
                     });
                 }
+
                 if tick_counter % 5 == 0 && !db_worker_snapshots.is_empty() {
                     let pool_bg = pg_pool.clone();
                     tokio::spawn(async move {
                         for snap in db_worker_snapshots {
-                            let port_pub = crate::stratum_tcp::resolve_worker_public_port(&snap.full_identity);
-                            let dev_prof = match port_pub { 3331 => "GPU_TIER_1", 3333 => "INDUSTRIAL_ASIC_TIER_3", _ => "HOME_ASIC_TIER_2" };
+                            let port_pub =
+                                crate::stratum_tcp::resolve_worker_public_port(&snap.full_identity);
+                            let dev_prof = match port_pub {
+                                3331 => "GPU_TIER_1",
+                                3333 => "INDUSTRIAL_ASIC_TIER_3",
+                                _ => "HOME_ASIC_TIER_2",
+                            };
                             let wn = snap.worker_name.to_lowercase();
-                            let hw = if wn.contains("ks7") { "IceRiver KS7 Lite" } else if wn.contains("ultra") { "IceRiver KS0 Ultra" } else if wn.contains("pro") { "IceRiver KS0 Pro" } else if wn.contains("ks0") { "IceRiver KS0" } else { "IceRiver KS" };
+                            let hw = if wn.contains("ks7") {
+                                "IceRiver KS7 Lite"
+                            } else if wn.contains("ultra") {
+                                "IceRiver KS0 Ultra"
+                            } else if wn.contains("pro") {
+                                "IceRiver KS0 Pro"
+                            } else if wn.contains("ks0") {
+                                "IceRiver KS0"
+                            } else {
+                                "IceRiver KS"
+                            };
                             let raw_hr = snap.hashrate_ths * 1e12;
-                            if let Err(e) = sqlx::query("INSERT INTO worker_profiles (worker_id, worker_identity, wallet_address, device_profile, hardware_model, worker_name, hashrate_ths, current_hashrate, stratum_port, valid_shares, rejected_shares, acceptance_pct, blocks_found, last_share_ts, streak_started_ts, effective_fee_rate, status, updated_at, last_seen) VALUES ($1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT (worker_id) DO UPDATE SET worker_identity = EXCLUDED.worker_identity, wallet_address = EXCLUDED.wallet_address, device_profile = EXCLUDED.device_profile, hardware_model = EXCLUDED.hardware_model, worker_name = EXCLUDED.worker_name, hashrate_ths = EXCLUDED.hashrate_ths, current_hashrate = EXCLUDED.current_hashrate, stratum_port = EXCLUDED.stratum_port, valid_shares = EXCLUDED.valid_shares, rejected_shares = EXCLUDED.rejected_shares, acceptance_pct = EXCLUDED.acceptance_pct, blocks_found = EXCLUDED.blocks_found, last_share_ts = EXCLUDED.last_share_ts, streak_started_ts = EXCLUDED.streak_started_ts, effective_fee_rate = EXCLUDED.effective_fee_rate, status = EXCLUDED.status, updated_at = CURRENT_TIMESTAMP, last_seen = CASE WHEN EXCLUDED.status = 'online' THEN CURRENT_TIMESTAMP ELSE worker_profiles.last_seen END")
-                                .bind(&snap.full_identity).bind(&snap.wallet_address).bind(dev_prof).bind(hw).bind(&snap.worker_name).bind(snap.hashrate_ths).bind(raw_hr).bind(port_pub).bind(snap.valid_shares).bind(snap.rejected_shares).bind(snap.acceptance_pct).bind(snap.blocks_found).bind(snap.last_share_ts).bind(snap.streak_started_ts).bind(snap.effective_fee_rate).bind(&snap.status)
-                                .execute(&pool_bg).await {
+                            if let Err(e) = sqlx::query(
+                                "INSERT INTO worker_profiles (worker_id, worker_identity, wallet_address, device_profile, hardware_model, worker_name, hashrate_ths, current_hashrate, stratum_port, valid_shares, rejected_shares, acceptance_pct, blocks_found, last_share_ts, streak_started_ts, effective_fee_bps, status, updated_at, last_seen) VALUES ($1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT (worker_id) DO UPDATE SET worker_identity = EXCLUDED.worker_identity, wallet_address = EXCLUDED.wallet_address, device_profile = EXCLUDED.device_profile, hardware_model = EXCLUDED.hardware_model, worker_name = EXCLUDED.worker_name, hashrate_ths = EXCLUDED.hashrate_ths, current_hashrate = EXCLUDED.current_hashrate, stratum_port = EXCLUDED.stratum_port, valid_shares = EXCLUDED.valid_shares, rejected_shares = EXCLUDED.rejected_shares, acceptance_pct = EXCLUDED.acceptance_pct, blocks_found = EXCLUDED.blocks_found, last_share_ts = EXCLUDED.last_share_ts, streak_started_ts = EXCLUDED.streak_started_ts, effective_fee_bps = EXCLUDED.effective_fee_bps, status = EXCLUDED.status, updated_at = CURRENT_TIMESTAMP, last_seen = CASE WHEN EXCLUDED.status = 'online' THEN CURRENT_TIMESTAMP ELSE worker_profiles.last_seen END",
+                            )
+                            .bind(&snap.full_identity)
+                            .bind(&snap.wallet_address)
+                            .bind(dev_prof)
+                            .bind(hw)
+                            .bind(&snap.worker_name)
+                            .bind(snap.hashrate_ths)
+                            .bind(raw_hr)
+                            .bind(port_pub)
+                            .bind(snap.valid_shares)
+                            .bind(snap.rejected_shares)
+                            .bind(snap.acceptance_pct)
+                            .bind(snap.blocks_found)
+                            .bind(snap.last_share_ts)
+                            .bind(snap.streak_started_ts)
+                            .bind(snap.effective_fee_bps as i32)
+                            .bind(&snap.status)
+                            .execute(&pool_bg)
+                            .await
+                            {
                                 tracing::error!("worker_profiles upsert failed: {}", e);
                             }
                         }
                     });
                 }
-                let total_blocks_kas = cached_l1_blocks_won_kas + cached_immature_blocks_kas;
-                let earned_pool_fee_kas = total_blocks_kas * pool_fee_rate;
-                let custodial_miner_blocks_kas = total_blocks_kas * (1.0 - pool_fee_rate);
-                pipeline
-                    .cmd("SET")
-                    .arg("perennia:fees:batch_accumulated:KAS")
-                    .arg(earned_pool_fee_kas)
-                    .ignore();
+
+                let total_blocks_sompi =
+                    cached_l1_blocks_won_sompi.saturating_add(cached_immature_blocks_sompi);
+                let earned_pool_fee_sompi =
+                    total_blocks_sompi.saturating_mul(pool_fee_bps as u128) / 10_000;
+                let miner_blocks_sompi = total_blocks_sompi.saturating_sub(earned_pool_fee_sompi);
+
                 let solvency_telemetry = json!({
-                    "maxHouseFloatKas": max_house_float_kas,
                     "totalBlocksWonCount": cached_total_blocks_count,
-                    "l1BlocksWonKas": cached_l1_blocks_won_kas,
-                    "immatureBlocksKas": cached_immature_blocks_kas,
-                    "totalBlocksRewardKas": total_blocks_kas,
-                    "earnedPoolFeeKas": earned_pool_fee_kas,
-                    "custodialMinerObligationKas": custodial_miner_blocks_kas,
+                    "l1BlocksWonSompi": cached_l1_blocks_won_sompi.to_string(),
+                    "immatureBlocksSompi": cached_immature_blocks_sompi.to_string(),
+                    "totalBlocksRewardSompi": total_blocks_sompi.to_string(),
+                    "earnedPoolFeeSompi": earned_pool_fee_sompi.to_string(),
+                    "minerBlocksNetSompi": miner_blocks_sompi.to_string(),
+                    "unpaidMatureSompi": cached_unpaid_mature_sompi.to_string(),
+                    "immatureAccrualsSompi": cached_immature_accruals_sompi.to_string(),
+                    "stage1FlushFloorSompi": STAGE1_FLUSH_FLOOR_SOMPI.to_string(),
+                    "poolFeeBps": pool_fee_bps,
                     "coinbaseMaturityDaa": coinbase_maturity_daa,
-                    "solvencyCeilingKas": total_solvency_ceiling_kas,
-                    "externalStreamedKas": total_external_streamed_kas,
-                    "availableHeadroomKas": available_headroom_kas,
-                    "elasticStreamingFactor": elastic_streaming_factor,
                     "maintenanceGraceShieldActive": maintenance_grace_shield_active,
                     "updatedAt": now_secs
                 });
@@ -994,7 +1069,8 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                 let telemetry_payload = json!({
                     "totalHashrate": total_hashrate,
                     "networkDifficulty": net_diff,
-                    "blockRewardKas": block_reward,
+                    "blockRewardSompi": block_reward_sompi.to_string(),
+                    "virtualDaaScore": current_virtual_daa,
                     "workers": workers_array,
                     "epoch": epoch_telemetry_val,
                     "fppsSolvency": solvency_telemetry
@@ -1019,15 +1095,9 @@ pub async fn start_accounting_engine(mut valid_share_rx: mpsc::Receiver<(String,
                     .arg("telemetry:updates")
                     .arg(telemetry_payload.to_string())
                     .ignore();
-                for update in yield_updates_to_publish {
-                    pipeline
-                        .cmd("PUBLISH")
-                        .arg("telemetry:updates")
-                        .arg(update.to_string())
-                        .ignore();
-                }
+
                 if let Err(e) = pipeline.query_async::<_, ()>(&mut redis_conn).await {
-                    tracing::error!("🚨 CRITICAL LEDGER FAILURE: {}", e);
+                    tracing::error!("🚨 CRITICAL REDIS TELEMETRY FAILURE: {}", e);
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     if let Ok(new_conn) = redis_client.get_multiplexed_async_connection().await {
                         redis_conn = new_conn;

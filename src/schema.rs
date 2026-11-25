@@ -716,29 +716,35 @@ pub async fn ensure_database_schema(pool: &PgPool) -> anyhow::Result<()> {
         }
     }
 
-    let default_whitelist_rows: &[(&str, &str, &str, f64)] = &[
-        ("KAS", "Kaspa Native L1", "KAS", 35.0),
-        ("USDC", "USD Coin Reserve", "ETH", 20.0),
-        ("USDT", "Tether USD Reserve", "ETH", 10.0),
-        ("BTC", "Bitcoin L1 Reserve", "BTC", 15.0),
-        ("ETH", "Ethereum L1 Reserve", "ETH", 10.0),
-        ("SOL", "Solana L1 Reserve", "SOL", 5.0),
-        ("SILO", "Perennia Silo Utility (KRC-20)", "KAS", 5.0),
+    sqlx::raw_sql(include_str!(
+        "../db/migrations/20261125_sovereign_l1_sompi_spine.sql"
+    ))
+    .execute(pool)
+    .await?;
+
+    let default_whitelist_rows: &[(&str, &str, &str, i32)] = &[
+        ("KAS", "Kaspa Native L1", "KAS", 35),
+        ("USDC", "USD Coin Reserve", "ETH", 20),
+        ("USDT", "Tether USD Reserve", "ETH", 10),
+        ("BTC", "Bitcoin L1 Reserve", "BTC", 15),
+        ("ETH", "Ethereum L1 Reserve", "ETH", 10),
+        ("SOL", "Solana L1 Reserve", "SOL", 5),
+        ("SILO", "Perennia Silo Utility (KCC-20)", "KAS", 5),
     ];
 
-    for &(ticker, name, net, weight) in default_whitelist_rows {
+    for &(ticker, name, net, weight_pct_int) in default_whitelist_rows {
         let _ = sqlx::query(
             r#"
             INSERT INTO token_steering_matrix (
                 ticker, asset_name, network, steering_state, is_whitelisted, target_weight_pct
-            ) VALUES ($1, $2, $3, 'AUTO_BALANCE', TRUE, $4)
+            ) VALUES ($1, $2, $3, 'AUTO_BALANCE', TRUE, $4::float8)
             ON CONFLICT (ticker) DO NOTHING
             "#,
         )
         .bind(ticker)
         .bind(name)
         .bind(net)
-        .bind(weight)
+        .bind(weight_pct_int)
         .execute(pool)
         .await;
     }
@@ -747,44 +753,59 @@ pub async fn ensure_database_schema(pool: &PgPool) -> anyhow::Result<()> {
         .or_else(|_| env::var("MASTER_ADMIN_ADDRESS"))
         .or_else(|_| env::var("PERENNIA_COLD_KAS_ADDRESS"))
         .unwrap_or_default();
-    let default_hot_ceiling = env::var("PERENNIA_HOT_CEILING_KAS")
+    let default_house_rev_kas = env::var("PERENNIA_HOUSE_REVENUE_KAS_ADDRESS")
+        .unwrap_or_else(|_| default_cold_kas.clone());
+
+    let default_hot_ceiling_sompi: i64 = env::var("PERENNIA_HOT_CEILING_SOMPI")
         .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|&v| v > 0.0)
-        .unwrap_or(5000.0);
-    let default_min_runway = env::var("PERENNIA_MIN_RUNWAY_KAS")
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(500_000_000_000);
+    let default_min_runway_sompi: i64 = env::var("PERENNIA_MIN_RUNWAY_SOMPI")
         .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|&v| v >= 0.0)
-        .unwrap_or(250.0);
-    let default_fpps_float = env::var("FPPS_MAX_FLOAT_KAS")
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|&v| v >= 0)
+        .unwrap_or(25_000_000_000);
+    let default_fpps_float_sompi: i64 = env::var("FPPS_MAX_FLOAT_SOMPI")
         .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|&v| v > 0.0)
-        .unwrap_or(50.0);
-    let default_pool_fee = env::var("POOL_FEE_RATE")
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(5_000_000_000);
+    let default_pool_fee_bps: i32 = env::var("POOL_FEE_BPS")
         .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|&v| v >= 0.0 && v < 1.0)
-        .unwrap_or(0.01);
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .filter(|&v| (50..=200).contains(&v))
+        .unwrap_or(100);
 
     let _ = sqlx::query(
         r#"
         INSERT INTO system_treasury_config (
-            config_id, hot_ceiling_kas, min_runway_kas, fpps_max_float_kas,
-            pool_fee_rate, outflow_breaker_tripped, cold_kas_address
-        ) VALUES ('PRIMARY', $1, $2, $3, $4, FALSE, $5)
+            config_id,
+            hot_ceiling_sompi,
+            min_runway_sompi,
+            fpps_max_float_sompi,
+            pool_fee_bps,
+            house_revenue_kas_address,
+            outflow_breaker_tripped,
+            solvency_breaker_tripped,
+            cold_kas_address
+        ) VALUES ('PRIMARY', $1, $2, $3, $4, $5, FALSE, FALSE, $6)
         ON CONFLICT (config_id) DO UPDATE SET
             cold_kas_address = CASE
                 WHEN system_treasury_config.cold_kas_address = '' THEN EXCLUDED.cold_kas_address
                 ELSE system_treasury_config.cold_kas_address
+            END,
+            house_revenue_kas_address = CASE
+                WHEN system_treasury_config.house_revenue_kas_address = '' THEN EXCLUDED.house_revenue_kas_address
+                ELSE system_treasury_config.house_revenue_kas_address
             END
         "#,
     )
-    .bind(default_hot_ceiling)
-    .bind(default_min_runway)
-    .bind(default_fpps_float)
-    .bind(default_pool_fee)
+    .bind(default_hot_ceiling_sompi)
+    .bind(default_min_runway_sompi)
+    .bind(default_fpps_float_sompi)
+    .bind(default_pool_fee_bps)
+    .bind(default_house_rev_kas.trim())
     .bind(default_cold_kas.trim())
     .execute(pool)
     .await;
@@ -815,8 +836,60 @@ pub async fn ensure_database_schema(pool: &PgPool) -> anyhow::Result<()> {
         }
     }
 
+    purge_legacy_custodial_redis_keys().await;
+
     tracing::info!(
-        "✅ PostgreSQL Schema Bootstrapper Verified (System Config, 5-State Token Steering Matrix, Security Firewall, Gross-Up Fiat Columns, HMAC Invariants & HIFO Tables Ready)."
+        "✅ Sovereign L1 Sompi Spine Schema Verified (stratum_mature_accruals, epoch_payout_outbox, vault_locks, thermostat_valves, settlement_receipts & zero-custody guards ready)."
     );
     Ok(())
+}
+
+async fn purge_legacy_custodial_redis_keys() {
+    let Ok(redis_url) = env::var("REDIS_URL") else {
+        return;
+    };
+    let Ok(client) = redis::Client::open(redis_url.trim()) else {
+        return;
+    };
+    let Ok(mut conn) = client.get_multiplexed_async_connection().await else {
+        return;
+    };
+
+    let _ = redis::cmd("DEL")
+        .arg("perennia:pool:external_streamed_kas")
+        .query_async::<_, i64>(&mut conn)
+        .await;
+
+    let patterns = [
+        "dev:sor:treasury:balances:*",
+        "worker:*:unpaid_yield",
+        "worker:*:deferred_yield_kas",
+    ];
+    for pattern in patterns {
+        let mut cursor: u64 = 0;
+        loop {
+            let scan_res: redis::RedisResult<(u64, Vec<String>)> = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(pattern)
+                .arg("COUNT")
+                .arg(256)
+                .query_async(&mut conn)
+                .await;
+            let Ok((next_cursor, keys)) = scan_res else {
+                break;
+            };
+            if !keys.is_empty() {
+                let mut del_cmd = redis::cmd("DEL");
+                for k in &keys {
+                    del_cmd.arg(k);
+                }
+                let _: redis::RedisResult<i64> = del_cmd.query_async(&mut conn).await;
+            }
+            cursor = next_cursor;
+            if cursor == 0 {
+                break;
+            }
+        }
+    }
 }
