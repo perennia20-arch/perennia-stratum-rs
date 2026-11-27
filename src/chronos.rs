@@ -92,6 +92,7 @@ pub struct SystemTreasuryConfig {
     pub updated_at: String,
     /// Temporary compile guard for untouched Batch 2 `chronos/daemons.rs`; always 0.0.
     #[serde(skip)]
+    #[allow(dead_code)]
     pub hot_ceiling_kas: f64,
 }
 
@@ -112,9 +113,9 @@ pub struct SolvencyProofSnapshot {
 }
 
 pub fn resolve_master_treasury_address() -> String {
-    env::var("PERENNIA_MASTER_TREASURY_KAS")
+    env::var("MASTER_TREASURY_ADDRESS")
+        .or_else(|_| env::var("PERENNIA_MASTER_TREASURY_KAS"))
         .or_else(|_| env::var("MASTER_ADMIN_ADDRESS"))
-        .or_else(|_| env::var("MASTER_TREASURY_ADDRESS"))
         .ok()
         .map(|s| s.trim().to_lowercase().replace("kaspa:", "").trim().to_string())
         .filter(|s| !s.is_empty())
@@ -125,10 +126,18 @@ pub fn resolve_master_treasury_prefixed() -> Result<String, String> {
     let clean = resolve_master_treasury_address();
     if clean.len() < 55 {
         return Err(
-            "CONFIG_HALT: PERENNIA_MASTER_TREASURY_KAS is not configured in .env.".to_string(),
+            "CONFIG_HALT: MASTER_TREASURY_ADDRESS / PERENNIA_MASTER_TREASURY_KAS is not configured in .env."
+                .to_string(),
         );
     }
-    Ok(format!("kaspa:{}", clean))
+    let prefixed = format!("kaspa:{}", clean);
+    if crate::state_api::decode_kaspa_address_payload(&prefixed).is_none() {
+        return Err(
+            "CONFIG_HALT: MASTER_TREASURY_ADDRESS is not a valid Bech32m kaspa: address."
+                .to_string(),
+        );
+    }
+    Ok(prefixed)
 }
 
 pub fn resolve_hot_dispatcher_address() -> Option<String> {
@@ -138,6 +147,76 @@ pub fn resolve_hot_dispatcher_address() -> Option<String> {
         .map(|s| s.trim().to_lowercase().replace("kaspa:", "").trim().to_string())
         .filter(|s| s.len() >= 55)
         .map(|clean| format!("kaspa:{}", clean))
+}
+
+#[allow(dead_code)]
+pub const STRATUM_HOT_AIRLOCK_CEILING_SOMPI: u128 = 500_000_000_000;
+
+/// Validates that the solver's dedicated liquidity wallet never shares an address
+/// or private key with Stratum's miner payout hot wallet (5,000 KAS airlock ceiling).
+#[allow(dead_code)]
+pub fn verify_solver_wallet_isolated_from_stratum_airlock(
+    solver_address: &str,
+) -> Result<(), String> {
+    let normalized_solver = format!(
+        "kaspa:{}",
+        solver_address
+            .trim()
+            .to_lowercase()
+            .replace("kaspa:", "")
+            .trim()
+    );
+    if crate::state_api::decode_kaspa_address_payload(&normalized_solver).is_none() {
+        return Err(
+            "SOLVER_ISOLATION_HALT: Solver wallet address is not a valid Bech32m kaspa: address."
+                .to_string(),
+        );
+    }
+    if let Some(hot_addr) = resolve_hot_dispatcher_address() {
+        if normalized_solver == hot_addr {
+            return Err(format!(
+                "SOLVER_ISOLATION_HALT: Solver wallet {} collides with Stratum hot payout wallet (hotCeilingSompi={}).",
+                normalized_solver, STRATUM_HOT_AIRLOCK_CEILING_SOMPI
+            ));
+        }
+    }
+    let solver_key = env::var("SOLVER_WALLET_PRIVATE_KEY")
+        .or_else(|_| env::var("SOLVER_PRIVATE_KEY_HEX"))
+        .ok()
+        .map(|s| s.trim().to_lowercase());
+    let stratum_hot_key = env::var("PERENNIA_HOT_PRIVATE_KEY")
+        .or_else(|_| env::var("KASPA_HOT_PRIVATE_KEY"))
+        .ok()
+        .map(|s| s.trim().to_lowercase());
+    if let (Some(sk), Some(hk)) = (solver_key, stratum_hot_key) {
+        if !sk.is_empty() && sk == hk {
+            return Err(format!(
+                "SOLVER_ISOLATION_HALT: Solver key shares private key material with Stratum hot payout wallet (hotCeilingSompi={}).",
+                STRATUM_HOT_AIRLOCK_CEILING_SOMPI
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Resolves and isolates the dedicated solver wallet address (`SOLVER_WALLET_ADDRESS` /
+/// `SOLVER_WALLET_KAS_ADDRESS`), failing closed if missing or identical to Stratum's hot wallet.
+#[allow(dead_code)]
+pub fn resolve_dedicated_solver_wallet_address() -> Result<String, String> {
+    let raw = env::var("SOLVER_WALLET_ADDRESS")
+        .or_else(|_| env::var("SOLVER_WALLET_KAS_ADDRESS"))
+        .map_err(|_| {
+            "SOLVER_ISOLATION_HALT: SOLVER_WALLET_ADDRESS is not configured.".to_string()
+        })?;
+    let clean = raw
+        .trim()
+        .to_lowercase()
+        .replace("kaspa:", "")
+        .trim()
+        .to_string();
+    let prefixed = format!("kaspa:{}", clean);
+    verify_solver_wallet_isolated_from_stratum_airlock(&prefixed)?;
+    Ok(prefixed)
 }
 
 #[allow(dead_code)]
@@ -187,6 +266,7 @@ pub fn compute_outbox_idempotency_key(
 }
 
 /// Deprecated custodial HMAC shim retained for Batch 2/4 callers (`admin_api.rs`, tests).
+#[allow(dead_code)]
 pub fn compute_reservoir_hmac(
     _wallet_address: &str,
     _legacy_a: f64,

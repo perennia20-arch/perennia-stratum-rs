@@ -332,22 +332,90 @@ fn lock_multiplier_bps_for_days(days: i32) -> u16 {
     }
 }
 
+/// Enforces a live, non-expired Redis `oracle:spot:KAS_USDC` entry (`PTTL > 0`).
+/// Fails closed with a `503`-mapped error message if missing, stale, or malformed.
+pub async fn require_fresh_redis_kas_usdc_e8() -> Result<u128, String> {
+    let redis_url = env::var("REDIS_URL").map_err(|_| {
+        "ORACLE_HALT: REDIS_URL is not configured for live oracle:spot:KAS_USDC verification (503)."
+            .to_string()
+    })?;
+    let client = redis::Client::open(redis_url).map_err(|e| {
+        format!(
+            "ORACLE_HALT: Redis client init failed for oracle:spot:KAS_USDC (503): {}",
+            e
+        )
+    })?;
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .map_err(|e| {
+            format!(
+                "ORACLE_HALT: Redis connection failed for oracle:spot:KAS_USDC (503): {}",
+                e
+            )
+        })?;
+    let (spot_opt, pttl_ms): (Option<String>, i64) = redis::pipe()
+        .cmd("GET")
+        .arg("oracle:spot:KAS_USDC")
+        .cmd("PTTL")
+        .arg("oracle:spot:KAS_USDC")
+        .query_async(&mut conn)
+        .await
+        .map_err(|e| {
+            format!(
+                "ORACLE_HALT: Redis read failed for oracle:spot:KAS_USDC (503): {}",
+                e
+            )
+        })?;
+    let spot_str = spot_opt.ok_or_else(|| {
+        "ORACLE_HALT: Redis oracle:spot:KAS_USDC is missing. Failing closed (503).".to_string()
+    })?;
+    if pttl_ms <= 0 {
+        return Err(format!(
+            "ORACLE_HALT: Redis oracle:spot:KAS_USDC is stale or missing TTL (pttl_ms={}). Failing closed (503).",
+            pttl_ms
+        ));
+    }
+    let e8 = parse_decimal_str_to_u128_scaled(&spot_str, 8).map_err(|e| {
+        format!(
+            "ORACLE_HALT: Redis oracle:spot:KAS_USDC parse error (503): {}",
+            e
+        )
+    })?;
+    if e8 == 0 {
+        return Err(
+            "ORACLE_HALT: Redis oracle:spot:KAS_USDC resolved to zero. Failing closed (503)."
+                .to_string(),
+        );
+    }
+    Ok(e8)
+}
+
 pub async fn resolve_strict_spot_price_e8(pool: &PgPool, asset_ticker: &str) -> Result<u128, String> {
     let clean = asset_ticker.trim().to_uppercase();
     if clean == "USD" || clean == "USDC" || clean == "USDT" {
         return Ok(ORACLE_USD_E8_SCALE);
     }
+    if clean == "KAS" {
+        return require_fresh_redis_kas_usdc_e8().await;
+    }
     if let Ok(redis_url) = env::var("REDIS_URL") {
         if let Ok(client) = redis::Client::open(redis_url) {
             if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
-                if let Ok(Some(spot_str)) = redis::cmd("GET")
-                    .arg(format!("oracle:spot:{}_USDC", clean))
-                    .query_async::<_, Option<String>>(&mut conn)
+                let key = format!("oracle:spot:{}_USDC", clean);
+                if let Ok((Some(spot_str), pttl_ms)) = redis::pipe()
+                    .cmd("GET")
+                    .arg(&key)
+                    .cmd("PTTL")
+                    .arg(&key)
+                    .query_async::<_, (Option<String>, i64)>(&mut conn)
                     .await
                 {
-                    if let Ok(e8) = parse_decimal_str_to_u128_scaled(&spot_str, 8) {
-                        if e8 > 0 {
-                            return Ok(e8);
+                    if pttl_ms > 0 {
+                        if let Ok(e8) = parse_decimal_str_to_u128_scaled(&spot_str, 8) {
+                            if e8 > 0 {
+                                return Ok(e8);
+                            }
                         }
                     }
                 }
@@ -399,6 +467,7 @@ pub async fn resolve_strict_spot_price(pool: &PgPool, asset_ticker: &str) -> Res
 }
 
 /// Retired custodial balance mutator: fails closed so no synthetic DB/Redis IOUs can ever be written.
+#[allow(dead_code)]
 pub async fn debit_user_token_balance(
     _pool: &PgPool,
     _clean_wallet: &str,
@@ -410,6 +479,7 @@ pub async fn debit_user_token_balance(
 }
 
 /// Retired custodial balance mutator: fails closed so no synthetic DB/Redis IOUs can ever be written.
+#[allow(dead_code)]
 pub async fn credit_user_token_balance(
     _pool: &PgPool,
     _clean_wallet: &str,

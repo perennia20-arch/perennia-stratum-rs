@@ -72,6 +72,260 @@ pub async fn execute_idempotent_mass_physical_settlement<T: PayoutBatchEntry>(
         .await
 }
 
+/// Allowed Liquidity Pair fee tiers in basis points: 0.30%, 1.00%, 2.50%.
+pub const ALLOWED_LP_FEE_TIERS_BPS: [u16; 3] = [30, 100, 250];
+
+/// Exact 256-bit intermediate `(a * b) / denom` returning `(quotient, remainder)` in pure `u128`.
+pub fn mul_div_rem_u128(a: u128, b: u128, denom: u128) -> Result<(u128, u128), String> {
+    if denom == 0 {
+        return Err("ARITHMETIC_HALT: Division by zero in u128 mul_div.".to_string());
+    }
+    if a == 0 || b == 0 {
+        return Ok((0, 0));
+    }
+    if let Some(prod) = a.checked_mul(b) {
+        return Ok((prod / denom, prod % denom));
+    }
+    // Full 64-bit limb multiplication a * b -> (hi, lo)
+    let a_lo = a & 0xFFFF_FFFF_FFFF_FFFF;
+    let a_hi = a >> 64;
+    let b_lo = b & 0xFFFF_FFFF_FFFF_FFFF;
+    let b_hi = b >> 64;
+
+    let p0 = a_lo * b_lo;
+    let p1 = a_lo * b_hi;
+    let p2 = a_hi * b_lo;
+    let p3 = a_hi * b_hi;
+
+    let mid = (p0 >> 64) + (p1 & 0xFFFF_FFFF_FFFF_FFFF) + (p2 & 0xFFFF_FFFF_FFFF_FFFF);
+    let lo = (p0 & 0xFFFF_FFFF_FFFF_FFFF) | (mid << 64);
+    let hi = p3 + (p1 >> 64) + (p2 >> 64) + (mid >> 64);
+
+    if hi >= denom {
+        return Err("ARITHMETIC_HALT: Quotient overflows u128.".to_string());
+    }
+
+    // 256-by-128 binary long division returning (quotient, remainder)
+    let mut q: u128 = 0;
+    let mut rem_lo: u128 = 0;
+    let mut rem_hi: u128 = 0;
+    for bit_idx in (0..256).rev() {
+        rem_hi = (rem_hi << 1) | (rem_lo >> 127);
+        let in_bit = if bit_idx >= 128 {
+            (hi >> (bit_idx - 128)) & 1
+        } else {
+            (lo >> bit_idx) & 1
+        };
+        rem_lo = (rem_lo << 1) | in_bit;
+        if rem_hi > 0 || rem_lo >= denom {
+            let (new_lo, borrow) = rem_lo.overflowing_sub(denom);
+            rem_lo = new_lo;
+            if borrow {
+                rem_hi -= 1;
+            }
+            if bit_idx < 128 {
+                q |= 1u128 << bit_idx;
+            }
+        }
+    }
+    Ok((q, rem_lo))
+}
+
+pub fn mul_div_floor_u128(a: u128, b: u128, denom: u128) -> Result<u128, String> {
+    Ok(mul_div_rem_u128(a, b, denom)?.0)
+}
+
+pub fn mul_div_ceil_u128(a: u128, b: u128, denom: u128) -> Result<u128, String> {
+    let (q, rem) = mul_div_rem_u128(a, b, denom)?;
+    if rem > 0 {
+        q.checked_add(1)
+            .ok_or_else(|| "ARITHMETIC_HALT: Ceil quotient overflows u128.".to_string())
+    } else {
+        Ok(q)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LpPairSompiSplit {
+    pub amount_in: u128,
+    pub fee_bps: u16,
+    pub total_fee: u128,
+    pub lp_fee: u128,
+    pub treasury_fee: u128,
+    pub net_out: u128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtocolSompiSplit {
+    pub amount_in: u128,
+    pub fee_bps: u16,
+    pub treasury_fee: u128,
+    pub net_out: u128,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InventoryOverflowSplit {
+    pub internalized_atomic: u128,
+    pub external_overflow_atomic: u128,
+}
+
+pub fn resolve_lp_pair_tier_bps(requested_bps: Option<u16>) -> Result<u16, String> {
+    let tier = requested_bps.unwrap_or(30);
+    if ALLOWED_LP_FEE_TIERS_BPS.contains(&tier) {
+        Ok(tier)
+    } else {
+        Err(format!(
+            "INVALID_LP_FEE_TIER: Expected 30, 100, or 250 bps; got {} bps.",
+            tier
+        ))
+    }
+}
+
+/// Deterministic 80/20 Liquidity Pair sompi fee split.
+/// Assigns any odd integer remainder (dust) deterministically to `treasury_fee`
+/// and enforces `amount_in == net_out + lp_fee + treasury_fee`.
+pub fn compute_lp_pair_sompi_split(
+    amount_in: u128,
+    fee_tier_bps: u16,
+) -> Result<LpPairSompiSplit, String> {
+    let fee_bps = resolve_lp_pair_tier_bps(Some(fee_tier_bps))?;
+    if amount_in == 0 {
+        return Err("ZERO_LOSS_INVARIANT_VIOLATION: amount_in must be > 0.".to_string());
+    }
+    let total_fee = mul_div_ceil_u128(amount_in, fee_bps as u128, 10_000)?;
+    let net_out = amount_in
+        .checked_sub(total_fee)
+        .filter(|&v| v > 0)
+        .ok_or_else(|| {
+            "ZERO_LOSS_INVARIANT_VIOLATION: Net LP swap output after fee is 0.".to_string()
+        })?;
+    let lp_fee = mul_div_floor_u128(total_fee, 80, 100)?;
+    let treasury_fee = total_fee.saturating_sub(lp_fee);
+    assert_eq!(
+        amount_in,
+        net_out + lp_fee + treasury_fee,
+        "ZERO_LOSS_INVARIANT_VIOLATION: LP pair split leaked sompi"
+    );
+    Ok(LpPairSompiSplit {
+        amount_in,
+        fee_bps,
+        total_fee,
+        lp_fee,
+        treasury_fee,
+        net_out,
+    })
+}
+
+/// Exact integer protocol fee deduction for direct SWAP / BOOST / PENDING SPLITS routes.
+pub fn compute_protocol_sompi_split(
+    amount_in: u128,
+    fee_bps: u16,
+) -> Result<ProtocolSompiSplit, String> {
+    if amount_in == 0 {
+        return Err("ZERO_LOSS_INVARIANT_VIOLATION: amount_in must be > 0.".to_string());
+    }
+    let treasury_fee = mul_div_ceil_u128(amount_in, fee_bps as u128, 10_000)?;
+    let net_out = amount_in
+        .checked_sub(treasury_fee)
+        .filter(|&v| v > 0)
+        .ok_or_else(|| {
+            "ZERO_LOSS_INVARIANT_VIOLATION: Net swap input after protocol fee is 0.".to_string()
+        })?;
+    assert_eq!(
+        amount_in,
+        net_out + treasury_fee,
+        "ZERO_LOSS_INVARIANT_VIOLATION: Protocol split leaked sompi"
+    );
+    Ok(ProtocolSompiSplit {
+        amount_in,
+        fee_bps,
+        treasury_fee,
+        net_out,
+    })
+}
+
+/// Splits trade size across available confirmed solver inventory and external overflow routing.
+#[allow(dead_code)]
+pub fn split_solver_inventory_and_overflow(
+    requested_atomic: u128,
+    solver_inventory_atomic: u128,
+) -> InventoryOverflowSplit {
+    let internalized_atomic = solver_inventory_atomic.min(requested_atomic);
+    let external_overflow_atomic = requested_atomic.saturating_sub(internalized_atomic);
+    assert_eq!(
+        requested_atomic,
+        internalized_atomic + external_overflow_atomic,
+        "ZERO_LOSS_INVARIANT_VIOLATION: Inventory overflow split leaked sompi"
+    );
+    InventoryOverflowSplit {
+        internalized_atomic,
+        external_overflow_atomic,
+    }
+}
+
+async fn record_sor_settlement_audit(
+    pool: &PgPool,
+    wallet_address: &str,
+    pay_asset: &str,
+    receive_asset: &str,
+    route_type: &str,
+    amount_in_atomic: u128,
+    pay_scale: u128,
+    pay_usd_e8: u128,
+    gross_usd_micros: u128,
+    lp_fee_atomic: u128,
+    treasury_fee_atomic: u128,
+) {
+    let event_type = format!("SOR_{}", route_type);
+    if let Err(e) = sqlx::query(
+        r#"
+        INSERT INTO tax_ledger_events (
+            wallet_address, asset_ticker, event_type,
+            gross_proceeds_usd, amount_tokens, spot_price_at_execution
+        ) VALUES (
+            $1, $2, $3,
+            ($4::NUMERIC / 1000000.0)::DOUBLE PRECISION,
+            ($5::NUMERIC / $6::NUMERIC)::DOUBLE PRECISION,
+            ($7::NUMERIC / 100000000.0)::DOUBLE PRECISION
+        )
+        "#,
+    )
+    .bind(wallet_address)
+    .bind(pay_asset)
+    .bind(&event_type)
+    .bind(gross_usd_micros.to_string())
+    .bind(amount_in_atomic.to_string())
+    .bind(pay_scale.max(1).to_string())
+    .bind(pay_usd_e8.to_string())
+    .execute(pool)
+    .await
+    {
+        tracing::warn!("SOR tax_ledger_events insert skipped: {}", e);
+    }
+
+    if lp_fee_atomic > 0 || treasury_fee_atomic > 0 {
+        let lp_fee_usd_micros = mul_div_floor_u128(lp_fee_atomic, pay_usd_e8, pay_scale.max(1).saturating_mul(100))
+            .unwrap_or(0);
+        if lp_fee_usd_micros > 0 {
+            let pool_pair = format!("{}-{}", pay_asset, receive_asset);
+            if let Err(e) = sqlx::query(
+                r#"
+                INSERT INTO yield_distributions (pool_pair, total_fees_distributed_usd)
+                VALUES ($1, ($2::NUMERIC / 1000000.0)::DOUBLE PRECISION)
+                "#,
+            )
+            .bind(&pool_pair)
+            .bind(lp_fee_usd_micros.to_string())
+            .execute(pool)
+            .await
+            {
+                tracing::warn!("SOR yield_distributions insert skipped: {}", e);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SorExecuteRequest {
@@ -80,6 +334,10 @@ pub struct SorExecuteRequest {
     pub receive_asset: String,
     #[serde(default)]
     pub target_network: Option<String>,
+    #[serde(default)]
+    pub route_mode: Option<String>,
+    #[serde(default)]
+    pub lp_fee_tier_bps: Option<u16>,
     #[serde(default)]
     pub amount_atomic: Option<String>,
     #[serde(default)]
@@ -650,30 +908,84 @@ pub async fn handle_sor_execute(
     }
 
     let allow_dp = steering.allow_dark_pool_internal_clearing && !dark_pool_paused;
-    let (fee_bps, fee_tier_label) = resolve_sor_fee_bps(
-        &pool,
-        &prefixed_wallet,
-        &clean_wallet,
-        gross_usd_micros,
-        &pay_asset,
-        &receive_asset,
-        allow_dp,
+    let is_lp_pair_route = req
+        .route_mode
+        .as_deref()
+        .map(|m| m.eq_ignore_ascii_case("LP_PAIR"))
+        .unwrap_or(false)
+        || req.lp_fee_tier_bps.is_some();
+
+    let (
+        fee_bps,
+        fee_tier_label,
+        protocol_fee_atomic,
+        net_in_atomic,
+        lp_fee_atomic,
+        treasury_fee_atomic,
+    ) = if is_lp_pair_route {
+        let tier_bps = match resolve_lp_pair_tier_bps(req.lp_fee_tier_bps) {
+            Ok(bps) => bps,
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, Json(json!({ "error": e })));
+            }
+        };
+        let split = match compute_lp_pair_sompi_split(amount_in_atomic, tier_bps) {
+            Ok(s) => s,
+            Err(e) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({ "error": e })),
+                );
+            }
+        };
+        (
+            split.fee_bps,
+            format!("LP_PAIR_{}BPS_80_20", split.fee_bps),
+            split.total_fee,
+            split.net_out,
+            split.lp_fee,
+            split.treasury_fee,
+        )
+    } else {
+        let (base_fee_bps, base_label) = resolve_sor_fee_bps(
+            &pool,
+            &prefixed_wallet,
+            &clean_wallet,
+            gross_usd_micros,
+            &pay_asset,
+            &receive_asset,
+            allow_dp,
+        )
+        .await;
+        let split = match compute_protocol_sompi_split(amount_in_atomic, base_fee_bps) {
+            Ok(s) => s,
+            Err(e) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({ "error": e })),
+                );
+            }
+        };
+        (
+            split.fee_bps,
+            base_label.to_string(),
+            split.treasury_fee,
+            split.net_out,
+            0u128,
+            split.treasury_fee,
+        )
+    };
+
+    let net_usd_micros = mul_div_floor_u128(
+        net_in_atomic,
+        pay_usd_e8,
+        pay_scale.saturating_mul(100),
     )
-    .await;
-
-    let protocol_fee_atomic = (amount_in_atomic.saturating_mul(fee_bps as u128) + 9_999) / 10_000;
-    let net_in_atomic = amount_in_atomic.saturating_sub(protocol_fee_atomic);
-    if net_in_atomic == 0 {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({ "error": "ZERO_LOSS_INVARIANT_VIOLATION: Net swap input after fee is 0." })),
-        );
-    }
-
-    let net_usd_micros = net_in_atomic.saturating_mul(pay_usd_e8) / (pay_scale.saturating_mul(100));
+    .unwrap_or(0);
+    let usd_equiv_rec = mul_div_floor_u128(net_in_atomic, pay_usd_e8, receive_usd_e8.max(1))
+        .unwrap_or(0);
     let estimated_out_atomic =
-        (net_in_atomic.saturating_mul(pay_usd_e8) / receive_usd_e8.max(1)).saturating_mul(rec_scale)
-            / pay_scale.max(1);
+        mul_div_floor_u128(usd_equiv_rec, rec_scale, pay_scale.max(1)).unwrap_or(0);
     let slippage_bps = req.slippage_bps.unwrap_or(50).clamp(1, 2500) as u128;
     let computed_min_out = estimated_out_atomic.saturating_mul(10_000 - slippage_bps) / 10_000;
     let min_out_atomic = req
@@ -683,23 +995,53 @@ pub async fn handle_sor_execute(
         .map(|u| u.max(computed_min_out))
         .unwrap_or(computed_min_out);
 
-    let sys_cfg = crate::chronos::load_system_treasury_config(&pool).await;
-    let house_revenue_addr = crate::chronos::resolve_house_revenue_kas_address(&sys_cfg)
-        .unwrap_or_else(|| sys_cfg.cold_kas_address.clone());
+    let master_treasury_addr = match crate::chronos::resolve_master_treasury_prefixed() {
+        Ok(addr) => addr,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": e })),
+            );
+        }
+    };
+    let house_revenue_addr = master_treasury_addr.clone();
     let tx_uuid = format!(
         "PER-SOR-{}",
         &Uuid::new_v4().simple().to_string().to_uppercase()[..12]
     );
 
     if pay_asset != "KAS" {
+        let cross_route_label = if is_lp_pair_route {
+            "LP_PAIR_CROSS_CHAIN_INTENT"
+        } else {
+            "CROSS_CHAIN_DEPOSIT_INTENT"
+        };
+        record_sor_settlement_audit(
+            &pool,
+            &prefixed_wallet,
+            &pay_asset,
+            &receive_asset,
+            cross_route_label,
+            amount_in_atomic,
+            pay_scale,
+            pay_usd_e8,
+            gross_usd_micros,
+            lp_fee_atomic,
+            treasury_fee_atomic,
+        )
+        .await;
         return (
             StatusCode::OK,
             Json(json!({
                 "success": true,
                 "transactionUuid": tx_uuid,
-                "routeType": "CROSS_CHAIN_DEPOSIT_INTENT",
+                "routeType": cross_route_label,
                 "amountInAtomic": amount_in_atomic.to_string(),
                 "protocolFeeAtomic": protocol_fee_atomic.to_string(),
+                "lpFeeAtomic": lp_fee_atomic.to_string(),
+                "treasuryFeeAtomic": treasury_fee_atomic.to_string(),
+                "masterTreasuryAddress": master_treasury_addr,
+                "zeroLossInvariantVerified": true,
                 "networkFeeSompi": "0",
                 "estimatedOutputAtomic": estimated_out_atomic.to_string(),
                 "minOutputAtomic": min_out_atomic.to_string(),
@@ -826,6 +1168,21 @@ pub async fn handle_sor_execute(
         obj.insert("version".to_string(), json!(1));
     }
 
+    record_sor_settlement_audit(
+        &pool,
+        &prefixed_wallet,
+        &pay_asset,
+        &receive_asset,
+        route_type,
+        amount_in_atomic,
+        pay_scale,
+        pay_usd_e8,
+        gross_usd_micros,
+        lp_fee_atomic,
+        treasury_fee_atomic,
+    )
+    .await;
+
     (
         StatusCode::OK,
         Json(json!({
@@ -834,6 +1191,10 @@ pub async fn handle_sor_execute(
             "routeType": route_type,
             "amountInAtomic": amount_in_atomic.to_string(),
             "protocolFeeAtomic": protocol_fee_atomic.to_string(),
+            "lpFeeAtomic": lp_fee_atomic.to_string(),
+            "treasuryFeeAtomic": treasury_fee_atomic.to_string(),
+            "masterTreasuryAddress": master_treasury_addr,
+            "zeroLossInvariantVerified": true,
             "networkFeeSompi": "0",
             "estimatedOutputAtomic": estimated_out_atomic.to_string(),
             "minOutputAtomic": min_out_atomic.to_string(),
@@ -851,4 +1212,60 @@ pub async fn handle_sor_execute(
             "formattedUtxos": formatted_utxos
         })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lp_pair_80_20_splits_preserve_exact_u128_invariants() {
+        for tier in [30u16, 100u16, 250u16] {
+            for amount in [
+                10_000u128,
+                100_001u128,
+                99_999_999u128,
+                100_000_000u128,
+                1_234_567_891_234u128,
+            ] {
+                let split = compute_lp_pair_sompi_split(amount, tier)
+                    .expect("valid LP fee tier must compute zero-loss split");
+                assert_eq!(
+                    split.amount_in,
+                    split.net_out + split.lp_fee + split.treasury_fee
+                );
+                assert_eq!(split.total_fee, split.lp_fee + split.treasury_fee);
+                // Floor 80% guarantees LP <= 80% and deterministic dust remainder goes to treasury
+                assert!(split.lp_fee <= (split.total_fee * 80) / 100);
+                assert!(split.treasury_fee >= split.total_fee / 5);
+            }
+        }
+    }
+
+    #[test]
+    fn lp_pair_rejects_unapproved_fee_tiers() {
+        assert!(resolve_lp_pair_tier_bps(Some(0)).is_err());
+        assert!(resolve_lp_pair_tier_bps(Some(15)).is_err());
+        assert!(resolve_lp_pair_tier_bps(Some(50)).is_err());
+        assert!(resolve_lp_pair_tier_bps(Some(500)).is_err());
+        assert_eq!(resolve_lp_pair_tier_bps(None).unwrap(), 30);
+    }
+
+    #[test]
+    fn protocol_split_and_overflow_preserve_sompi_conservation() {
+        let proto = compute_protocol_sompi_split(250_000_000_007, 50).unwrap();
+        assert_eq!(proto.amount_in, proto.net_out + proto.treasury_fee);
+
+        let full_internal = split_solver_inventory_and_overflow(50_000_000_000, 120_000_000_000);
+        assert_eq!(full_internal.internalized_atomic, 50_000_000_000);
+        assert_eq!(full_internal.external_overflow_atomic, 0);
+
+        let partial = split_solver_inventory_and_overflow(50_000_000_000, 17_500_000_123);
+        assert_eq!(partial.internalized_atomic, 17_500_000_123);
+        assert_eq!(partial.external_overflow_atomic, 32_499_999_877);
+        assert_eq!(
+            partial.internalized_atomic + partial.external_overflow_atomic,
+            50_000_000_000
+        );
+    }
 }

@@ -80,12 +80,14 @@ pub fn register_dynamic_oracle_ticker(ticker: &str) {
     }
 }
 
+#[allow(dead_code)]
 pub fn is_oracle_supported_asset(ticker: &str) -> bool {
     let clean = ticker.trim().to_uppercase();
     ORACLE_SUPPORTED_ASSETS.iter().any(|&a| a == clean)
         || DYNAMIC_ORACLE_TICKERS.contains(&clean)
 }
 
+#[allow(dead_code)]
 pub fn is_pyth_rwa_asset(ticker: &str) -> bool {
     let clean = ticker.trim().to_uppercase();
     PYTH_RWA_FEEDS.iter().any(|&(t, _, _)| t == clean)

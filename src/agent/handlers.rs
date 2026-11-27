@@ -297,55 +297,38 @@ async fn settle_sleeve_swap_exact_u128(
         }
         streaming_e8 -= debit_e8;
     } else {
-        let cur = lp_map.get(pay_asset).copied().unwrap_or(0);
-        if cur < debit_e8 {
-            return Err(AgentError::new(
-                AgentErrorCode::InvalidInput,
-                format!(
-                    "Insufficient execution-sleeve {} balance: available {} e8, requested {} e8.",
-                    pay_asset, cur, debit_e8
-                ),
-            ));
-        }
-        let rem = cur - debit_e8;
-        if rem == 0 {
-            lp_map.remove(pay_asset);
-        } else {
-            lp_map.insert(pay_asset.to_string(), rem);
-        }
+        return Err(AgentError::new(
+            AgentErrorCode::InvalidInput,
+            format!(
+                "SYNTHETIC_IOU_FORBIDDEN: Execution-sleeve non-KAS asset {} cannot mutate yield_reservoirs.lp_tokens; settle directly via L1 UTXOs.",
+                pay_asset
+            ),
+        ));
     }
 
-    let mut added_verified_kas_e8: u128 = 0;
-    if receive_asset == "KAS" {
+    let added_verified_kas_e8: u128 = if receive_asset == "KAS" {
         streaming_e8 = streaming_e8.checked_add(credit_e8).ok_or_else(|| {
             AgentError::new(
                 AgentErrorCode::SolvencyFloorViolation,
                 "Execution-sleeve KAS credit overflow.",
             )
         })?;
-        added_verified_kas_e8 = credit_e8;
+        credit_e8
     } else {
-        let cur_out = lp_map.get(receive_asset).copied().unwrap_or(0);
-        let next_out = cur_out.checked_add(credit_e8).ok_or_else(|| {
-            AgentError::new(
-                AgentErrorCode::SolvencyFloorViolation,
-                "Execution-sleeve token credit overflow.",
-            )
-        })?;
-        lp_map.insert(receive_asset.to_string(), next_out);
-    }
+        return Err(AgentError::new(
+            AgentErrorCode::InvalidInput,
+            format!(
+                "SYNTHETIC_IOU_FORBIDDEN: Execution-sleeve output {} cannot be credited as synthetic IOUs in yield_reservoirs.lp_tokens.",
+                receive_asset
+            ),
+        ));
+    };
+    lp_map.clear();
 
     let new_hmac =
         compute_reservoir_hmac_exact_e8(clean_wallet, streaming_e8, total_yield_e8, &lp_map)?;
 
-    let mut lp_json_obj = serde_json::Map::new();
-    for (tick, &amt_e8) in &lp_map {
-        let dec_str = format_u128_scaled_to_decimal_str(amt_e8, 8);
-        if let Ok(num_val) = serde_json::from_str::<Value>(&dec_str) {
-            lp_json_obj.insert(tick.clone(), num_val);
-        }
-    }
-    let lp_json = Value::Object(lp_json_obj);
+    let lp_json = Value::Object(serde_json::Map::new());
     let streaming_str = format_u128_scaled_to_decimal_str(streaming_e8, 8);
     let total_yield_str = format_u128_scaled_to_decimal_str(total_yield_e8, 8);
     let added_verified_str = format_u128_scaled_to_decimal_str(added_verified_kas_e8, 8);

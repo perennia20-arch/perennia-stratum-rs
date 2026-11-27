@@ -1,0 +1,24 @@
+[package]
+name = "perennia-solver-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone Sovereign Dark Pool RFQ Maker, Cross-Venue Ring Solver & 22:00 UTC Pre-Hedger"
+default-run = "perennia-solver-rs"
+
+[dependencies]
+tokio = { version = "1.36", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+redis = { version = "0.25", features = ["tokio-comp"] }
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.8", features = ["v4", "serde"] }
+secp256k1 = { version = "0.29.0", features = ["global-context", "rand-std"] }
+blake3 = "1.5"
+hex = "0.4"
+rand = "0.8"
+anyhow = "1.0"
+dotenvy = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

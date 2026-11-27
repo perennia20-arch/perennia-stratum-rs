@@ -373,3 +373,55 @@ fn rehearsal_5_verify_batch3_cow_htlc_tier2_bid_invariants_and_zktls_0x20() {
     assert_eq!(state_api::validate_zk_precompile_tag(0x20), Ok(0x20));
     assert!(state_api::validate_zk_precompile_tag(0x21).is_err());
 }
+
+#[test]
+fn lp_pair_80_20_splits_treasury_routing_and_airlock_isolation_invariants() {
+    // 1. Verify exact 80/20 sompi splits across 30, 100, and 250 bps with deterministic dust
+    for tier_bps in [30u16, 100u16, 250u16] {
+        for amount_in in [10_000u128, 100_003u128, 999_999_997u128, 50_000_000_000u128] {
+            let split = sor::compute_lp_pair_sompi_split(amount_in, tier_bps).unwrap();
+            assert_eq!(
+                split.amount_in,
+                split.net_out + split.lp_fee + split.treasury_fee
+            );
+            assert!(split.treasury_fee >= split.total_fee / 5);
+        }
+    }
+    assert!(sor::compute_lp_pair_sompi_split(100_000_000, 75).is_err());
+
+    // 2. Direct swap / BOOST exact protocol fee conservation & overflow partitioning
+    let proto = sor::compute_protocol_sompi_split(250_000_000_005, 50).unwrap();
+    assert_eq!(proto.amount_in, proto.net_out + proto.treasury_fee);
+
+    let overflow = sor::split_solver_inventory_and_overflow(600_000_000_000, 150_000_000_000);
+    assert_eq!(overflow.internalized_atomic, 150_000_000_000);
+    assert_eq!(overflow.external_overflow_atomic, 450_000_000_000);
+    assert_eq!(
+        overflow.internalized_atomic + overflow.external_overflow_atomic,
+        600_000_000_000
+    );
+
+    // 3. Stratum 5,000 KAS airlock isolation guard
+    assert_eq!(chronos::STRATUM_HOT_AIRLOCK_CEILING_SOMPI, 500_000_000_000);
+    let hot_addr = "kaspa:qrsmsx90uctxg3lnjra64vad98kwuhq7xxhk0f7q5g245tyerxznj2lvwe0hx".to_string();
+    let solver_addr = chronos::build_kaspa_opsha256_htlc_covenant(
+        &[0x42u8; 32],
+        &[0x43u8; 32],
+        &[0x44u8; 32],
+        200_000_000,
+    )
+    .p2sh_address;
+    std::env::set_var("PERENNIA_HOT_KAS_ADDRESS", &hot_addr);
+    std::env::set_var("PERENNIA_HOT_PRIVATE_KEY", &"11".repeat(32));
+    std::env::set_var("SOLVER_WALLET_PRIVATE_KEY", &"22".repeat(32));
+
+    assert!(chronos::verify_solver_wallet_isolated_from_stratum_airlock(&solver_addr).is_ok());
+    assert!(chronos::verify_solver_wallet_isolated_from_stratum_airlock(&hot_addr).is_err());
+
+    std::env::set_var("SOLVER_WALLET_PRIVATE_KEY", &"11".repeat(32));
+    assert!(chronos::verify_solver_wallet_isolated_from_stratum_airlock(&solver_addr).is_err());
+
+    std::env::remove_var("PERENNIA_HOT_KAS_ADDRESS");
+    std::env::remove_var("PERENNIA_HOT_PRIVATE_KEY");
+    std::env::remove_var("SOLVER_WALLET_PRIVATE_KEY");
+}

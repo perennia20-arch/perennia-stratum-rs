@@ -17,10 +17,15 @@ pub const INITIAL_LOCAL_KAS_FLOAT_USD: f64 = 500.0;
 pub const INITIAL_WHOLESALE_API_USD_FLOAT: f64 = 400.0;
 pub const TARGET_RATCHET_FLOAT_CAP_USD: f64 = 5_000.0;
 pub const HARD_PROFIT_FLOOR_PCT: f64 = 0.001;
+#[allow(dead_code)]
 pub const BUY_KAS_INBOUND_FEE_PCT: f64 = 0.002;
+#[allow(dead_code)]
 pub const WHOLESALE_VOLUME_SWAP_FEE_PCT: f64 = 0.0025;
+#[allow(dead_code)]
 pub const SILO_SHIELD_SWAP_FEE_PCT: f64 = 0.0035;
+#[allow(dead_code)]
 pub const STANDARD_PUBLIC_SWAP_FEE_PCT: f64 = 0.005;
+#[allow(dead_code)]
 pub const PASS_THROUGH_SWAP_FEE_PCT: f64 = 0.0085;
 
 pub const RETAIL_ONRAMP_FEE_BPS: u64 = 85;
@@ -1163,6 +1168,7 @@ pub async fn fetch_changenow_min_amount(
     Ok(min_amount)
 }
 
+#[allow(dead_code)]
 pub async fn resolve_live_profitable_bucket_threshold(
     pool: &PgPool,
     target_ticker: &str,

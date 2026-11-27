@@ -15,6 +15,7 @@ pub fn calculate_compute_mass(num_inputs: usize, num_outputs: usize, payload_len
         + (payload_len as u64)
 }
 
+#[allow(dead_code)]
 pub fn calculate_storage_mass(input_amounts: &[u64], output_amounts: &[u64]) -> u64 {
     if input_amounts.is_empty() || output_amounts.is_empty() {
         return 0;

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HifoDisposalSummary {
@@ -52,6 +53,7 @@ pub async fn record_hifo_acquisition_lot(
     Ok(lot_id)
 }
 
+#[allow(dead_code)]
 pub async fn match_and_consume_hifo_lots(
     pool: &PgPool,
     wallet_address: &str,

@@ -1,5 +1,9 @@
 # Cargo.toml
 
+[workspace]
+members = [".", "crates/perennia-solver"]
+resolver = "2"
+
 [package]
 name = "perennia-stratum-rs"
 version = "0.2.0"

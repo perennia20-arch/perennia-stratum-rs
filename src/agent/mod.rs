@@ -66,11 +66,11 @@ impl AgentGatewayState {
             raw_secret.as_bytes(),
         );
 
-        let x402_treasury_address = crate::chronos::resolve_hot_dispatcher_address()
-            .or_else(|| crate::chronos::resolve_master_treasury_prefixed().ok())
+        let x402_treasury_address = crate::chronos::resolve_master_treasury_prefixed()
+            .ok()
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "CRITICAL_CONFIG_HALT: PERENNIA_HOT_KAS_ADDRESS or PERENNIA_MASTER_TREASURY_KAS must be configured for non-custodial settlement and x402 burst credits."
+                    "CRITICAL_CONFIG_HALT: MASTER_TREASURY_ADDRESS / PERENNIA_MASTER_TREASURY_KAS must be configured for non-custodial settlement and x402 burst credits (isolated from Stratum hot wallet)."
                 )
             })?;
 
