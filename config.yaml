@@ -1,17 +1,48 @@
-# Core Network Parameters (Kaspa TN12 - Toccata)
-stratum_port: ":5555"
-kaspad_address: "192.168.0.12:16210" # Shifted from 16110 to TN12
 
-# Central Pool Wallet (Testnet-12 P2SH Covenant Boundary)
-mining_address: "kaspatest:qqktt4fyd3t8hg0d2mxzcle69cx33wnzd59v4zguc5ywc2lfvtq6cvcwlwzus"
+# Core Network Parameters (RPC Node Array for Automatic Failover)
+
+stratum_port: ":5555"
+
+kaspad_addresses:
+
+  - "127.0.0.1:16110"
+
+  - "192.168.50.100:16110"
+
+  - "api.kaspa.org:16110"
+
+
+
+# Central Pool Wallet (Matched to Master Admin Treasury)
+
+mining_address: "kaspa:qpra0t9ul8hd7m7pw4td6ax3unlf2vyc2fzit9p9yulhsnk7quakmpj4lpw7"
+
+
 
 # Public Pool Mechanics
-starting_diff: 64       # ⚡ Allows KS0 Ultras to survive
-min_share_diff: 2.0      
-var_diff: true           
+
+starting_diff: 64
+
+min_share_diff: 2.0
+
+var_diff: true
+
 shares_per_min: 20
+
 extranonce_size: 2
 
+
+
 # Telemetry System
-prom_port: ":8081"
+
+prom_port: ":9091"
+
 print_stats: true
+
+
+
+# Settlement Invariants
+
+default_unassigned_settlement_threshold: 50.0
+
+coinbase_maturity_daa_confirmations: 5000
