@@ -49,7 +49,7 @@ use crate::agent::{
         compute_execution_commitment_hash, select_and_verify_wallet_utxos,
         verify_signed_execution_submission, VerifiedExecutionPayload,
     },
-    AgentGatewayState, REDIS_KEY_BLACKLISTED_WALLETS, REDIS_KEY_LATEST_PULSE,
+    AgentGatewayState, REDIS_KEY_AI_INTENT_SKEW, REDIS_KEY_BLACKLISTED_WALLETS, REDIS_KEY_LATEST_PULSE,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -784,6 +784,264 @@ pub async fn handle_get_markets(
     Ok(Json(body))
 }
 
+async fn publish_anonymized_ai_intent_skew(
+    state: &AgentGatewayState,
+    redis_conn: &mut redis::aio::MultiplexedConnection,
+    pay_asset: &str,
+    receive_asset: &str,
+    venue: &str,
+    spend_sompi_equiv: u128,
+    notional_usd_micros: u128,
+) {
+    let kas_delta_i128: i128 = if pay_asset == "KAS" && receive_asset != "KAS" {
+        -(spend_sompi_equiv as i128)
+    } else if receive_asset == "KAS" && pay_asset != "KAS" {
+        spend_sompi_equiv as i128
+    } else {
+        0
+    };
+    let existing_raw: Option<String> = redis::cmd("GET")
+        .arg(REDIS_KEY_AI_INTENT_SKEW)
+        .query_async(redis_conn)
+        .await
+        .ok()
+        .flatten();
+    let mut skew_doc: Value = existing_raw
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .unwrap_or_else(|| {
+            json!({
+                "netKasDeltaSompi": "0",
+                "totalVolumeUsdMicros": "0",
+                "pairs": {}
+            })
+        });
+    let prev_net = skew_doc
+        .get("netKasDeltaSompi")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<i128>().ok())
+        .unwrap_or(0);
+    let prev_vol = skew_doc
+        .get("totalVolumeUsdMicros")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<u128>().ok())
+        .unwrap_or(0);
+    let new_net = prev_net.saturating_add(kas_delta_i128);
+    let new_vol = prev_vol.saturating_add(notional_usd_micros);
+    let pair_key = format!("{}/{}", pay_asset, receive_asset);
+    let prev_pair_vol = skew_doc
+        .get("pairs")
+        .and_then(|p| p.get(&pair_key))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<u128>().ok())
+        .unwrap_or(0);
+    if let Some(obj) = skew_doc.as_object_mut() {
+        obj.insert("netKasDeltaSompi".to_string(), json!(new_net.to_string()));
+        obj.insert("totalVolumeUsdMicros".to_string(), json!(new_vol.to_string()));
+        obj.insert("updatedAtMs".to_string(), json!(now_unix_ms().to_string()));
+        let pairs_obj = obj
+            .entry("pairs".to_string())
+            .or_insert_with(|| json!({}));
+        if let Some(pm) = pairs_obj.as_object_mut() {
+            pm.insert(pair_key, json!(prev_pair_vol.saturating_add(notional_usd_micros).to_string()));
+        }
+    }
+    let _: redis::RedisResult<()> = redis::cmd("SETEX")
+        .arg(REDIS_KEY_AI_INTENT_SKEW)
+        .arg(900u64)
+        .arg(skew_doc.to_string())
+        .query_async(redis_conn)
+        .await;
+
+    let _ = sqlx::query(
+        r#"
+        INSERT INTO public.agent_intent_signals (
+            pay_asset, receive_asset, venue, net_kas_delta_sompi, quote_volume_usd_micros
+        )
+        VALUES ($1, $2, $3, $4::NUMERIC, $5::NUMERIC)
+        "#,
+    )
+    .bind(pay_asset)
+    .bind(receive_asset)
+    .bind(venue)
+    .bind(kas_delta_i128.to_string())
+    .bind(notional_usd_micros.to_string())
+    .execute(&state.pg_pool)
+    .await;
+}
+
+// ============================================================================
+// ENDPOINT 1B: AGENT-ONLY ALPHA & SPREAD INTELLIGENCE (GET /api/v1/agent/alpha)
+// ============================================================================
+
+pub async fn core_get_alpha(
+    state: &AgentGatewayState,
+    headers: &HeaderMap,
+) -> Result<Value, AgentError> {
+    let mut conn = state.get_redis_conn().await?;
+    let claims = authenticate_agent_request(state, headers, &mut conn).await?;
+    let rl = locks_and_limits::enforce_dynamic_rate_limit(state, &mut conn, &claims, false).await?;
+
+    let cached_raw: Option<String> = redis::cmd("GET")
+        .arg(REDIS_KEY_LATEST_PULSE)
+        .query_async(&mut conn)
+        .await
+        .ok()
+        .flatten();
+    let pulse = match cached_raw.and_then(|s| serde_json::from_str::<Value>(&s).ok()) {
+        Some(v) => v,
+        None => solvency::build_cached_market_pulse_snapshot(&mut conn).await?,
+    };
+
+    let (pool_ths_raw, prebell_raw): (Option<String>, Option<String>) = redis::pipe()
+        .cmd("GET")
+        .arg("pool:hashrate_ths")
+        .cmd("GET")
+        .arg("oracle:prebell:2200_demand")
+        .query_async(&mut conn)
+        .await
+        .unwrap_or((None, None));
+    let pool_ths_e6 = pool_ths_raw
+        .as_deref()
+        .and_then(|s| parse_decimal_str_to_u128_scaled(s.trim(), 6).ok())
+        .unwrap_or(0);
+
+    let mut hashrate_batch_calls: Vec<Value> = Vec::new();
+    let bucket_rows = sqlx::query(
+        r#"
+        SELECT target_asset,
+               COALESCE(SUM(FLOOR(accumulated_kas * 100000000)), 0)::NUMERIC(39,0)::TEXT AS acc_sompi,
+               COALESCE(MAX(FLOOR(target_threshold_kas * 100000000)), 1000000000)::NUMERIC(39,0)::TEXT AS thresh_sompi
+        FROM epoch_staging_buffers
+        WHERE status IN ('PENDING', 'FILLING', 'READY')
+        GROUP BY target_asset
+        ORDER BY target_asset ASC
+        "#,
+    )
+    .fetch_all(&state.pg_pool)
+    .await
+    .unwrap_or_default();
+
+    for row in bucket_rows {
+        let asset_raw: String = row.try_get("target_asset").unwrap_or_default();
+        let Ok(asset) = sanitize_sterile_ticker(&asset_raw) else {
+            continue;
+        };
+        let acc_sompi = row
+            .try_get::<String, _>("acc_sompi")
+            .ok()
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or(0);
+        let thresh_sompi = row
+            .try_get::<String, _>("thresh_sompi")
+            .ok()
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or(1_000_000_000)
+            .max(1);
+        let fill_bps = acc_sompi
+            .saturating_mul(BPS_DENOMINATOR)
+            .checked_div(thresh_sompi)
+            .unwrap_or(0)
+            .min(10_000);
+        if fill_bps >= 7_500 {
+            let gap_sompi = thresh_sompi.saturating_sub(acc_sompi);
+            hashrate_batch_calls.push(json!({
+                "asset": asset,
+                "fillBps": U128Str(fill_bps),
+                "accumulatedSompi": U128Str(acc_sompi),
+                "thresholdSompi": U128Str(thresh_sompi),
+                "gapSompi": U128Str(gap_sompi),
+                "incomingPoolThsE6": U128Str(pool_ths_e6),
+                "boostRouteMode": "BATCH_BOOST"
+            }));
+        }
+    }
+    hashrate_batch_calls.sort_by(|a, b| {
+        let fb = b.get("fillBps").and_then(|v| v.as_str()).and_then(|s| s.parse::<u128>().ok()).unwrap_or(0);
+        let fa = a.get("fillBps").and_then(|v| v.as_str()).and_then(|s| s.parse::<u128>().ok()).unwrap_or(0);
+        fb.cmp(&fa)
+    });
+
+    let mut spread_dislocations: Vec<Value> = Vec::new();
+    let mut yield_spikes: Vec<Value> = Vec::new();
+    let markets = pulse.get("markets").and_then(|m| m.as_array()).cloned().unwrap_or_default();
+    let scalar = claims.fee_tier_multiplier_bps as u128;
+
+    for mkt in &markets {
+        let pair = mkt.get("pair").and_then(|v| v.as_str()).unwrap_or("");
+        let base = mkt.get("baseAsset").and_then(|v| v.as_str()).unwrap_or("KAS");
+        let quote = mkt.get("quoteAsset").and_then(|v| v.as_str()).unwrap_or("");
+        let depth_base_e8 = mkt
+            .get("poolReserveBaseE8")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or(0);
+        let depth_quote_e8 = mkt
+            .get("poolReserveQuoteE8")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or(0);
+        let taker_base_bps = mkt
+            .get("takerFeeBaseBps")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(DARK_POOL_MAJOR_TAKER_BASE_BPS as u64) as u128;
+        let fee_floor_bps = div_ceil_u128(taker_base_bps.saturating_mul(scalar), BPS_DENOMINATOR)
+            .unwrap_or(TAKER_ZERO_LOSS_FLOOR_BPS as u128)
+            .max(TAKER_ZERO_LOSS_FLOOR_BPS as u128);
+        let venue_raw: Option<String> = redis::cmd("GET")
+            .arg(format!("oracle:venues:{}", quote))
+            .query_async(&mut conn)
+            .await
+            .ok()
+            .flatten();
+        if let Some(v_doc) = venue_raw.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()) {
+            let div_bps = v_doc.get("divergenceBps").and_then(|v| v.as_u64()).unwrap_or(0) as u128;
+            if div_bps > fee_floor_bps && depth_base_e8 > 0 {
+                let net_edge_bps = div_bps.saturating_sub(fee_floor_bps);
+                spread_dislocations.push(json!({
+                    "pair": pair,
+                    "payAsset": base,
+                    "receiveAsset": quote,
+                    "grossSpreadBps": U128Str(div_bps),
+                    "feeFloorBps": U128Str(fee_floor_bps),
+                    "netEdgeBps": U128Str(net_edge_bps),
+                    "maxExecutableAtomic": U128Str(depth_base_e8 / 10)
+                }));
+            }
+        }
+        if is_kaspa_l1_asset(quote) && depth_base_e8 > 0 {
+            let apr_bps = if quote == "SILO" { 1_850u128 } else { 950u128 };
+            yield_spikes.push(json!({
+                "pair": pair,
+                "aprBps": U128Str(apr_bps),
+                "depthSompi": U128Str(depth_base_e8),
+                "quoteReserveAtomic": U128Str(depth_quote_e8),
+                "volume24hSompi": U128Str(depth_base_e8 / 4),
+                "siloFeeTierUnlockBps": U128Str(fee_floor_bps)
+            }));
+        }
+    }
+
+    Ok(json!({
+        "ok": true,
+        "generatedAtMs": now_unix_ms().to_string(),
+        "agentMode": claims.mode,
+        "preBellDemandSnapshotPresent": prebell_raw.is_some(),
+        "hashrateBatchCalls": hashrate_batch_calls,
+        "spreadDislocations": spread_dislocations,
+        "yieldSpikes": yield_spikes,
+        "rateLimit": rl
+    }))
+}
+
+pub async fn handle_get_alpha(
+    State(state): State<AgentGatewayState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AgentError> {
+    let body = core_get_alpha(&state, &headers).await?;
+    Ok(Json(body))
+}
+
 // ============================================================================
 // STREAM ENDPOINT: LIGHTWEIGHT SSE + WEBSOCKET MARKET PULSE (/api/v1/agent/stream)
 // ============================================================================
@@ -1412,6 +1670,17 @@ pub async fn core_post_quote(
         max_conc,
     )
     .await?;
+
+    publish_anonymized_ai_intent_skew(
+        state,
+        &mut conn,
+        &pay_asset,
+        &receive_asset,
+        req.venue.as_str(),
+        solvency_math.spend_sompi_equiv,
+        solvency_math.notional_usd_micros,
+    )
+    .await;
 
     Ok(json!({
         "ok": true,
@@ -2278,6 +2547,17 @@ pub async fn core_post_execute(
         "microBatchClearing": micro_batch_meta,
         "settledAt": Utc::now().to_rfc3339()
     });
+
+    publish_anonymized_ai_intent_skew(
+        state,
+        &mut conn,
+        &quote.pay_asset,
+        &quote.receive_asset,
+        quote.venue.as_str(),
+        quote.spend_sompi_equiv.as_u128(),
+        quote.notional_usd_micros.as_u128(),
+    )
+    .await;
 
     locks_and_limits::finalize_settled_execution_metrics(
         &mut conn,

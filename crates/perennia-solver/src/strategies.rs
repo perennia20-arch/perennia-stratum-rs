@@ -638,13 +638,43 @@ pub async fn evaluate_cross_asset_and_rings(
     Ok(evaluated)
 }
 
+/// Applies anonymized AI agent directional skew conservatively (`±max_shift_bps` cap, default <= 2500 bps)
+/// so the Chronos 22:00 UTC pre-hedger can pre-stage Dark Pool counter-liquidity without front-running quotes.
+pub fn apply_ai_intent_skew_sompi(
+    base_kas_sompi: u128,
+    net_kas_skew_sompi: i128,
+    max_shift_bps: u16,
+) -> (u128, i128) {
+    if base_kas_sompi == 0 || net_kas_skew_sompi == 0 || max_shift_bps == 0 {
+        return (base_kas_sompi, 0);
+    }
+    let capped_bps = (max_shift_bps as u128).min(2_500);
+    let max_delta = base_kas_sompi.saturating_mul(capped_bps) / 10_000;
+    let abs_skew = net_kas_skew_sompi.unsigned_abs();
+    let bounded_delta = abs_skew.min(max_delta);
+    if net_kas_skew_sompi > 0 {
+        // Net AI KAS buy demand -> reduce pre-hedge sell sizing up to bound
+        let adjusted = base_kas_sompi.saturating_sub(bounded_delta).max(1);
+        (adjusted, -(bounded_delta as i128))
+    } else {
+        // Net AI KAS sell pressure -> expand pre-hedge absorption within bound
+        let adjusted = base_kas_sompi.saturating_add(bounded_delta);
+        (adjusted, bounded_delta as i128)
+    }
+}
+
 /// 3. 21:55 -> 22:00 UTC Epoch Pre-Hedger (0 bps Post-Only Maker Pre-Sourcing)
 pub async fn evaluate_2200_epoch_pre_hedger(
     ctx: &TickContext<'_>,
     redis_conn: &mut redis::aio::MultiplexedConnection,
     startup_readiness_drill: bool,
 ) -> Result<i64> {
-    let pb_raw: Option<String> = redis::cmd("GET").arg("oracle:prebell:2200_demand").query_async(redis_conn).await.unwrap_or(None);
+    let (pb_raw, ai_skew_raw): (Option<String>, Option<String>) = redis::pipe()
+        .cmd("GET").arg("oracle:prebell:2200_demand")
+        .cmd("GET").arg("perennia:solver:ai_intent_skew")
+        .query_async(redis_conn)
+        .await
+        .unwrap_or((None, None));
     let Some(pb_str) = pb_raw else { return Ok(0); };
     let Ok(pb) = serde_json::from_str::<Value>(&pb_str) else { return Ok(0); };
 
@@ -664,9 +694,20 @@ pub async fn evaluate_2200_epoch_pre_hedger(
         "STARTUP_READINESS_AUDIT".to_string()
     };
 
-    let target_kas_for_sizing = if total_uncovered_kas > 1.0 { total_uncovered_kas / 5.0 }
+    let base_target_kas = if total_uncovered_kas > 1.0 { total_uncovered_kas / 5.0 }
         else if total_pending_kas > 1.0 { total_pending_kas / 5.0 }
         else { ctx.cfg.default_notional_usd / ctx.kas_usd };
+
+    let ai_net_kas_delta_sompi = ai_skew_raw
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .and_then(|v| v.get("netKasDeltaSompi").and_then(|x| x.as_str()).map(|s| s.to_string()))
+        .and_then(|s| s.parse::<i128>().ok())
+        .unwrap_or(0);
+    let base_kas_sompi = ((base_target_kas * (SOMPI_PER_KAS as f64)).round() as u128).max(1);
+    let (adjusted_kas_sompi, applied_skew_delta_sompi) =
+        apply_ai_intent_skew_sompi(base_kas_sompi, ai_net_kas_delta_sompi, 2_000);
+    let target_kas_for_sizing = (adjusted_kas_sompi as f64) / (SOMPI_PER_KAS as f64);
 
     let Some(kas_maker_sell) = best_post_only_maker_sell(kas_books, target_kas_for_sizing) else { return Ok(0); };
 
@@ -733,9 +774,35 @@ pub async fn evaluate_2200_epoch_pre_hedger(
             net_pnl_usd: projected_saved_usd,
             schnorr_intent_sig: sig,
             source_ref: src_ref,
-            metadata_json: json!({ "nextEpochBellTs": next_bell_ts, "secondsUntilBell": secs_until_bell, "clearingTarget": "100_PCT_INTERNAL_DARK_POOL_CROSSED" }),
+            metadata_json: json!({
+                "nextEpochBellTs": next_bell_ts,
+                "secondsUntilBell": secs_until_bell,
+                "aiIntentSkewKasDeltaSompi": applied_skew_delta_sompi.to_string(),
+                "clearingTarget": "100_PCT_INTERNAL_DARK_POOL_CROSSED"
+            }),
         }).await;
     }
 
     Ok(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_ai_intent_skew_sompi;
+
+    #[test]
+    fn ai_intent_skew_caps_prehedge_adjustment_and_preserves_direction() {
+        let base = 1_000_000_000_000u128; // 10,000 KAS
+        let (adj_buy, delta_buy) = apply_ai_intent_skew_sompi(base, 500_000_000_000, 2_000);
+        assert_eq!(adj_buy, 800_000_000_000);
+        assert_eq!(delta_buy, -200_000_000_000);
+
+        let (adj_sell, delta_sell) = apply_ai_intent_skew_sompi(base, -50_000_000_000, 2_000);
+        assert_eq!(adj_sell, 1_050_000_000_000);
+        assert_eq!(delta_sell, 50_000_000_000);
+
+        let (adj_zero, delta_zero) = apply_ai_intent_skew_sompi(base, 0, 2_000);
+        assert_eq!(adj_zero, base);
+        assert_eq!(delta_zero, 0);
+    }
 }

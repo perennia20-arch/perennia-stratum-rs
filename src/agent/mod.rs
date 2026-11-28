@@ -36,6 +36,7 @@ pub const REDIS_KEY_BLACKLISTED_TOKENS: &str = "perennia:firewall:blacklisted_to
 pub const REDIS_KEY_BLACKLISTED_IPS: &str = "perennia:firewall:blacklisted_ips";
 pub const REDIS_KEY_LP_DEPTH_CACHE: &str = "perennia:agent:lp_depth_e8";
 pub const REDIS_KEY_LATEST_PULSE: &str = "perennia:agent:latest_market_pulse";
+pub const REDIS_KEY_AI_INTENT_SKEW: &str = "perennia:solver:ai_intent_skew";
 
 #[derive(Clone)]
 pub struct AgentGatewayState {
@@ -222,6 +223,19 @@ pub async fn ensure_agent_schema(pool: &PgPool) -> anyhow::Result<()> {
         )
         "#,
         "CREATE INDEX IF NOT EXISTS idx_agent_x402_credits_key ON public.agent_x402_credits (key_id, credited_at DESC)",
+        r#"
+        CREATE TABLE IF NOT EXISTS public.agent_intent_signals (
+            signal_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            signal_bucket TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            pay_asset VARCHAR(16) NOT NULL CHECK (pay_asset ~ '^[A-Z0-9]{2,10}$'),
+            receive_asset VARCHAR(16) NOT NULL CHECK (receive_asset ~ '^[A-Z0-9]{2,10}$'),
+            venue VARCHAR(32) NOT NULL,
+            net_kas_delta_sompi NUMERIC(39, 0) NOT NULL DEFAULT 0,
+            quote_volume_usd_micros NUMERIC(39, 0) NOT NULL DEFAULT 0,
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
+        "CREATE INDEX IF NOT EXISTS idx_agent_intent_signals_bucket ON public.agent_intent_signals (signal_bucket DESC, pay_asset, receive_asset)",
     ];
 
     for stmt in ddl_statements {
@@ -611,6 +625,7 @@ pub fn agent_public_router(state: AgentGatewayState) -> Router {
             post(locks_and_limits::handle_x402_credit_claim),
         )
         .route("/api/v1/agent/markets", get(handlers::handle_get_markets))
+        .route("/api/v1/agent/alpha", get(handlers::handle_get_alpha))
         .route("/api/v1/agent/quote", post(handlers::handle_post_quote))
         .route("/api/v1/agent/execute", post(handlers::handle_post_execute))
         .route(
