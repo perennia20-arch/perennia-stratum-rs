@@ -318,6 +318,10 @@ pub async fn ensure_database_schema(pool: &PgPool) -> anyhow::Result<()> {
             post_trade_sweep_json JSONB DEFAULT '{}'::jsonb,
             tx_hash VARCHAR(255),
             status VARCHAR(64) NOT NULL DEFAULT 'AWAITING_WIRE_RECEIPT',
+            clearing_hold_status VARCHAR(32) NOT NULL DEFAULT 'AVAILABLE',
+            clearing_unlocks_at TIMESTAMP WITH TIME ZONE,
+            settled_webhook_id VARCHAR(128),
+            settlement_txid VARCHAR(255),
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         )
@@ -356,7 +360,13 @@ pub async fn ensure_database_schema(pool: &PgPool) -> anyhow::Result<()> {
         "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS bank_last4 VARCHAR(10)",
         "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS master_treasury_fee_usdc DOUBLE PRECISION NOT NULL DEFAULT 0.0",
         "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS post_trade_sweep_json JSONB DEFAULT '{}'::jsonb",
+        "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS clearing_hold_status VARCHAR(32) NOT NULL DEFAULT 'AVAILABLE'",
+        "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS clearing_unlocks_at TIMESTAMP WITH TIME ZONE",
+        "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS settled_webhook_id VARCHAR(128)",
+        "ALTER TABLE fiat_onramp_orders ADD COLUMN IF NOT EXISTS settlement_txid VARCHAR(255)",
         "CREATE INDEX IF NOT EXISTS idx_fiat_onramp_wallet ON fiat_onramp_orders (wallet_address, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_fiat_onramp_hold ON fiat_onramp_orders (wallet_address, clearing_hold_status, clearing_unlocks_at)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_fiat_onramp_settled_webhook ON fiat_onramp_orders (settled_webhook_id) WHERE settled_webhook_id IS NOT NULL",
         r#"
         CREATE TABLE IF NOT EXISTS fiat_float_ledger (
             ledger_id VARCHAR(64) PRIMARY KEY,

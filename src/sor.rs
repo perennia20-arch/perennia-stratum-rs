@@ -356,6 +356,10 @@ pub struct SorExecuteRequest {
     pub htlc_sha256_hashlock_hex: Option<String>,
     #[serde(default)]
     pub counterparty_pubkey_hex: Option<String>,
+    #[serde(default)]
+    pub boost_bucket_asset: Option<String>,
+    #[serde(default)]
+    pub boost_gap_sompi: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -908,12 +912,19 @@ pub async fn handle_sor_execute(
     }
 
     let allow_dp = steering.allow_dark_pool_internal_clearing && !dark_pool_paused;
-    let is_lp_pair_route = req
+    let is_batch_boost = req
         .route_mode
         .as_deref()
-        .map(|m| m.eq_ignore_ascii_case("LP_PAIR"))
+        .map(|m| m.eq_ignore_ascii_case("BATCH_BOOST"))
         .unwrap_or(false)
-        || req.lp_fee_tier_bps.is_some();
+        || req.boost_bucket_asset.is_some();
+    let is_lp_pair_route = !is_batch_boost
+        && (req
+            .route_mode
+            .as_deref()
+            .map(|m| m.eq_ignore_ascii_case("LP_PAIR"))
+            .unwrap_or(false)
+            || req.lp_fee_tier_bps.is_some());
 
     let (
         fee_bps,
@@ -1168,6 +1179,35 @@ pub async fn handle_sor_execute(
         obj.insert("version".to_string(), json!(1));
     }
 
+    if is_batch_boost {
+        let boost_asset = req
+            .boost_bucket_asset
+            .as_deref()
+            .unwrap_or(receive_asset.as_str())
+            .trim()
+            .to_uppercase();
+        if let Ok(redis_url) = env::var("REDIS_URL") {
+            if let Ok(client) = redis::Client::open(redis_url) {
+                if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
+                    let boost_ev = json!({
+                        "txUuid": tx_uuid,
+                        "wallet": prefixed_wallet,
+                        "asset": boost_asset,
+                        "boostSompi": pay_sompi.to_string(),
+                        "boostGapSompi": req.boost_gap_sompi.as_deref().unwrap_or(""),
+                        "protocolFeeAtomic": protocol_fee_atomic.to_string(),
+                        "immediateSettle": true
+                    });
+                    let _: redis::RedisResult<()> = redis::cmd("LPUSH")
+                        .arg("perennia:sor:boost_settlement_triggers")
+                        .arg(boost_ev.to_string())
+                        .query_async(&mut conn)
+                        .await;
+                }
+            }
+        }
+    }
+
     record_sor_settlement_audit(
         &pool,
         &prefixed_wallet,
@@ -1189,6 +1229,8 @@ pub async fn handle_sor_execute(
             "success": true,
             "transactionUuid": tx_uuid,
             "routeType": route_type,
+            "batchBoostTriggered": is_batch_boost,
+            "batchBoostAsset": req.boost_bucket_asset.as_deref().unwrap_or(receive_asset.as_str()).trim().to_uppercase(),
             "amountInAtomic": amount_in_atomic.to_string(),
             "protocolFeeAtomic": protocol_fee_atomic.to_string(),
             "lpFeeAtomic": lp_fee_atomic.to_string(),

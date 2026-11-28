@@ -5,7 +5,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use chrono::Utc;
+use chrono::{DateTime, Datelike, Duration, Utc, Weekday};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
@@ -34,7 +34,21 @@ pub const INSTITUTIONAL_WIRE_ONRAMP_FEE_BPS: u64 = 20;
 pub const MIN_ONRAMP_FEE_FLOOR_CENTS: i64 = 250;
 pub const ACH_AUTO_DEFAULT_THRESHOLD_CENTS: i64 = 62_500;
 pub const PRO_TIER_THRESHOLD_CENTS: i64 = 1_000_000;
-pub const INSTITUTIONAL_WIRE_THRESHOLD_CENTS: i64 = 10_000_000;
+pub const INSTITUTIONAL_WIRE_THRESHOLD_CENTS: i64 = 250_000;
+pub const MANDATORY_WIRE_THRESHOLD_CENTS: i64 = 10_000_000;
+pub const ACH_CLEARING_HOLD_BUSINESS_DAYS: u32 = 5;
+
+fn add_business_days(start: DateTime<Utc>, business_days: u32) -> DateTime<Utc> {
+    let mut cur = start;
+    let mut added = 0u32;
+    while added < business_days {
+        cur += Duration::days(1);
+        if !matches!(cur.weekday(), Weekday::Sat | Weekday::Sun) {
+            added += 1;
+        }
+    }
+    cur
+}
 
 pub const MERCURY_COLUMN_ABA_ROUTING: &str = "121145433";
 pub const MERCURY_COLUMN_ACCOUNT_NUMBER: &str = "580798008849901";
@@ -164,6 +178,8 @@ pub struct LiveWebhookRequest {
     pub event_type: String,
     pub order_id: Option<String>,
     pub payout_id: Option<String>,
+    pub webhook_id: Option<String>,
+    pub wire_status: Option<String>,
     pub confirmations: Option<i32>,
     pub trace_id: Option<String>,
     pub tx_hash: Option<String>,
@@ -231,7 +247,10 @@ pub fn calculate_gateway_gross_up_cents(
     payment_method: &str,
 ) -> GatewayGrossUpBreakdown {
     let safe_principal = principal_cents.max(0);
-    if safe_principal >= INSTITUTIONAL_WIRE_THRESHOLD_CENTS {
+    let method_is_wire = payment_method.trim().eq_ignore_ascii_case("wire");
+    if safe_principal >= MANDATORY_WIRE_THRESHOLD_CENTS
+        || (method_is_wire && safe_principal >= INSTITUTIONAL_WIRE_THRESHOLD_CENTS)
+    {
         let pct_fee = ((safe_principal as f64)
             * (INSTITUTIONAL_WIRE_ONRAMP_FEE_BPS as f64)
             / 10_000.0)
@@ -2730,6 +2749,17 @@ async fn handle_create_onramp_order(
     } else {
         "AWAITING_WIRE_RECEIPT"
     };
+    let is_reversible_ach = gross_up.payment_method == "ach";
+    let clearing_hold_status = if is_reversible_ach {
+        "CLEARING"
+    } else {
+        "AVAILABLE"
+    };
+    let clearing_unlocks_at = if is_reversible_ach {
+        Some(add_business_days(Utc::now(), ACH_CLEARING_HOLD_BUSINESS_DAYS))
+    } else {
+        None
+    };
     let sweep_json = serde_json::to_value(&post_trade_sweep).unwrap_or_else(|_| json!({}));
 
     let _ = sqlx::query(
@@ -2743,7 +2773,8 @@ async fn handle_create_onramp_order(
             locked_spot_price, estimated_kas, delivered_kas, wire_memo,
             routing_topology, wholesale_order_id, wholesale_withdraw_id,
             bridge_wire_routing, bridge_wire_account,
-            master_treasury_fee_usdc, post_trade_sweep_json, status
+            master_treasury_fee_usdc, post_trade_sweep_json, status,
+            clearing_hold_status, clearing_unlocks_at
         ) VALUES (
             $1, $2, $3, $4, $5, $6,
             $7, $8, $9, $10, $11,
@@ -2753,7 +2784,8 @@ async fn handle_create_onramp_order(
             $23, $24, 0.0, $1,
             $25, $26, $27,
             $28, $29,
-            $17, $30, $31
+            $17, $30, $31,
+            $32, $33
         )
         "#,
     )
@@ -2788,6 +2820,8 @@ async fn handle_create_onramp_order(
     .bind(MERCURY_COLUMN_ACCOUNT_NUMBER)
     .bind(&sweep_json)
     .bind(status)
+    .bind(clearing_hold_status)
+    .bind(clearing_unlocks_at)
     .execute(&pool)
     .await;
 
@@ -2818,6 +2852,9 @@ async fn handle_create_onramp_order(
         "bundledUsdcFeeWaived": quote.bundled_usdc_fee_waived,
         "paymentRail": quote.bank_rail,
         "settlementTarget": settlement_target,
+        "clearingHoldStatus": clearing_hold_status,
+        "clearingUnlocksAt": clearing_unlocks_at.map(|ts| ts.to_rfc3339()),
+        "clearingHoldBusinessDays": if is_reversible_ach { ACH_CLEARING_HOLD_BUSINESS_DAYS } else { 0 },
         "routingTopology": quote.routing_topology,
         "wholesaleOrderId": wholesale_order_id,
         "wholesaleWithdrawId": wholesale_withdraw_id,
@@ -2851,6 +2888,50 @@ async fn handle_create_offramp_order(
         .to_string();
     let prefixed_wallet = format!("kaspa:{}", clean_wallet);
     let source_asset = req.source_asset.trim().to_uppercase();
+
+    // Expire any elapsed 5-business-day ACH clearing holds cleanly, then enforce fail-closed hold lock
+    let _ = sqlx::query(
+        r#"
+        UPDATE fiat_onramp_orders
+        SET clearing_hold_status = 'AVAILABLE', updated_at = CURRENT_TIMESTAMP
+        WHERE (wallet_address = $1 OR wallet_address = $2)
+          AND clearing_hold_status = 'CLEARING'
+          AND clearing_unlocks_at IS NOT NULL
+          AND clearing_unlocks_at <= CURRENT_TIMESTAMP
+        "#,
+    )
+    .bind(&prefixed_wallet)
+    .bind(&clean_wallet)
+    .execute(&pool)
+    .await;
+
+    if let Ok(Some(unlocks_at)) = sqlx::query_scalar::<_, DateTime<Utc>>(
+        r#"
+        SELECT clearing_unlocks_at
+        FROM fiat_onramp_orders
+        WHERE (wallet_address = $1 OR wallet_address = $2)
+          AND clearing_hold_status = 'CLEARING'
+          AND clearing_unlocks_at > CURRENT_TIMESTAMP
+        ORDER BY clearing_unlocks_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(&prefixed_wallet)
+    .bind(&clean_wallet)
+    .fetch_optional(&pool)
+    .await
+    {
+        return Err((
+            StatusCode::LOCKED,
+            Json(json!({
+                "success": false,
+                "error": "CLEARING_HOLD_ACTIVE",
+                "clearingHoldStatus": "CLEARING",
+                "clearingUnlocksAt": unlocks_at.to_rfc3339(),
+                "message": "Reversible ACH funds are in the 5-business-day clearing window before external withdrawal unlocks."
+            })),
+        ));
+    }
     let spot = match resolve_live_spot_price(&pool, &source_asset).await {
         Ok(p) => p,
         Err(e) => {
@@ -3032,15 +3113,75 @@ async fn handle_authenticated_webhook(
 
     if evt == "ACH_CLEARED"
         || evt == "WIRE_CLEARED"
+        || evt == "WIRE_SETTLED"
+        || evt == "MERCURY_WIRE_SETTLED"
         || evt == "CONFIRM_WIRE_RECEIPT"
         || evt == "PAYMENT_INTENT_SUCCEEDED"
     {
+        if (evt.contains("WIRE") || req.wire_status.is_some())
+            && !req
+                .wire_status
+                .as_deref()
+                .map(|s| s.trim().eq_ignore_ascii_case("SETTLED"))
+                .unwrap_or(evt == "WIRE_CLEARED" || evt == "WIRE_SETTLED" || evt == "MERCURY_WIRE_SETTLED" || evt == "CONFIRM_WIRE_RECEIPT")
+        {
+            return Ok(Json(json!({
+                "success": true,
+                "released": false,
+                "wireStatus": req.wire_status.as_deref().unwrap_or("PENDING"),
+                "message": "Wire settlement held until final SETTLED status."
+            })));
+        }
+
         let order_id = req.order_id.as_deref().unwrap_or("").trim().to_string();
         if order_id.is_empty() {
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "orderId is required for ACH_CLEARED webhook" })),
+                Json(json!({ "error": "orderId is required for clearing webhook" })),
             ));
+        }
+
+        if let Some(ref wh_id) = req.webhook_id.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            let dup_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM fiat_onramp_orders WHERE settled_webhook_id = $1",
+            )
+            .bind(wh_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap_or(0);
+            if dup_count > 0 {
+                return Ok(Json(json!({
+                    "success": true,
+                    "alreadyCompleted": true,
+                    "idempotentReplay": true,
+                    "orderId": order_id,
+                    "webhookId": wh_id
+                })));
+            }
+        }
+
+        let claim_locked = sqlx::query(
+            r#"
+            UPDATE fiat_onramp_orders
+            SET status = 'SETTLING_LOCKED',
+                settled_webhook_id = COALESCE(settled_webhook_id, $2),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE order_id = $1
+              AND status NOT IN ('COMPLETED', 'SETTLING_LOCKED')
+            "#,
+        )
+        .bind(&order_id)
+        .bind(req.webhook_id.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()))
+        .execute(&pool)
+        .await
+        .map(|r| r.rows_affected() > 0)
+        .unwrap_or(false);
+        if !claim_locked {
+            return Ok(Json(json!({
+                "success": true,
+                "alreadyCompleted": true,
+                "orderId": order_id
+            })));
         }
         let row_opt = sqlx::query(
             r#"
@@ -3201,6 +3342,14 @@ async fn handle_authenticated_webhook(
                 estimated_tokens = $3,
                 target_spot_price = $4,
                 tx_hash = $5,
+                settlement_txid = COALESCE(settlement_txid, $5),
+                clearing_hold_status = CASE
+                    WHEN LOWER(COALESCE(payment_method, 'ach')) = 'ach'
+                     AND clearing_unlocks_at IS NOT NULL
+                     AND clearing_unlocks_at > CURRENT_TIMESTAMP
+                    THEN 'CLEARING'
+                    ELSE 'AVAILABLE'
+                END,
                 master_treasury_fee_usdc = $6,
                 settled_net_cents = $7,
                 fulfilled_principal_cents = $8,
@@ -3449,6 +3598,14 @@ mod tests {
         assert_eq!(wire_100k.perennia_fee_cents, 20_000);
         assert_eq!(wire_100k.stripe_gateway_fee_cents, 0);
         assert!(wire_100k.requires_institutional_wire);
+
+        let vip_wire_2500 = calculate_gateway_gross_up_cents(250_000, false, "wire");
+        assert_eq!(vip_wire_2500.tier_name, "INSTITUTIONAL_WIRE");
+        assert!(vip_wire_2500.requires_institutional_wire);
+
+        let mon = DateTime::parse_from_rfc3339("2026-11-23T15:00:00Z").unwrap().with_timezone(&Utc);
+        let unlocked = add_business_days(mon, 5);
+        assert_eq!((unlocked - mon).num_days(), 7);
     }
 
     #[test]
