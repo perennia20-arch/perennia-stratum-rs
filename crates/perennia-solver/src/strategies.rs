@@ -786,9 +786,87 @@ pub async fn evaluate_2200_epoch_pre_hedger(
     Ok(1)
 }
 
+/// 4. <= 20% Positive-Pressure SILO -> KAS Siphon Valve (strictly halts on flat/negative 5m TWAP or low depth)
+pub fn compute_positive_pressure_silo_siphon_atomic(
+    net_buy_inflow_sompi: i128,
+    twap_5m_delta_bps: i32,
+    pool_depth_sompi: u128,
+    depth_floor_sompi: u128,
+    max_valve_bps: u16,
+) -> u128 {
+    if net_buy_inflow_sompi <= 0 || twap_5m_delta_bps <= 0 || pool_depth_sompi < depth_floor_sompi {
+        return 0;
+    }
+    let effective_bps = (max_valve_bps as u128).min(2_000);
+    (net_buy_inflow_sompi as u128).saturating_mul(effective_bps) / 10_000
+}
+
+pub async fn evaluate_silo_positive_pressure_siphon(
+    ctx: &TickContext<'_>,
+    redis_conn: &mut redis::aio::MultiplexedConnection,
+) -> Result<i64> {
+    let (halt_raw, flow_raw, depth_raw): (Option<String>, Option<String>, Option<String>) = redis::pipe()
+        .cmd("GET").arg("perennia:killswitch:silo_siphon")
+        .cmd("GET").arg("perennia:silo:net_buy_inflow_5m")
+        .cmd("HGET").arg("perennia:agent:lp_depth_e8").arg("KAS/SILO")
+        .query_async(redis_conn)
+        .await
+        .unwrap_or((None, None, None));
+
+    let halted = halt_raw.as_deref() == Some("1");
+    let (net_buy_sompi, twap_delta_bps) = flow_raw
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .map(|v| {
+            let inflow = v.get("netBuyInflowSompi").and_then(|x| x.as_str()).and_then(|s| s.parse::<i128>().ok()).unwrap_or(0);
+            let twap = v.get("twap5mDeltaBps").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+            (inflow, twap)
+        })
+        .unwrap_or((0, 0));
+
+    let pool_depth_sompi = depth_raw
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .and_then(|v| v.get("reserveAE8").and_then(|x| x.as_str()).map(|s| s.to_string()))
+        .and_then(|s| s.parse::<u128>().ok())
+        .unwrap_or(0);
+
+    let depth_floor_sompi: u128 = 1_000 * SOMPI_PER_KAS;
+    let siphon_sompi = if halted {
+        0
+    } else {
+        compute_positive_pressure_silo_siphon_atomic(
+            net_buy_sompi,
+            twap_delta_bps,
+            pool_depth_sompi,
+            depth_floor_sompi,
+            2_000,
+        )
+    };
+
+    let tel_doc = json!({
+        "halted": halted,
+        "lastSiphonedKasSompi": siphon_sompi.to_string(),
+        "netBuyInflowSompi": net_buy_sompi.to_string(),
+        "twap5mDeltaBps": twap_delta_bps,
+        "poolDepthSompi": pool_depth_sompi.to_string(),
+        "depthFloorSompi": depth_floor_sompi.to_string(),
+        "maxValveBps": 2000,
+        "masterTreasuryAddress": ctx.master_treasury_address
+    });
+    let _: redis::RedisResult<()> = redis::cmd("SETEX")
+        .arg("perennia:solver:silo_siphon_telemetry")
+        .arg(120u64)
+        .arg(tel_doc.to_string())
+        .query_async(redis_conn)
+        .await;
+
+    Ok(if siphon_sompi > 0 { 1 } else { 0 })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::apply_ai_intent_skew_sompi;
+    use super::{apply_ai_intent_skew_sompi, compute_positive_pressure_silo_siphon_atomic};
 
     #[test]
     fn ai_intent_skew_caps_prehedge_adjustment_and_preserves_direction() {
@@ -804,5 +882,15 @@ mod tests {
         let (adj_zero, delta_zero) = apply_ai_intent_skew_sompi(base, 0, 2_000);
         assert_eq!(adj_zero, base);
         assert_eq!(delta_zero, 0);
+    }
+
+    #[test]
+    fn silo_siphon_valve_enforces_20_pct_cap_and_halts_on_flat_or_negative_twap() {
+        let floor = 100_000_000_000u128;
+        assert_eq!(compute_positive_pressure_silo_siphon_atomic(500_000_000_000, 45, 500_000_000_000, floor, 5_000), 100_000_000_000);
+        assert_eq!(compute_positive_pressure_silo_siphon_atomic(500_000_000_000, 0, 500_000_000_000, floor, 2_000), 0);
+        assert_eq!(compute_positive_pressure_silo_siphon_atomic(500_000_000_000, -15, 500_000_000_000, floor, 2_000), 0);
+        assert_eq!(compute_positive_pressure_silo_siphon_atomic(-100, 45, 500_000_000_000, floor, 2_000), 0);
+        assert_eq!(compute_positive_pressure_silo_siphon_atomic(500_000_000_000, 45, floor - 1, floor, 2_000), 0);
     }
 }

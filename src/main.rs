@@ -462,6 +462,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(protected_routes)
         .merge(admin_api::admin_routes())
         .merge(fiat_rails::fiat_routes())
+        .merge(state_api::forge_queries::forge_routes())
         .with_state(pool.clone());
 
     let app = core_app

@@ -23,8 +23,8 @@ use crate::cex_books::CexOrderbookClient;
 use crate::config::SolverConfig;
 use crate::kaspa_crypto::SolverIdentity;
 use crate::strategies::{
-    evaluate_2200_epoch_pre_hedger, evaluate_cross_asset_and_rings, evaluate_sor_and_rfq_maker,
-    TickContext,
+    evaluate_2200_epoch_pre_hedger, evaluate_cross_asset_and_rings,
+    evaluate_silo_positive_pressure_siphon, evaluate_sor_and_rfq_maker, TickContext,
 };
 
 #[tokio::main]
@@ -256,6 +256,10 @@ async fn main() -> Result<()> {
                 eval_count += n;
             }
             Err(e) => warn!("22:00 UTC Pre-Hedger cycle error: {}", e),
+        }
+        match evaluate_silo_positive_pressure_siphon(&ctx, &mut redis_conn).await {
+            Ok(n) => eval_count += n,
+            Err(e) => warn!("SILO Positive-Pressure Siphon cycle error: {}", e),
         }
 
         let _ = db::heartbeat_session(&pool, session_id, eval_count).await;

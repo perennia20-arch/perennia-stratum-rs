@@ -1643,13 +1643,13 @@ pub async fn handle_state_action(
                 .to_uppercase();
             if !matches!(
                 vault_kind.as_str(),
-                "MINER_SILO" | "STANDALONE_WALLET_SILO" | "MAKER_PLANT"
+                "MINER_SILO" | "STANDALONE_WALLET_SILO" | "MAKER_PLANT" | "SILO_UTXO_LOCK"
             ) {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(json!({
                         "success": false,
-                        "error": "vaultKind must be MINER_SILO, STANDALONE_WALLET_SILO, or MAKER_PLANT."
+                        "error": "vaultKind must be MINER_SILO, STANDALONE_WALLET_SILO, MAKER_PLANT, or SILO_UTXO_LOCK."
                     })),
                 );
             }
@@ -1690,11 +1690,39 @@ pub async fn handle_state_action(
             let threshold_sompi = parse_u128_json_field(payload.get("thresholdSompi"))
                 .unwrap_or(STAGE1_FLUSH_FLOOR_SOMPI)
                 .max(10_000_000);
-            let fee_bps = payload
-                .get("feeBps")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(50)
-                .clamp(0, 1000) as i32;
+            let raw_outpoint = payload
+                .get("outpoint")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty());
+            if vault_kind == "SILO_UTXO_LOCK" {
+                let Some(ref op) = raw_outpoint else {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "success": false, "error": "SILO_UTXO_LOCK requires unspent txid:vout outpoint." })),
+                    );
+                };
+                let mut parts = op.split(':');
+                let txid_ok = parts.next().map(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())).unwrap_or(false);
+                let vout_ok = parts.next().and_then(|v| v.parse::<u32>().ok()).is_some() && parts.next().is_none();
+                if !txid_ok || !vout_ok {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "success": false, "error": "SILO_UTXO_LOCK outpoint must be 64-hex txid:vout." })),
+                    );
+                }
+            }
+            let locked_silo_atomic = parse_u128_json_field(payload.get("lockedSiloAtomic")).unwrap_or(0);
+            let silo_tier_fee_bps = if vault_kind == "SILO_UTXO_LOCK" || locked_silo_atomic > 0 {
+                forge_queries::compute_silo_utxo_fee_tier_bps(locked_silo_atomic) as i32
+            } else {
+                payload
+                    .get("feeBps")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(50)
+                    .clamp(2, 1000) as i32
+            };
+            let fee_bps = silo_tier_fee_bps;
             let maker_spread_bps = payload
                 .get("makerSpreadBps")
                 .and_then(|v| v.as_i64())

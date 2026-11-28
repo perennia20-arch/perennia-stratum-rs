@@ -751,18 +751,39 @@ async fn resolve_sor_fee_bps(
     .and_then(|s| s.parse::<u128>().ok())
     .unwrap_or(0);
 
+    let utxo_lock_silo_atomic: u128 = sqlx::query_scalar::<_, Option<String>>(
+        r#"
+        SELECT COALESCE(SUM(threshold_sompi), 0)::NUMERIC(39,0)::TEXT
+        FROM vault_locks
+        WHERE (clean_wallet = $1 OR wallet_address = $2)
+          AND status != 'CANCELLED'
+          AND (vault_kind = 'SILO_UTXO_LOCK' OR kcc20_token_ticker = 'SILO')
+        "#,
+    )
+    .bind(clean_wallet)
+    .bind(prefixed_wallet)
+    .fetch_one(pool)
+    .await
+    .ok()
+    .flatten()
+    .and_then(|s| s.parse::<u128>().ok())
+    .unwrap_or(0);
+
+    let combined_silo_atomic = staked_silo_atomic.saturating_add(utxo_lock_silo_atomic);
+    let silo_tier_bps = crate::state_api::forge_queries::compute_silo_utxo_fee_tier_bps(combined_silo_atomic).max(2);
+
     let is_buy_kas = receive_asset == "KAS" && pay_asset != "USD";
-    if staked_silo_atomic >= 100_000_000_000_000 {
-        return (10, "10 bps SILO Sovereign Staker Floor");
+    if silo_tier_bps <= 15 {
+        return (15, "15 bps SILO Sovereign UTXO Lock Tier");
     }
     if is_buy_kas {
         return (20, "20 bps Buy-KAS Inbound Tier");
     }
-    if staked_silo_atomic >= 10_000_000_000_000 || gross_usd_micros >= 2_500_000_000 {
-        return (25, "25 bps Wholesale / Vanguard Tier");
+    if silo_tier_bps <= 25 || gross_usd_micros >= 2_500_000_000 {
+        return (25, "25 bps SILO Vanguard / Wholesale Tier");
     }
-    if staked_silo_atomic >= 1_000_000_000_000 {
-        return (35, "35 bps SILO Shield Staker Tier");
+    if silo_tier_bps <= 35 {
+        return (35, "35 bps SILO Shield UTXO Lock Tier");
     }
     let is_dp_major = allow_dark_pool
         && DEFAULT_RESERVE_WHITELIST.iter().any(|&t| t == pay_asset)

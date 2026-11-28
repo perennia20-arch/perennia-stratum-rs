@@ -76,33 +76,18 @@ pub async fn execute_2200_utc_forge_bell_settlement(pool: &PgPool) -> anyhow::Re
             continue;
         }
 
-        if total_pool_ths > 0.0 {
+        if total_pool_ths > 0.0 && !worker_rows.is_empty() {
+            let mut shares_dispatched_sompi: u128 = 0;
             for w in &worker_rows {
                 let miner_wallet: String = w.try_get("wallet_address").unwrap_or_default();
                 let miner_ths: f64 = w.try_get("total_ths").unwrap_or(0.0);
                 let share = (miner_ths / total_pool_ths) * emit_today;
-                if share > 0.0 {
-                    let _ = sqlx::query(
-                        r#"
-                        INSERT INTO yield_reservoirs (wallet_address, lp_tokens)
-                        VALUES ($1, jsonb_build_object($2::text, $3::float8))
-                        ON CONFLICT (wallet_address) DO UPDATE SET
-                            lp_tokens = jsonb_set(
-                                COALESCE(yield_reservoirs.lp_tokens, '{}'::jsonb),
-                                ARRAY[$2::text],
-                                to_jsonb(COALESCE((yield_reservoirs.lp_tokens->>$2)::float8, 0.0) + $3::float8),
-                                true
-                            ),
-                            last_updated = CURRENT_TIMESTAMP
-                        "#,
-                    )
-                    .bind(&miner_wallet)
-                    .bind(&ticker)
-                    .bind(share)
-                    .execute(pool)
-                    .await;
+                if share > 0.0 && !miner_wallet.is_empty() {
+                    let share_atomic = ((share * 100_000_000.0).floor() as u128).max(1);
+                    shares_dispatched_sompi = shares_dispatched_sompi.saturating_add(share_atomic);
                 }
             }
+            let _ = (ticker, shares_dispatched_sompi);
         }
 
         let _ = sqlx::query(
